@@ -374,6 +374,8 @@ pub fn handle(command: &str, args: serde_json::Value, ctx: &Ctx) -> Result<serde
 
 A lock file (`<data-dir>/gateway.lock`, `OpenOptions::new().create_new(true)`) is created at startup and removed on shutdown; a second start fails with `another gateway is already running on this data directory`.
 
+> **Superseded by `src-tauri/src/data_lock.rs`:** a PID file cannot be made correct by patching its checks, so the lock is now a kernel `flock` on `<data-dir>/kingcode.lock`, shared with the desktop app, and the file is never removed.
+
 - [ ] **Step 4: Verify**
 
 Run: `cargo test --features gateway --test gateway_http` — all tests PASS, including the Task 1 and 2 tests.

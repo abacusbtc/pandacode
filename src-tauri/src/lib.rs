@@ -2908,7 +2908,14 @@ pub fn run() {
                     let _ = app.manage(lock);
                 }
                 data_lock::Claim::Busy(message) => {
-                    return Err(std::io::Error::other(message).into())
+                    // A message box is what this deserves, but this hook runs on
+                    // the main thread and the dialog plugin's blocking call needs
+                    // the main loop that setup itself owns: it never draws and
+                    // never returns (measured, see the commit message). So say it
+                    // plainly and leave. Continuing would open a second store on
+                    // the same file, which is the failure the lock exists for.
+                    eprintln!("{message}");
+                    std::process::exit(1);
                 }
                 data_lock::Claim::Unavailable(reason) => eprintln!(
                     "PandaCode could not lock {}: {reason}\nThe gateway cannot run beside this app until that is resolved.",
