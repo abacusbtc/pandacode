@@ -4,6 +4,7 @@
 //! dependency set and never starts a second server.
 
 pub mod config;
+pub mod server;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -18,6 +19,8 @@ pub struct GatewayConfig {
     pub token: String,
     /// Built frontend to serve; `None` leaves the gateway API-only.
     pub static_dir: Option<PathBuf>,
+    /// Browser origins allowed to call the API; the app's webview by default.
+    pub allowed_origins: Vec<String>,
 }
 
 /// A running gateway. `stop` is the only way to shut it down cleanly.
@@ -37,7 +40,10 @@ impl GatewayHandle {
 
 /// Binds the listener and serves until the handle is stopped.
 pub async fn spawn(config: GatewayConfig) -> std::io::Result<GatewayHandle> {
-    let router = axum::Router::new().route("/healthz", axum::routing::get(|| async { "ok" }));
+    let router = server::router(server::RouterState {
+        token: config.token.clone(),
+        allowed_origins: config.allowed_origins.clone(),
+    });
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
     let addr = listener.local_addr()?;
     let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel::<()>();

@@ -13,7 +13,29 @@ const APP_DIR: &str = "ai.pandacode.desktop";
 const TOKEN_FILE: &str = "gateway-token";
 
 pub fn usage() -> &'static str {
-    "usage: pandacode-gateway [--data-dir <dir>] [--host <host>] [--port <port>] [--token <token>] [--token-file <file>] [--static-dir <dir>]"
+    "usage: pandacode-gateway [--data-dir <dir>] [--host <host>] [--port <port>] [--token <token>] [--token-file <file>] [--static-dir <dir>] [--allow-origin <origin>]…"
+}
+
+/// The app's own webview origins; a browser on another origin must be named
+/// with `--allow-origin`.
+pub fn default_origins() -> Vec<String> {
+    vec![
+        "http://tauri.localhost".to_string(),
+        "https://tauri.localhost".to_string(),
+        "tauri://localhost".to_string(),
+    ]
+}
+
+/// A non-loopback bind must be authorised with a token the operator chose; a
+/// token this process generated for its own data directory is not enough to
+/// expose the database to a network.
+pub fn validate(bind: SocketAddr, explicit_token: bool) -> Result<(), String> {
+    if !bind.ip().is_loopback() && !explicit_token {
+        return Err(format!(
+            "refusing to bind {bind} without a token: pass --token or --token-file"
+        ));
+    }
+    Ok(())
 }
 
 /// Parses the flags into a config, creating the data directory's token on first run.
@@ -28,6 +50,7 @@ where
     let mut token: Option<String> = None;
     let mut token_file: Option<PathBuf> = None;
     let mut static_dir: Option<PathBuf> = None;
+    let mut allowed_origins: Vec<String> = Vec::new();
 
     let mut index = 0;
     while index < args.len() {
@@ -43,21 +66,28 @@ where
             "--token" => token = Some(value(&args, index, &flag)?),
             "--token-file" => token_file = Some(PathBuf::from(value(&args, index, &flag)?)),
             "--static-dir" => static_dir = Some(PathBuf::from(value(&args, index, &flag)?)),
+            "--allow-origin" => allowed_origins.push(value(&args, index, &flag)?),
             other => return Err(format!("unknown argument {other}\n{}", usage())),
         }
         index += 2;
     }
 
     let data_dir = data_dir.unwrap_or_else(default_data_dir);
-    let token = resolve_token(token, token_file.as_deref(), &data_dir)?;
     let bind = format!("{host}:{port}")
         .parse::<SocketAddr>()
         .map_err(|_| format!("{host}:{port} is not an address to bind"))?;
+    // Refuse before resolving the token, so a refused bind never writes one.
+    validate(bind, token.is_some() || token_file.is_some())?;
+    let token = resolve_token(token, token_file.as_deref(), &data_dir)?;
+    if allowed_origins.is_empty() {
+        allowed_origins = default_origins();
+    }
     Ok(GatewayConfig {
         data_dir,
         bind,
         token,
         static_dir,
+        allowed_origins,
     })
 }
 

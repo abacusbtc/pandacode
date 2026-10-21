@@ -13,7 +13,7 @@ crate-type = ["rlib"]
 [features]
 # The standalone gateway serves the same database over HTTP (docs/gateway.md).
 # Off by default, so the desktop build's dependency set does not change.
-gateway = ["dep:axum", "dep:tempfile"]
+gateway = ["dep:axum", "dep:tempfile", "dep:tower-http"]
 
 [[bin]]
 name = "pandacode-gateway"
@@ -52,6 +52,7 @@ tauri-plugin-updater = ">=2, <2.10"
 tauri-plugin-process = ">=2, <2.4"
 # Only the `gateway` feature pulls these in; nothing in the desktop build links them.
 axum = { version = "0.8", optional = true }
+tower-http = { version = "0.6", default-features = false, features = ["cors"], optional = true }
 tempfile = { version = "3", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
