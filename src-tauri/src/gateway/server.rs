@@ -61,7 +61,18 @@ async fn capabilities() -> Response {
 }
 
 /// The SPA, or a plain 404 when this gateway was started without a build.
-async fn spa(State(state): State<RouterState>, uri: Uri) -> Response {
+async fn spa(State(state): State<RouterState>, method: Method, uri: Uri) -> Response {
+    // The fallback serves files, so a write to a client route is a wrong method
+    // rather than a missing route: 405 with Allow says that, where 200 with the
+    // shell would quietly tell a POST its body was accepted.
+    if method != Method::GET && method != Method::HEAD {
+        return (
+            StatusCode::METHOD_NOT_ALLOWED,
+            [(header::ALLOW, HeaderValue::from_static("GET, HEAD"))],
+            "method not allowed",
+        )
+            .into_response();
+    }
     match &state.static_dir {
         Some(root) => static_files::serve(root, uri.path())
             .await
@@ -75,8 +86,12 @@ fn not_found() -> Response {
 }
 
 async fn authorize(State(state): State<RouterState>, request: Request, next: Next) -> Response {
-    // Health, the SPA's files and a browser preflight are public; the API is not.
-    if request.method() == Method::OPTIONS || !GUARDED.contains(&request.uri().path()) {
+    // CORS is outermost, so a real preflight never reaches this point: what this
+    // middleware sees are the app's own requests. Guard by the canonical path,
+    // because /rpc/ and //rpc are not what axum routes to the handler, and an
+    // auth decision must not hang on how a client spelled the path.
+    let path = canonical_path(request.uri().path());
+    if !GUARDED.contains(&path.as_str()) {
         return next.run(request).await;
     }
     let presented = request
@@ -88,6 +103,20 @@ async fn authorize(State(state): State<RouterState>, request: Request, next: Nex
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }
     next.run(request).await
+}
+
+/// Collapses the spellings axum does not route to a handler, so `/rpc/` and
+/// `//rpc` are judged as the API they name.
+fn canonical_path(path: &str) -> String {
+    let mut canonical = String::with_capacity(path.len());
+    for segment in path.split('/').filter(|segment| !segment.is_empty()) {
+        canonical.push('/');
+        canonical.push_str(segment);
+    }
+    if canonical.is_empty() {
+        canonical.push('/');
+    }
+    canonical
 }
 
 /// Reflects only the origins named on the command line; everything else is dropped.

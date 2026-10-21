@@ -248,28 +248,111 @@ async fn a_second_gateway_on_the_same_data_directory_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let handle = start(dir.path()).await;
     let error = refusal(test_config(dir.path(), "127.0.0.1:0")).await;
-    assert!(error.contains("another gateway is already running"), "{error}");
+    // The message has to name the directory and the holder, because the same
+    // sentence is what the desktop app shows when the gateway is the one running.
+    assert!(error.contains("is in use by another process"), "{error}");
+    assert!(error.contains(&dir.path().display().to_string()), "{error}");
     handle.stop().await;
 
-    // A clean stop releases the lock, so the next start needs no --force-owner.
+    // The kernel released the lock with the process, so the next start is clean.
     let again = start(dir.path()).await;
     again.stop().await;
 }
 
 #[tokio::test]
-async fn a_lock_left_by_a_dead_process_is_reclaimed() {
+async fn force_owner_cannot_take_a_live_lock() {
+    install_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = start(dir.path()).await;
+    let mut config = test_config(dir.path(), "127.0.0.1:0");
+    config.force_owner = true;
+    let error = refusal(config).await;
+    assert!(error.contains("is in use by another process"), "{error}");
+    assert!(
+        error.contains("--force-owner does not take a live lock"),
+        "{error}"
+    );
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn a_lock_that_cannot_be_taken_is_refused_not_warned() {
+    install_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    // A lock we cannot even open is the "I cannot promise I am the only writer"
+    // case: the gateway must refuse rather than run unprotected.
+    let path = dir.path().join("kingcode.lock");
+    std::fs::write(&path, "").unwrap();
+    let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(&path, permissions).unwrap();
+
+    let error = refusal(test_config(dir.path(), "127.0.0.1:0")).await;
+    assert!(error.contains("cannot open"), "{error}");
+
+    // And --force-owner is not a way around an unprovable lock either.
+    let mut forced = test_config(dir.path(), "127.0.0.1:0");
+    forced.force_owner = true;
+    let error = refusal(forced).await;
+    assert!(error.contains("cannot open"), "{error}");
+}
+
+#[tokio::test]
+async fn the_shared_lock_refuses_for_the_desktop_too() {
+    install_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    // This is the helper the desktop app calls in setup(), exercised directly:
+    // launching the real window is not part of this suite.
+    let handle = start(dir.path()).await;
+    assert!(matches!(
+        config::claim(dir.path(), false),
+        config::Claim::Busy(_)
+    ));
+    handle.stop().await;
+
+    let claimed = config::claim(dir.path(), false);
+    assert!(matches!(claimed, config::Claim::Held(_)), "claim after stop");
+}
+
+#[tokio::test]
+async fn a_lock_file_from_a_dead_process_does_not_block() {
     install_crypto_provider();
     let dir = tempfile::tempdir().unwrap();
     let child = std::process::Command::new("true").spawn().unwrap();
     let dead = child.id();
     let mut child = child;
     child.wait().unwrap();
-    std::fs::write(dir.path().join("gateway.lock"), format!("{dead}\n")).unwrap();
+    // A kernel lock cannot be inherited from a file's contents, so a leftover
+    // PID is diagnostics, not state.
+    std::fs::write(dir.path().join("kingcode.lock"), format!("{dead}\n")).unwrap();
 
     let handle = start(dir.path()).await;
     let listed = call(&handle, "list_projects", json!({})).await;
     assert!(listed.as_array().unwrap().is_empty());
     handle.stop().await;
+}
+
+#[test]
+fn the_lock_directory_is_the_identifier_tauri_uses() {
+    // Both processes only guard the same database if they compute the same
+    // directory, and that directory is the bundle identifier under the data base.
+    let text = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tauri.conf.json"
+    ))
+    .unwrap();
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        parsed["identifier"].as_str().unwrap(),
+        config::APP_DIR,
+        "tauri.conf.json identifier and the gateway's APP_DIR disagree, so the lock and the database would sit in different directories"
+    );
+
+    let base = std::path::PathBuf::from("/example/data");
+    assert_eq!(
+        config::data_dir_under(base),
+        std::path::PathBuf::from("/example/data").join(config::APP_DIR)
+    );
 }
 
 #[tokio::test]
@@ -353,6 +436,13 @@ async fn capabilities_come_from_the_table_the_dispatcher_answers() {
         .collect();
     assert!(commands.contains(&"list_projects"));
 
+    // A command listed twice would mean the table and the endpoint disagree about
+    // what exists, so the list itself is part of the pin.
+    let mut unique = commands.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), commands.len(), "duplicate command advertised: {commands:?}");
+
     // Everything advertised is answered: a command short of arguments fails on
     // the arguments, never on its name.
     for command in &commands {
@@ -409,6 +499,43 @@ async fn serves_index_for_unknown_routes_and_types_assets() {
         .await
         .unwrap();
     assert_eq!(unguarded.status(), 401);
+
+    // A write to a client route is a wrong method, not a missing route: 200 with
+    // the shell would tell a POST its body had been accepted somewhere.
+    let write = reqwest::Client::new()
+        .post(format!("{base}/threads/42"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(write.status(), 405);
+    assert_eq!(write.headers()["allow"], "GET, HEAD");
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn a_differently_spelled_rpc_path_is_still_guarded() {
+    install_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = start(dir.path()).await;
+    let rpc = json!({ "id": "1", "command": "list_projects", "args": {} });
+    // axum does not route this spelling to rpc::handle, so this pins the auth
+    // decision (a doubled or trailing slash cannot walk around the token), not a
+    // live bypass.
+    let response = reqwest::Client::new()
+        .post(format!("http://{}/rpc/", handle.addr))
+        .json(&rpc)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 401);
+
+    let doubled = reqwest::Client::new()
+        .post(format!("http://{}//rpc", handle.addr))
+        .json(&rpc)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(doubled.status(), 401);
     handle.stop().await;
 }
 

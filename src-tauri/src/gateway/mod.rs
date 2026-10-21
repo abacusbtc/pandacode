@@ -47,8 +47,15 @@ impl GatewayHandle {
 
 /// Binds the listener and serves until the handle is stopped.
 pub async fn spawn(config: GatewayConfig) -> std::io::Result<GatewayHandle> {
-    let lock =
-        config::Lock::acquire(&config.data_dir, config.force_owner).map_err(std::io::Error::other)?;
+    // One writer per data directory: the desktop app claims this too, so starting
+    // either while the other runs is a refusal rather than two silent SQLite
+    // writers. On unix the kernel releases the lock however the holder dies.
+    let lock = match config::claim(&config.data_dir, config.force_owner) {
+        config::Claim::Held(lock) => lock,
+        config::Claim::Busy(message) | config::Claim::Unavailable(message) => {
+            return Err(std::io::Error::other(message))
+        }
+    };
     let state = crate::gateway_state(&config.data_dir).map_err(std::io::Error::other)?;
     let router = server::router(server::RouterState {
         token: config.token.clone(),

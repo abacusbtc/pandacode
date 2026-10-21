@@ -8,10 +8,13 @@ use super::GatewayConfig;
 /// Loopback keeps the gateway off the network unless someone asks for more.
 pub const DEFAULT_HOST: &str = "127.0.0.1";
 pub const DEFAULT_PORT: u16 = 47399;
-/// The Tauri bundle identifier, so the gateway opens the app's own database.
-const APP_DIR: &str = "ai.pandacode.desktop";
+/// The Tauri bundle identifier: the app's data directory is the platform data
+/// base plus this, and the lock and database live there. A test reads
+/// tauri.conf.json and fails if the two ever disagree.
+pub const APP_DIR: &str = "ai.pandacode.desktop";
 const TOKEN_FILE: &str = "gateway-token";
-const LOCK_FILE: &str = "gateway.lock";
+
+pub use crate::data_lock::{claim, Claim};
 
 pub fn usage() -> &'static str {
     "usage: pandacode-gateway [--data-dir <dir>] [--host <host>] [--port <port>] [--token <token>] [--token-file <file>] [--static-dir <dir>] [--allow-origin <origin>]… [--force-owner]"
@@ -123,71 +126,6 @@ pub fn open_store(data_dir: &Path) -> Result<crate::storage::Store, String> {
     crate::storage::Store::open(&path)
 }
 
-/// The exclusive writer mark for a data directory. Removed on clean shutdown; a
-/// lock left behind by a crash is reclaimed once its process is gone.
-pub struct Lock {
-    path: PathBuf,
-}
-
-impl Lock {
-    pub fn acquire(data_dir: &Path, force: bool) -> Result<Lock, String> {
-        std::fs::create_dir_all(data_dir)
-            .map_err(|error| format!("cannot create {}: {error}", data_dir.display()))?;
-        let path = data_dir.join(LOCK_FILE);
-        if let Ok(existing) = std::fs::read_to_string(&path) {
-            let pid = existing.trim().parse::<u32>().ok();
-            let running = pid.is_some_and(pid_is_running);
-            if running && !force {
-                return Err(format!(
-                    "another gateway is already running on {} (pid {})\nstop it, or start with --force-owner",
-                    data_dir.display(),
-                    pid.unwrap_or(0)
-                ));
-            }
-            if running {
-                eprintln!(
-                    "taking the gateway lock at {} from a live process (pid {})",
-                    path.display(),
-                    pid.unwrap_or(0)
-                );
-            } else if let Some(pid) = pid {
-                eprintln!(
-                    "clearing a stale gateway lock at {} (pid {pid} is gone)",
-                    path.display()
-                );
-            } else if !force {
-                // Not a lock this gateway wrote; never overwrite it silently.
-                return Err(format!(
-                    "{} is unreadable\nstop whatever holds it, or start with --force-owner",
-                    path.display()
-                ));
-            }
-        }
-        std::fs::write(&path, format!("{}\n", std::process::id()))
-            .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
-        Ok(Lock { path })
-    }
-}
-
-impl Drop for Lock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-#[cfg(unix)]
-fn pid_is_running(pid: u32) -> bool {
-    // Signal 0 asks whether the process exists without disturbing it.
-    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
-}
-
-/// No portable liveness check here, so an existing lock is treated as live and
-/// only --force-owner takes it over.
-#[cfg(not(unix))]
-fn pid_is_running(_pid: u32) -> bool {
-    true
-}
-
 fn value(args: &[String], index: usize, flag: &str) -> Result<String, String> {
     args.get(index + 1)
         .cloned()
@@ -255,6 +193,17 @@ fn write_private(path: &Path, token: &str) -> Result<(), String> {
 }
 
 /// The desktop app's data directory, rebuilt without a Tauri handle.
+///
+/// The rule is Tauri's `app_data_dir()`: the platform data base with the bundle
+/// identifier under it, and `data_dir_under` is that join. The bases below are
+/// the documented variables on each platform; Linux and macOS are the same
+/// variables Tauri resolves, while on Windows Tauri reaches the known folder
+/// through the shell API even when `APPDATA` is unset, where this build falls
+/// back to the temp directory. APPDATA is set on any normal Windows session, so
+/// the two processes agree in practice, but that parity is not proven by a test
+/// here and should not be read as one. On every platform the identifier is
+/// pinned against tauri.conf.json by a test, so the two directories cannot drift
+/// apart silently by renaming the app.
 fn default_data_dir() -> PathBuf {
     let base = if cfg!(target_os = "macos") {
         std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Library/Application Support"))
@@ -268,5 +217,11 @@ fn default_data_dir() -> PathBuf {
                 std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share"))
             })
     };
-    base.unwrap_or_else(std::env::temp_dir).join(APP_DIR)
+    data_dir_under(base.unwrap_or_else(std::env::temp_dir))
 }
+
+/// Tauri's join: the bundle identifier under the platform's data base.
+pub fn data_dir_under(base: PathBuf) -> PathBuf {
+    base.join(APP_DIR)
+}
+

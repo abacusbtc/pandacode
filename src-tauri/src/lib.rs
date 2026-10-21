@@ -20,6 +20,7 @@ mod simulator;
 mod vm;
 mod secret_store;
 mod cloud;
+mod data_lock;
 mod vsix_themes;
 mod token_saver;
 mod goal_state;
@@ -2898,6 +2899,22 @@ pub fn run() {
             }
             let dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&dir)?;
+            // The gateway takes the same lock before it opens this database, so a
+            // lock held elsewhere means another writer and this copy must not
+            // start. Every other outcome is a warning: a lock that cannot be taken
+            // is not a reason to keep someone out of their own workspace.
+            match data_lock::claim(&dir, false) {
+                data_lock::Claim::Held(lock) => {
+                    let _ = app.manage(lock);
+                }
+                data_lock::Claim::Busy(message) => {
+                    return Err(std::io::Error::other(message).into())
+                }
+                data_lock::Claim::Unavailable(reason) => eprintln!(
+                    "PandaCode could not lock {}: {reason}\nThe gateway cannot run beside this app until that is resolved.",
+                    dir.display()
+                ),
+            }
             provider_settings::setup(&dir).map_err(std::io::Error::other)?;
             // Optional integration storage must never prevent the workspace from opening.
             if jev::setup(&dir).is_err() {
