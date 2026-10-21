@@ -10,6 +10,16 @@ name = "pandacode_lib"
 # Desktop only links the rlib; add "staticlib", "cdylib" back for mobile targets.
 crate-type = ["rlib"]
 
+[features]
+# The standalone gateway serves the same database over HTTP (docs/gateway.md).
+# Off by default, so the desktop build's dependency set does not change.
+gateway = ["dep:axum", "dep:tempfile"]
+
+[[bin]]
+name = "pandacode-gateway"
+path = "src/bin/pandacode-gateway.rs"
+required-features = ["gateway"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -40,6 +50,9 @@ shell-words = "1"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 tauri-plugin-updater = ">=2, <2.10"
 tauri-plugin-process = ">=2, <2.4"
+# Only the `gateway` feature pulls these in; nothing in the desktop build links them.
+axum = { version = "0.8", optional = true }
+tempfile = { version = "3", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3"

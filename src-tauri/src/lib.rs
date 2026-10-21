@@ -49,6 +49,10 @@ mod usage_keychain;
 mod usage_ledger;
 mod workspace;
 
+// The standalone HTTP gateway; the desktop build never links it.
+#[cfg(feature = "gateway")]
+pub mod gateway;
+
 pub use usage_keychain::handle_usage_keychain_helper;
 
 use providers::{AgentEvent, RunConfig, RunInput};
