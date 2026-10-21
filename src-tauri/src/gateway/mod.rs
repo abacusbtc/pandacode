@@ -8,6 +8,7 @@ pub mod config;
 mod dispatch;
 mod rpc;
 mod server;
+mod static_files;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -52,6 +53,7 @@ pub async fn spawn(config: GatewayConfig) -> std::io::Result<GatewayHandle> {
     let router = server::router(server::RouterState {
         token: config.token.clone(),
         allowed_origins: config.allowed_origins.clone(),
+        static_dir: config.static_dir.clone(),
         ctx: dispatch::Ctx {
             state: Arc::new(state),
         },

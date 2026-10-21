@@ -369,3 +369,58 @@ async fn capabilities_come_from_the_table_the_dispatcher_answers() {
     assert_eq!(body["error"], "unsupported_command: send_message");
     handle.stop().await;
 }
+
+#[tokio::test]
+async fn serves_index_for_unknown_routes_and_types_assets() {
+    install_crypto_provider();
+    let dist = tempfile::tempdir().unwrap();
+    std::fs::write(dist.path().join("index.html"), "<html>pandacode</html>").unwrap();
+    std::fs::write(dist.path().join("app.js"), "console.log(1)").unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let mut config = test_config(data.path(), "127.0.0.1:0");
+    config.static_dir = Some(dist.path().to_path_buf());
+    let handle = spawn(config).await.unwrap();
+    let base = format!("http://{}", handle.addr);
+
+    // A client route is the shell, and no token was needed to fetch it.
+    let deep = reqwest::get(format!("{base}/threads/42")).await.unwrap();
+    assert_eq!(deep.status(), 200);
+    assert!(deep.text().await.unwrap().contains("pandacode"));
+
+    let js = reqwest::get(format!("{base}/app.js")).await.unwrap();
+    assert_eq!(
+        js.headers()["content-type"],
+        "text/javascript; charset=utf-8"
+    );
+
+    // Nothing escapes the build directory: an encoded traversal is the shell.
+    let escape = reqwest::get(format!("{base}/%2e%2e%2fCargo.toml"))
+        .await
+        .unwrap();
+    let body = escape.text().await.unwrap();
+    assert!(body.contains("pandacode"), "{body}");
+    assert!(!body.contains("[package]"), "{body}");
+
+    // The API stays guarded while the files are not.
+    let unguarded = reqwest::Client::new()
+        .post(format!("{base}/rpc"))
+        .json(&json!({ "id": "1", "command": "list_projects", "args": {} }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unguarded.status(), 401);
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn unknown_routes_are_404_without_a_built_frontend() {
+    install_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = start(dir.path()).await;
+    let response = reqwest::get(format!("http://{}/threads/42", handle.addr))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
+    assert_eq!(response.text().await.unwrap(), "not found");
+    handle.stop().await;
+}

@@ -4,21 +4,27 @@ use std::time::Duration;
 
 use axum::{
     extract::{Request, State},
-    http::{header, HeaderValue, Method, StatusCode},
+    http::{header, HeaderValue, Method, StatusCode, Uri},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     Router,
 };
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
-use super::{dispatch, rpc};
+use super::{dispatch, rpc, static_files};
 use serde_json::json;
+use std::path::PathBuf;
+
+/// The only paths a token protects. The SPA's own files must load before a
+/// client can present one, and `/events` joins this list in Task 6.
+const GUARDED: &[&str] = &["/rpc", "/capabilities"];
 
 /// What a request needs to be authorised and answered.
 #[derive(Clone)]
 pub(crate) struct RouterState {
     pub(crate) token: String,
     pub(crate) allowed_origins: Vec<String>,
+    pub(crate) static_dir: Option<PathBuf>,
     pub(crate) ctx: dispatch::Ctx,
 }
 
@@ -28,6 +34,7 @@ pub(crate) fn router(state: RouterState) -> Router {
         .route("/healthz", axum::routing::get(|| async { "ok" }))
         .route("/capabilities", axum::routing::get(capabilities))
         .route("/rpc", axum::routing::post(rpc::handle))
+        .fallback(spa)
         // Layer order is load-bearing: the last layer is outermost, so CORS
         // answers the browser's token-less preflight and auth guards the rest.
         // Swapping these two breaks the app's client with an opaque browser error.
@@ -45,9 +52,23 @@ async fn capabilities() -> Response {
     .into_response()
 }
 
+/// The SPA, or a plain 404 when this gateway was started without a build.
+async fn spa(State(state): State<RouterState>, uri: Uri) -> Response {
+    match &state.static_dir {
+        Some(root) => static_files::serve(root, uri.path())
+            .await
+            .unwrap_or_else(not_found),
+        None => not_found(),
+    }
+}
+
+fn not_found() -> Response {
+    (StatusCode::NOT_FOUND, "not found").into_response()
+}
+
 async fn authorize(State(state): State<RouterState>, request: Request, next: Next) -> Response {
-    // Health is public, and a preflight carries no Authorization header by design.
-    if request.method() == Method::OPTIONS || request.uri().path() == "/healthz" {
+    // Health, the SPA's files and a browser preflight are public; the API is not.
+    if request.method() == Method::OPTIONS || !GUARDED.contains(&request.uri().path()) {
         return next.run(request).await;
     }
     let presented = request
