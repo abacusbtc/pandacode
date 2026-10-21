@@ -285,3 +285,87 @@ async fn a_database_from_a_newer_build_is_refused() {
     assert!(error.contains("schema version 999"), "{error}");
     assert!(error.contains("Update PandaCode"), "{error}");
 }
+
+#[tokio::test]
+async fn capabilities_and_sessions_come_from_the_real_schema() {
+    install_crypto_provider();
+    let data = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let handle = start(data.path()).await;
+
+    let status = call(&handle, "gateway_status", json!({})).await;
+    let commands = status["commands"].as_array().unwrap();
+    assert!(commands.iter().any(|command| command == "create_session"));
+    assert!(commands.iter().any(|command| command == "get_messages"));
+
+    let created = call(
+        &handle,
+        "add_project",
+        json!({ "path": project.path().to_str().unwrap() }),
+    )
+    .await;
+    let project_id = created["id"].as_str().unwrap();
+    let session = call(
+        &handle,
+        "create_session",
+        json!({ "projectId": project_id, "provider": "claude", "model": "claude-sonnet-4-5" }),
+    )
+    .await;
+    assert_eq!(session["projectId"], project_id);
+
+    let sessions = call(&handle, "list_sessions", json!({})).await;
+    assert_eq!(sessions.as_array().unwrap().len(), 1);
+    let session_id = sessions[0]["id"].as_str().unwrap();
+
+    let messages = call(&handle, "get_messages", json!({ "sessionId": session_id })).await;
+    assert!(messages["messages"].as_array().unwrap().is_empty());
+    assert_eq!(messages["hasOlder"], false);
+
+    // The optional filter narrows to one project instead of listing everything.
+    let elsewhere = call(&handle, "list_sessions", json!({ "projectId": "not-a-project" })).await;
+    assert!(elsewhere.as_array().unwrap().is_empty());
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn capabilities_come_from_the_table_the_dispatcher_answers() {
+    install_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = start(dir.path()).await;
+    let url = format!("http://{}/capabilities", handle.addr);
+
+    let denied = reqwest::get(&url).await.unwrap();
+    assert_eq!(denied.status(), 401);
+
+    let response = reqwest::Client::new()
+        .get(&url)
+        .header("Authorization", "Bearer test-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await.unwrap();
+    let commands: Vec<&str> = body["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|command| command.as_str())
+        .collect();
+    assert!(commands.contains(&"list_projects"));
+
+    // Everything advertised is answered: a command short of arguments fails on
+    // the arguments, never on its name.
+    for command in &commands {
+        let body = rpc(&handle, command, json!({})).await;
+        let error = body["error"].as_str().unwrap_or_default();
+        assert!(
+            !error.starts_with("unsupported_command"),
+            "{command} is advertised but unanswered: {error}"
+        );
+    }
+
+    // And something not advertised is refused by name.
+    let body = rpc(&handle, "send_message", json!({})).await;
+    assert_eq!(body["error"], "unsupported_command: send_message");
+    handle.stop().await;
+}

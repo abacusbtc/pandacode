@@ -513,6 +513,12 @@ pub(crate) fn remove_project_inner(state: &AppState, project_id: String) -> Resu
 }
 #[tauri::command]
 async fn list_sessions(state: State<'_, AppState>) -> Result<Vec<Session>> {
+    list_sessions_inner(&state)
+}
+/// A read that can write: a row claiming to run with no live agent is settled by
+/// `reconcile_inactive_task`. The gateway holds the only writer lock and has no
+/// agents, so this is the correct sweep there — the body stays shared verbatim.
+pub(crate) fn list_sessions_inner(state: &AppState) -> Result<Vec<Session>> {
     let agents = state.agents.lock().map_err(|e| e.to_string())?;
     let store = state.store.lock().map_err(|e| e.to_string())?;
     Ok(store
@@ -575,6 +581,16 @@ async fn configure_window_appearance(
 #[tauri::command]
 async fn create_session(
     state: State<'_, AppState>,
+    project_id: String,
+    provider: String,
+    model: String,
+    mode: Option<String>,
+    draft: Option<bool>,
+) -> Result<Session> {
+    create_session_inner(&state, project_id, provider, model, mode, draft)
+}
+pub(crate) fn create_session_inner(
+    state: &AppState,
     project_id: String,
     provider: String,
     model: String,
@@ -738,6 +754,13 @@ async fn update_session(
 #[tauri::command]
 async fn get_messages(
     state: State<'_, AppState>,
+    session_id: String,
+    before_id: Option<i64>,
+) -> Result<MessagePage> {
+    get_messages_inner(&state, session_id, before_id)
+}
+pub(crate) fn get_messages_inner(
+    state: &AppState,
     session_id: String,
     before_id: Option<i64>,
 ) -> Result<MessagePage> {

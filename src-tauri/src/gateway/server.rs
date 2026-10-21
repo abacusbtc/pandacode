@@ -12,6 +12,7 @@ use axum::{
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use super::{dispatch, rpc};
+use serde_json::json;
 
 /// What a request needs to be authorised and answered.
 #[derive(Clone)]
@@ -25,6 +26,7 @@ pub(crate) fn router(state: RouterState) -> Router {
     let cors = cors(&state.allowed_origins);
     Router::new()
         .route("/healthz", axum::routing::get(|| async { "ok" }))
+        .route("/capabilities", axum::routing::get(capabilities))
         .route("/rpc", axum::routing::post(rpc::handle))
         // Layer order is load-bearing: the last layer is outermost, so CORS
         // answers the browser's token-less preflight and auth guards the rest.
@@ -32,6 +34,15 @@ pub(crate) fn router(state: RouterState) -> Router {
         .layer(middleware::from_fn_with_state(state.clone(), authorize))
         .layer(cors)
         .with_state(state)
+}
+
+/// The same list the dispatcher matches on, so a client can hide what is absent.
+async fn capabilities() -> Response {
+    axum::Json(json!({
+        "commands": dispatch::COMMANDS,
+        "features": dispatch::FEATURES,
+    }))
+    .into_response()
 }
 
 async fn authorize(State(state): State<RouterState>, request: Request, next: Next) -> Response {
