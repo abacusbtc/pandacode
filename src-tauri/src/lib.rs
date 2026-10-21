@@ -477,10 +477,16 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'sta
 
 #[tauri::command]
 async fn list_projects(state: State<'_, AppState>) -> Result<Vec<Project>> {
+    list_projects_inner(&state)
+}
+pub(crate) fn list_projects_inner(state: &AppState) -> Result<Vec<Project>> {
     state.store.lock().map_err(|e| e.to_string())?.projects()
 }
 #[tauri::command]
 async fn add_project(state: State<'_, AppState>, path: String) -> Result<Project> {
+    add_project_inner(&state, path)
+}
+pub(crate) fn add_project_inner(state: &AppState, path: String) -> Result<Project> {
     state
         .store
         .lock()
@@ -489,6 +495,9 @@ async fn add_project(state: State<'_, AppState>, path: String) -> Result<Project
 }
 #[tauri::command]
 async fn remove_project(state: State<'_, AppState>, project_id: String) -> Result<()> {
+    remove_project_inner(&state, project_id)
+}
+pub(crate) fn remove_project_inner(state: &AppState, project_id: String) -> Result<()> {
     let agents = state.agents.lock().map_err(|e| e.to_string())?;
     let store = state.store.lock().map_err(|e| e.to_string())?;
     for session_id in agents.keys() {
@@ -2838,6 +2847,20 @@ async fn list_local_servers() -> Result<Vec<local_servers::LocalServer>> {
 /// Process-wide setup that must happen before any thread or child process starts.
 pub fn prepare_environment() {
     providers::widen_process_path();
+}
+
+/// The gateway's state: the struct the desktop app builds, with no live agents,
+/// terminals or shutdown flag. The gateway holds the only writer lock on the data
+/// directory, so an empty registry is the truth here rather than a placeholder.
+#[cfg(feature = "gateway")]
+pub(crate) fn gateway_state(data_dir: &std::path::Path) -> Result<AppState> {
+    let store = gateway::config::open_store(data_dir)?;
+    Ok(AppState {
+        store: Arc::new(Mutex::new(store)),
+        agents: Arc::new(Mutex::new(HashMap::new())),
+        terminals: Arc::new(Mutex::new(HashMap::new())),
+        shutdown: AtomicU8::new(0),
+    })
 }
 
 pub fn run() {

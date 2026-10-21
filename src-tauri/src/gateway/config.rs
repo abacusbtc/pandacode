@@ -11,9 +11,10 @@ pub const DEFAULT_PORT: u16 = 47399;
 /// The Tauri bundle identifier, so the gateway opens the app's own database.
 const APP_DIR: &str = "ai.pandacode.desktop";
 const TOKEN_FILE: &str = "gateway-token";
+const LOCK_FILE: &str = "gateway.lock";
 
 pub fn usage() -> &'static str {
-    "usage: pandacode-gateway [--data-dir <dir>] [--host <host>] [--port <port>] [--token <token>] [--token-file <file>] [--static-dir <dir>] [--allow-origin <origin>]…"
+    "usage: pandacode-gateway [--data-dir <dir>] [--host <host>] [--port <port>] [--token <token>] [--token-file <file>] [--static-dir <dir>] [--allow-origin <origin>]… [--force-owner]"
 }
 
 /// The app's own webview origins; a browser on another origin must be named
@@ -51,11 +52,17 @@ where
     let mut token_file: Option<PathBuf> = None;
     let mut static_dir: Option<PathBuf> = None;
     let mut allowed_origins: Vec<String> = Vec::new();
+    let mut force_owner = false;
 
     let mut index = 0;
     while index < args.len() {
         let flag = args[index].clone();
         match flag.as_str() {
+            "--force-owner" => {
+                force_owner = true;
+                index += 1;
+                continue;
+            }
             "--data-dir" => data_dir = Some(PathBuf::from(value(&args, index, &flag)?)),
             "--host" => host = value(&args, index, &flag)?,
             "--port" => {
@@ -88,7 +95,97 @@ where
         token,
         static_dir,
         allowed_origins,
+        force_owner,
     })
+}
+
+/// Opens the app's database, refusing a file newer than this build understands
+/// before any statement touches it: a second binary sharing one file must not be
+/// the thing that reveals it is too old.
+pub fn open_store(data_dir: &Path) -> Result<crate::storage::Store, String> {
+    std::fs::create_dir_all(data_dir)
+        .map_err(|error| format!("cannot create {}: {error}", data_dir.display()))?;
+    let path = data_dir.join("kingcode.sqlite3");
+    if path.exists() {
+        let connection =
+            rusqlite::Connection::open(&path).map_err(|error| error.to_string())?;
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .map_err(|error| error.to_string())?;
+        if version > crate::storage::SCHEMA_VERSION {
+            return Err(format!(
+                "{} is schema version {version} and this build reads {}. Update PandaCode before pointing the gateway at it.",
+                path.display(),
+                crate::storage::SCHEMA_VERSION
+            ));
+        }
+    }
+    crate::storage::Store::open(&path)
+}
+
+/// The exclusive writer mark for a data directory. Removed on clean shutdown; a
+/// lock left behind by a crash is reclaimed once its process is gone.
+pub struct Lock {
+    path: PathBuf,
+}
+
+impl Lock {
+    pub fn acquire(data_dir: &Path, force: bool) -> Result<Lock, String> {
+        std::fs::create_dir_all(data_dir)
+            .map_err(|error| format!("cannot create {}: {error}", data_dir.display()))?;
+        let path = data_dir.join(LOCK_FILE);
+        if let Ok(existing) = std::fs::read_to_string(&path) {
+            let pid = existing.trim().parse::<u32>().ok();
+            let running = pid.is_some_and(pid_is_running);
+            if running && !force {
+                return Err(format!(
+                    "another gateway is already running on {} (pid {})\nstop it, or start with --force-owner",
+                    data_dir.display(),
+                    pid.unwrap_or(0)
+                ));
+            }
+            if running {
+                eprintln!(
+                    "taking the gateway lock at {} from a live process (pid {})",
+                    path.display(),
+                    pid.unwrap_or(0)
+                );
+            } else if let Some(pid) = pid {
+                eprintln!(
+                    "clearing a stale gateway lock at {} (pid {pid} is gone)",
+                    path.display()
+                );
+            } else if !force {
+                // Not a lock this gateway wrote; never overwrite it silently.
+                return Err(format!(
+                    "{} is unreadable\nstop whatever holds it, or start with --force-owner",
+                    path.display()
+                ));
+            }
+        }
+        std::fs::write(&path, format!("{}\n", std::process::id()))
+            .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+        Ok(Lock { path })
+    }
+}
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(unix)]
+fn pid_is_running(pid: u32) -> bool {
+    // Signal 0 asks whether the process exists without disturbing it.
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+/// No portable liveness check here, so an existing lock is treated as live and
+/// only --force-owner takes it over.
+#[cfg(not(unix))]
+fn pid_is_running(_pid: u32) -> bool {
+    true
 }
 
 fn value(args: &[String], index: usize, flag: &str) -> Result<String, String> {

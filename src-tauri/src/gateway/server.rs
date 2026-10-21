@@ -7,38 +7,31 @@ use axum::{
     http::{header, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::post,
     Router,
 };
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
-/// What a request needs to be authorised: the expected token and who may call us.
+use super::{dispatch, rpc};
+
+/// What a request needs to be authorised and answered.
 #[derive(Clone)]
-pub struct RouterState {
-    pub token: String,
-    pub allowed_origins: Vec<String>,
+pub(crate) struct RouterState {
+    pub(crate) token: String,
+    pub(crate) allowed_origins: Vec<String>,
+    pub(crate) ctx: dispatch::Ctx,
 }
 
-pub fn router(state: RouterState) -> Router {
+pub(crate) fn router(state: RouterState) -> Router {
     let cors = cors(&state.allowed_origins);
     Router::new()
         .route("/healthz", axum::routing::get(|| async { "ok" }))
-        .route("/rpc", post(rpc_not_ready))
+        .route("/rpc", axum::routing::post(rpc::handle))
         // Layer order is load-bearing: the last layer is outermost, so CORS
         // answers the browser's token-less preflight and auth guards the rest.
         // Swapping these two breaks the app's client with an opaque browser error.
         .layer(middleware::from_fn_with_state(state.clone(), authorize))
         .layer(cors)
         .with_state(state)
-}
-
-/// Placeholder until the dispatcher lands; proves the token let the call through.
-async fn rpc_not_ready() -> Response {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        "rpc is not implemented yet",
-    )
-        .into_response()
 }
 
 async fn authorize(State(state): State<RouterState>, request: Request, next: Next) -> Response {
