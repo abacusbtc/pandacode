@@ -2,7 +2,7 @@
 use crate::{architect, jev, jev_decisions, storage::Store, terminal, AppState, Result};
 use serde::Serialize;
 use std::sync::atomic::Ordering;
-use tauri::{Emitter, Manager};
+use tauri::Manager;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -103,13 +103,13 @@ pub async fn delete_session(
     crate::providers::discard_warm_agent(&session_id);
     crate::blocking(move || {
         let deleted = delete_state(&app.state::<AppState>(), &session_id)?;
-        let _ = app.emit(
+        let _ = crate::events::emit(&app, 
             "sessions-deleted",
             serde_json::json!({
                 "sessionIds": &deleted.deleted_session_ids,
             }),
         );
-        let _ = app.emit("sessions-changed", ());
+        let _ = crate::events::emit(&app, "sessions-changed", ());
         Ok(deleted)
     })
     .await

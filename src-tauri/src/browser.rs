@@ -9,7 +9,7 @@ use std::{
     },
     time::Duration,
 };
-use tauri::{Emitter, Manager, Webview};
+use tauri::{Manager, Webview};
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 mod platform;
 
@@ -145,7 +145,7 @@ fn bounded(mut bounds: BrowserBounds, window: &tauri::Window) -> Result<BrowserB
 fn update(app: &tauri::AppHandle, f: impl FnOnce(&mut BrowserStatus)) {
     if let Ok(mut status) = app.state::<BrowserState>().status.lock() {
         f(&mut status);
-        let _ = app.emit_to("main", "browser-state", status.clone());
+        let _ = crate::events::emit_to(app, "main", "browser-state", status.clone());
     }
 }
 
@@ -534,7 +534,7 @@ pub async fn browser_pick(caller: Webview, app: tauri::AppHandle, enabled: bool)
             }
             if let Ok(element) = serde_json::from_value::<BrowserElement>(value) {
                 if let Some(element) = validate_element(element) {
-                    let _ = app.emit_to("main", "browser-element", element);
+                    let _ = crate::events::emit_to(&app, "main", "browser-element", element);
                 }
             }
             break;

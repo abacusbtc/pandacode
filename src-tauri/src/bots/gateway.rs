@@ -8,7 +8,7 @@ use crate::{message_queue, storage::Store, AppState, Result};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Mutex;
-use tauri::{Emitter, Manager};
+use tauri::Manager;
 
 /// A message for a bot from the desktop, the web UI or a chat channel.
 #[derive(Debug, Clone)]
@@ -143,8 +143,8 @@ pub(crate) async fn deliver(app: &tauri::AppHandle, inbound: Inbound) -> Result<
         compose(&store, &bot, &session_id, &kind, &inbound.sender_name, &text)?
     };
     start_or_queue(app, &bot, &session_id, turn).await?;
-    let _ = app.emit("bots-changed", ());
-    let _ = app.emit("sessions-changed", ());
+    let _ = crate::events::emit(app, "bots-changed", ());
+    let _ = crate::events::emit(app, "sessions-changed", ());
     Ok(session_id)
 }
 
@@ -163,7 +163,7 @@ pub(crate) async fn run_scheduled(app: &tauri::AppHandle, bot_id: &str, label: &
         (bot, session, turn)
     };
     start_or_queue(app, &bot, &session_id, turn).await?;
-    let _ = app.emit("bots-changed", ());
+    let _ = crate::events::emit(app, "bots-changed", ());
     Ok(())
 }
 
@@ -205,7 +205,7 @@ pub(crate) async fn run_finished(app: &tauri::AppHandle, session_id: &str, succe
     if let Ok(store) = state.store.lock() {
         let _ = super::log(&store, &bot.id, if successful { "reply" } else { "error" }, &text.chars().take(200).collect::<String>(), json!({"sessionId": session_id}));
     }
-    let _ = app.emit("bots-changed", ());
+    let _ = crate::events::emit(app, "bots-changed", ());
     // Send the next queued message natively, so bot threads keep moving without the window.
     // A failed run holds the queue until the next turn ends cleanly.
     let next = if !successful { None } else { state.store.lock().ok().and_then(|store| message_queue::list(&store, Some(session_id)).ok()).and_then(|queue| queue.into_iter().next()) };
@@ -221,7 +221,7 @@ pub(crate) async fn run_finished(app: &tauri::AppHandle, session_id: &str, succe
                 }
                 let _ = super::log(&store, &bot.id, "error", &format!("Couldn't send a queued message: {}", error.chars().take(160).collect::<String>()), json!({"sessionId": session_id}));
             }
-            let _ = app.emit("bots-changed", ());
+            let _ = crate::events::emit(app, "bots-changed", ());
         }
     }
 }
@@ -248,7 +248,7 @@ fn queued_prompt(attachments: &Value) -> (String, Vec<String>) {
 async fn answer(app: &tauri::AppHandle, session_id: &str, request_id: &str, approved: bool) -> Result<()> {
     crate::respond_approval(app.state::<AppState>(), session_id.to_owned(), request_id.to_owned(), approved).await?;
     let event = crate::providers::AgentEvent { session_id: session_id.into(), kind: "approval_cancelled".into(), text: String::new(), request_id: Some(request_id.into()), data: None, tool: None };
-    let _ = app.emit("agent-event", event);
+    let _ = crate::events::emit(app, "agent-event", event);
     Ok(())
 }
 
@@ -287,7 +287,7 @@ pub(crate) async fn approval_requested(app: &tauri::AppHandle, session_id: &str,
         "schedule" => notify(app, &bot, &message).await,
         channel => reply(app, &bot, channel, &thread.external_id, &message).await,
     }
-    let _ = app.emit("bots-changed", ());
+    let _ = crate::events::emit(app, "bots-changed", ());
 }
 
 async fn answer_approval(app: &tauri::AppHandle, bot: &Bot, session_id: &str, approved: bool, always: bool) -> Result<()> {
@@ -314,7 +314,7 @@ async fn answer_approval(app: &tauri::AppHandle, bot: &Bot, session_id: &str, ap
 /// Sends text to one thread, splitting it to fit the channel.
 pub(crate) async fn reply(app: &tauri::AppHandle, bot: &Bot, channel_id: &str, thread: &str, text: &str) {
     if channel_id == super::DESKTOP {
-        let _ = app.emit("bot-notification", json!({"botId": bot.id, "text": text}));
+        let _ = crate::events::emit(app, "bot-notification", json!({"botId": bot.id, "text": text}));
         return;
     }
     if let Err(error) = channels::send(app, channel_id, thread, text).await {
@@ -324,7 +324,7 @@ pub(crate) async fn reply(app: &tauri::AppHandle, bot: &Bot, channel_id: &str, t
 
 /// A proactive message: to the bot's notification thread, and always to the desktop app.
 pub(crate) async fn notify(app: &tauri::AppHandle, bot: &Bot, text: &str) {
-    let _ = app.emit("bot-notification", json!({"botId": bot.id, "text": text}));
+    let _ = crate::events::emit(app, "bot-notification", json!({"botId": bot.id, "text": text}));
     if let (Some(channel), Some(thread)) = (&bot.notify_channel_id, &bot.notify_thread) {
         reply(app, bot, channel, thread, text).await;
     }

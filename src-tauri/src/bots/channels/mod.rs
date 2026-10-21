@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Mutex;
-use tauri::{Emitter, Manager, State};
+use tauri::{Manager, State};
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -319,8 +319,8 @@ pub(crate) async fn handle_inbound(app: &tauri::AppHandle, channel_id: &str, sen
             }
         }
         Err((channel, Some(code), bot)) => {
-            let _ = app.emit("bots-changed", ());
-            let _ = app.emit("bot-pairing", json!({"botId": channel.bot_id, "channelId": channel_id, "senderName": sender_name, "code": code}));
+            let _ = crate::events::emit(app, "bots-changed", ());
+            let _ = crate::events::emit(app, "bot-pairing", json!({"botId": channel.bot_id, "channelId": channel_id, "senderName": sender_name, "code": code}));
             let _ = send(app, channel_id, thread, &format!("Hi! I'm {bot}. To talk with me, the owner needs to approve pairing code {code} in PandaCode (Bots → {bot} → Channels).")).await;
         }
         Err(_) => {}
@@ -368,7 +368,7 @@ pub(crate) fn update_status(app: &tauri::AppHandle, channel_id: &str, status: &s
     if let Ok(store) = app.state::<AppState>().store.lock() {
         set_status(&store, channel_id, status);
     }
-    let _ = app.emit("bots-changed", ());
+    let _ = crate::events::emit(app, "bots-changed", ());
 }
 
 /// Starts (or restarts) one channel's connection loop. Web channels share the local server.
@@ -459,7 +459,7 @@ pub async fn bot_channel_add(app: tauri::AppHandle, state: State<'_, AppState>, 
     input.config["identity"] = json!(identity);
     let channel = add(&*state.store.lock().map_err(|e| e.to_string())?, &bot_id, &input)?;
     start(&app, channel.clone());
-    let _ = app.emit("bots-changed", ());
+    let _ = crate::events::emit(&app, "bots-changed", ());
     Ok(channel)
 }
 
@@ -491,7 +491,7 @@ pub(crate) fn configure(store: &Store, channel_id: &str, patch: &Value) -> Resul
 #[tauri::command]
 pub async fn bot_channel_configure(app: tauri::AppHandle, state: State<'_, AppState>, channel_id: String, config: Value) -> Result<Channel> {
     let channel = configure(&*state.store.lock().map_err(|e| e.to_string())?, &channel_id, &config)?;
-    let _ = app.emit("bots-changed", ());
+    let _ = crate::events::emit(&app, "bots-changed", ());
     Ok(channel)
 }
 
@@ -509,7 +509,7 @@ pub async fn bot_channel_set_enabled(app: tauri::AppHandle, state: State<'_, App
         get(&store, &channel_id)?
     };
     start(&app, channel.clone());
-    let _ = app.emit("bots-changed", ());
+    let _ = crate::events::emit(&app, "bots-changed", ());
     Ok(channel)
 }
 
@@ -521,7 +521,7 @@ pub async fn bot_channel_remove(app: tauri::AppHandle, state: State<'_, AppState
     let channel = get(&store, &channel_id)?;
     store.db.execute("DELETE FROM bot_channels WHERE id=?1", [&channel_id]).map_err(|e| e.to_string())?;
     super::log(&store, &channel.bot_id, "channel", &format!("Removed a {} channel", channel.kind), json!({}))?;
-    let _ = app.emit("bots-changed", ());
+    let _ = crate::events::emit(&app, "bots-changed", ());
     Ok(())
 }
 
@@ -532,7 +532,7 @@ pub async fn bot_pairing_decide(app: tauri::AppHandle, state: State<'_, AppState
         let kind = kind_of(&*state.store.lock().map_err(|e| e.to_string())?, &channel_id).unwrap_or_default();
         let _ = send(&app, &channel_id, &direct_thread(&kind, &sender_id), "You're paired. Send me a message to get started.").await;
     }
-    let _ = app.emit("bots-changed", ());
+    let _ = crate::events::emit(&app, "bots-changed", ());
     Ok(())
 }
 

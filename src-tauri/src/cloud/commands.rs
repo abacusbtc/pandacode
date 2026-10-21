@@ -2,7 +2,7 @@
 use serde::Serialize;
 use serde_json::Value;
 use std::time::Duration;
-use tauri::{ipc::Response, AppHandle, Emitter};
+use tauri::{ipc::Response, AppHandle};
 
 use super::{aws::Aws, aws_screen, cloudflare::Cloudflare, daytona::Daytona, http::block, split, Machine};
 use crate::Result;
@@ -116,7 +116,7 @@ pub async fn cloud_connect(app: AppHandle, provider: String, key: String, option
             }
             _ => return Err("Unknown cloud provider.".into()),
         }
-        let _ = app.emit("vm-changed", serde_json::json!({}));
+        let _ = crate::events::emit(&app, "vm-changed", serde_json::json!({}));
         Ok(connections())
     })
     .await
@@ -155,7 +155,7 @@ pub async fn cloud_setup_sandboxes(app: AppHandle) -> Result<Vec<Connection>> {
     crate::blocking(move || {
         let token = super::secret("cloudflare_token").ok_or("Connect Cloudflare first.")?;
         let account = super::settings().cloudflare_account.ok_or("Connect Cloudflare first.")?;
-        let progress = |label: &str| { let _ = app.emit("cloud-setup", serde_json::json!({"provider": "cloudflare", "label": label})); };
+        let progress = |label: &str| { let _ = crate::events::emit(&app, "cloud-setup", serde_json::json!({"provider": "cloudflare", "label": label})); };
         let (url, secret) = super::cloudflare::deploy(&token, &account, &progress)?;
         progress("Checking the Worker…");
         let worker = Cloudflare::new(url.clone(), secret.clone());
@@ -171,7 +171,7 @@ pub async fn cloud_setup_sandboxes(app: AppHandle) -> Result<Vec<Connection>> {
         let mut settings = super::settings();
         settings.cloudflare_worker_url = Some(url);
         super::save_settings(&settings)?;
-        let _ = app.emit("vm-changed", serde_json::json!({}));
+        let _ = crate::events::emit(&app, "vm-changed", serde_json::json!({}));
         Ok(connections())
     })
     .await
@@ -225,7 +225,7 @@ pub async fn cloud_disconnect(app: AppHandle, provider: String) -> Result<Vec<Co
             }
             _ => return Err("Unknown cloud provider.".into()),
         }
-        let _ = app.emit("vm-changed", serde_json::json!({}));
+        let _ = crate::events::emit(&app, "vm-changed", serde_json::json!({}));
         Ok(connections())
     })
     .await
@@ -352,7 +352,7 @@ pub fn act(id: &str, action: &crate::vm::screen::Action) -> Result<String> {
 pub async fn cloud_create(app: AppHandle, provider: String, name: String) -> Result<Machine> {
     crate::blocking(move || {
         let machine = create(&provider, &name)?;
-        let _ = app.emit("vm-changed", serde_json::json!({}));
+        let _ = crate::events::emit(&app, "vm-changed", serde_json::json!({}));
         Ok(machine)
     })
     .await
@@ -361,7 +361,7 @@ pub async fn cloud_create(app: AppHandle, provider: String, name: String) -> Res
 pub async fn cloud_power(app: AppHandle, id: String, action: String) -> Result<()> {
     crate::blocking(move || {
         power(&id, &action)?;
-        let _ = app.emit("vm-changed", serde_json::json!({}));
+        let _ = crate::events::emit(&app, "vm-changed", serde_json::json!({}));
         Ok(())
     })
     .await

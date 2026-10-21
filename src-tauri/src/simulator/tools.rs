@@ -11,7 +11,7 @@ use std::{
     },
     time::Duration,
 };
-use tauri::{Emitter, Manager};
+use tauri::Manager;
 
 use super::{duo::Pose, Device, Input, Screen, Simulators};
 use crate::agent_tools::{spec, validate_spec};
@@ -129,7 +129,7 @@ fn manage(app: &tauri::AppHandle, sims: &Simulators, args: &Value) -> Result<Val
         }
         _ => return Err("Unknown simulator action.".into()),
     };
-    let _ = app.emit("simulator-changed", json!({"udid": device.udid, "show": matches!(action.as_str(), "boot" | "show")}));
+    let _ = crate::events::emit(app, "simulator-changed", json!({"udid": device.udid, "show": matches!(action.as_str(), "boot" | "show")}));
     Ok(json!(report))
 }
 

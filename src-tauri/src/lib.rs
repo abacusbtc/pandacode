@@ -21,6 +21,7 @@ mod vm;
 mod secret_store;
 mod cloud;
 mod data_lock;
+mod events;
 mod vsix_themes;
 mod token_saver;
 mod goal_state;
@@ -67,7 +68,7 @@ use std::{
     },
 };
 use storage::{ContextUsage, MessagePage, Project, Session, Store};
-use tauri::{Emitter, Manager, State};
+use tauri::{Manager, State};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
 type Result<T> = std::result::Result<T, String>;
@@ -544,14 +545,14 @@ async fn prompt_activity(state: State<'_, AppState>) -> Result<Vec<(i64, String,
 #[tauri::command]
 async fn pin_session(app: tauri::AppHandle, state: State<'_, AppState>, session_id: String, pinned: bool) -> Result<Session> {
     let task = state.store.lock().map_err(|e| e.to_string())?.pin_session(&session_id, pinned)?;
-    let _ = app.emit("sessions-changed", ());
+    let _ = crate::events::emit(&app, "sessions-changed", ());
     Ok(task)
 }
 #[tauri::command]
 async fn reorder_sessions(app: tauri::AppHandle, state: State<'_, AppState>, session_ids: Vec<String>) -> Result<Vec<Session>> {
     let store = state.store.clone();
     let tasks = blocking(move || store.lock().map_err(|e| e.to_string())?.reorder_sessions(&session_ids)).await?;
-    let _ = app.emit("sessions-changed", ());
+    let _ = crate::events::emit(&app, "sessions-changed", ());
     Ok(tasks)
 }
 #[tauri::command]
@@ -840,10 +841,10 @@ fn persist_turn_changes(
         Ok((message_id, summary)) => {
             let mut e = event(sid, "turn_changes", "");
             e.data = Some(serde_json::json!({"messageId":message_id,"turnChanges":summary}));
-            let _ = app.emit("agent-event", e);
+            let _ = crate::events::emit(app, "agent-event", e);
         }
         Err(error) => {
-            let _ = app.emit(
+            let _ = crate::events::emit(app, 
                 "agent-event",
                 event(
                     sid,
@@ -1532,7 +1533,7 @@ async fn launch_operation_admitted(
             team: team_admission,
         },
     )?;
-    let _ = app.emit("agent-event", event(&session_id, "status", "running"));
+    let _ = crate::events::emit(&app, "agent-event", event(&session_id, "status", "running"));
     let store = state.store.clone();
     let agents = state.agents.clone();
     // Optional metadata must never block a conversation when its storage cannot
@@ -1714,7 +1715,7 @@ async fn launch_operation_admitted(
             }
             let completed = e.kind == "turn_complete";
             let changes_sid = e.session_id.clone();
-            let _ = app_sink.emit("agent-event", e);
+            let _ = crate::events::emit(&app_sink, "agent-event", e);
             if completed {
                 if let Some(tracker) = &tracker_sink {
                     let capture = blocking_snapshot(|| {
@@ -1818,7 +1819,7 @@ async fn launch_operation_admitted(
             for child in changed {
                 let mut activity = event(&session_id, "subagent", "");
                 activity.data = serde_json::to_value(child).ok();
-                let _ = app.emit("agent-event", activity);
+                let _ = crate::events::emit(&app, "agent-event", activity);
             }
             if let Err(error) = saved {
                 if let Ok(mut slot) = persistence_error.lock() {
@@ -1856,7 +1857,7 @@ async fn launch_operation_admitted(
                     if db.record_goal(&session_id, Some(&goal)).is_ok() {
                         let mut e = event(&session_id, "goal", "");
                         e.data = serde_json::to_value(goal).ok();
-                        let _ = app.emit("agent-event", e);
+                        let _ = crate::events::emit(&app, "agent-event", e);
                     }
                 }
             }
@@ -1889,7 +1890,7 @@ async fn launch_operation_admitted(
             }
             if let Some(title) = &title_run {
                 if title.finish(&db, successful).unwrap_or(false) {
-                    let _ = app.emit("sessions-changed", ());
+                    let _ = crate::events::emit(&app, "sessions-changed", ());
                 }
             }
         } else {
@@ -1897,7 +1898,7 @@ async fn launch_operation_admitted(
         }
         if let Ok(error) = persistence_error.lock() {
             if let Some(error) = error.as_ref() {
-                let _ = app.emit(
+                let _ = crate::events::emit(&app, 
                     "agent-event",
                     event(
                         &session_id,
@@ -1910,7 +1911,7 @@ async fn launch_operation_admitted(
         if let Some(registry) = registry.as_mut() {
             registry.remove(&session_id);
         }
-        let _ = app.emit(
+        let _ = crate::events::emit(&app, 
             "agent-event",
             event(
                 &session_id,
@@ -2894,6 +2895,10 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
+            // One sink per process: here the app's own webviews, so every emit
+            // takes the same path a gateway would. Installed first, so nothing
+            // emitted during startup falls back to a different route.
+            let _ = crate::events::set_sink(std::sync::Arc::new(app.handle().clone()));
             if let Ok(cache) = app.path().app_cache_dir() {
                 turn_changes::cleanup_cache(&cache.join("turn-captures"));
             }
@@ -2964,7 +2969,7 @@ pub fn run() {
                         .and_then(|store| store.archive_completed(storage::now()));
                     match archived {
                         Ok(count) if count > 0 => {
-                            let _ = handle.emit("sessions-changed", ());
+                            let _ = crate::events::emit(&handle, "sessions-changed", ());
                         }
                         Err(error) => eprintln!("Completed task archive failed: {error}"),
                         _ => {}

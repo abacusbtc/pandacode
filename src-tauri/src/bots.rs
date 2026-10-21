@@ -18,7 +18,7 @@ use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::PathBuf;
-use tauri::{Emitter, Manager, State};
+use tauri::{Manager, State};
 
 pub(crate) const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS bots(
@@ -565,8 +565,8 @@ pub async fn bot_desktop_thread(app: tauri::AppHandle, state: State<'_, AppState
         thread_session(&store, &bot, DESKTOP, DESKTOP, &format!("{} · You", bot.name))?
     };
     if created {
-        let _ = app.emit("sessions-changed", ());
-        let _ = app.emit("bots-changed", ());
+        let _ = crate::events::emit(&app, "sessions-changed", ());
+        let _ = crate::events::emit(&app, "bots-changed", ());
     }
     Ok(session)
 }
@@ -590,7 +590,7 @@ pub async fn bot_detail(state: State<'_, AppState>, bot_id: String) -> Result<Bo
 pub async fn bot_create(app: tauri::AppHandle, window: tauri::WebviewWindow, state: State<'_, AppState>, input: BotInput) -> Result<Bot> {
     guard_main(&window)?;
     let bot = create(&*state.store.lock().map_err(|e| e.to_string())?, &input, &workspace_root())?;
-    let _ = app.emit("bots-changed", ());
+    let _ = crate::events::emit(&app, "bots-changed", ());
     Ok(bot)
 }
 
@@ -598,7 +598,7 @@ pub async fn bot_create(app: tauri::AppHandle, window: tauri::WebviewWindow, sta
 pub async fn bot_update(app: tauri::AppHandle, window: tauri::WebviewWindow, state: State<'_, AppState>, bot_id: String, input: BotInput) -> Result<Bot> {
     guard_main(&window)?;
     let bot = update(&*state.store.lock().map_err(|e| e.to_string())?, &bot_id, &input)?;
-    let _ = app.emit("bots-changed", ());
+    let _ = crate::events::emit(&app, "bots-changed", ());
     Ok(bot)
 }
 
@@ -609,7 +609,7 @@ pub async fn bot_set_paused(app: tauri::AppHandle, window: tauri::WebviewWindow,
         gateway::stop_bot(&app, &bot_id).await;
     }
     let bot = set_paused(&*state.store.lock().map_err(|e| e.to_string())?, &bot_id, paused)?;
-    let _ = app.emit("bots-changed", ());
+    let _ = crate::events::emit(&app, "bots-changed", ());
     Ok(bot)
 }
 
@@ -618,8 +618,8 @@ pub async fn bot_reset(app: tauri::AppHandle, window: tauri::WebviewWindow, stat
     guard_main(&window)?;
     gateway::stop_bot(&app, &bot_id).await;
     let bot = reset(&*state.store.lock().map_err(|e| e.to_string())?, &bot_id)?;
-    let _ = app.emit("bots-changed", ());
-    let _ = app.emit("sessions-changed", ());
+    let _ = crate::events::emit(&app, "bots-changed", ());
+    let _ = crate::events::emit(&app, "sessions-changed", ());
     Ok(bot)
 }
 
@@ -629,22 +629,22 @@ pub async fn bot_delete(app: tauri::AppHandle, window: tauri::WebviewWindow, sta
     gateway::stop_bot(&app, &bot_id).await;
     channels::stop_bot_channels(&app, &bot_id).await;
     delete(&*state.store.lock().map_err(|e| e.to_string())?, &bot_id)?;
-    let _ = app.emit("bots-changed", ());
-    let _ = app.emit("sessions-changed", ());
+    let _ = crate::events::emit(&app, "bots-changed", ());
+    let _ = crate::events::emit(&app, "sessions-changed", ());
     Ok(())
 }
 
 #[tauri::command]
 pub async fn bot_remember(app: tauri::AppHandle, state: State<'_, AppState>, bot_id: String, content: String) -> Result<Memory> {
     let memory = remember(&*state.store.lock().map_err(|e| e.to_string())?, &bot_id, &content, "user")?;
-    let _ = app.emit("bots-changed", ());
+    let _ = crate::events::emit(&app, "bots-changed", ());
     Ok(memory)
 }
 
 #[tauri::command]
 pub async fn bot_forget(app: tauri::AppHandle, state: State<'_, AppState>, bot_id: String, memory_id: String) -> Result<()> {
     forget(&*state.store.lock().map_err(|e| e.to_string())?, &bot_id, &memory_id)?;
-    let _ = app.emit("bots-changed", ());
+    let _ = crate::events::emit(&app, "bots-changed", ());
     Ok(())
 }
 

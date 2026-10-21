@@ -9,7 +9,7 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
-use tauri::{AppHandle, Emitter};
+use tauri::AppHandle;
 
 use crate::token_saver::find_tool;
 use crate::workspace::{checked, run_process};
@@ -24,7 +24,7 @@ pub const AVD: &str = "Pixel_9_API_35";
 struct Progress { step: usize, total: usize, label: String, done: bool, error: Option<String> }
 
 fn emit(app: &AppHandle, step: usize, total: usize, label: &str) {
-    let _ = app.emit("android-setup", Progress { step, total, label: label.into(), done: false, error: None });
+    let _ = crate::events::emit(app, "android-setup", Progress { step, total, label: label.into(), done: false, error: None });
 }
 fn brew(args: &[&str]) -> Result<(), String> {
     let brew = find_tool("brew").ok_or("Homebrew is needed to set up the Android emulator. Install it from brew.sh, or install Android Studio.")?;
@@ -109,7 +109,7 @@ pub async fn android_setup(app: AppHandle) -> crate::Result<String> {
     let events = app.clone();
     let result = crate::blocking(move || run(&app)).await;
     RUNNING.store(false, Ordering::SeqCst);
-    let _ = events.emit("android-setup", Progress { step: 5, total: 5, label: match &result { Ok(_) => "Android emulator ready".into(), Err(_) => "Android setup stopped".into() }, done: true, error: result.as_ref().err().cloned() });
+    let _ = crate::events::emit(&events, "android-setup", Progress { step: 5, total: 5, label: match &result { Ok(_) => "Android emulator ready".into(), Err(_) => "Android setup stopped".into() }, done: true, error: result.as_ref().err().cloned() });
     result
 }
 

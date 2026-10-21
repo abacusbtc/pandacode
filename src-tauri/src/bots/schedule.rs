@@ -9,7 +9,7 @@ use crate::{storage::Store, AppState, Result};
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tauri::{Emitter, Manager, State};
+use tauri::{Manager, State};
 
 const MINUTE: i64 = 60_000;
 const DAY: i64 = 24 * 60 * MINUTE;
@@ -219,7 +219,7 @@ pub(crate) fn start(app: tauri::AppHandle) {
             for bot in due.1 {
                 let _ = gateway::run_scheduled(&app, &bot.id, "Check-in", HEARTBEAT_PROMPT).await;
             }
-            let _ = app.emit("bots-changed", ());
+            let _ = crate::events::emit(&app, "bots-changed", ());
         }
     });
 }
@@ -227,21 +227,21 @@ pub(crate) fn start(app: tauri::AppHandle) {
 #[tauri::command]
 pub async fn bot_schedule_create(app: tauri::AppHandle, state: State<'_, AppState>, bot_id: String, input: ScheduleInput) -> Result<Schedule> {
     let schedule = create(&*state.store.lock().map_err(|e| e.to_string())?, &bot_id, &input, "user", crate::storage::now())?;
-    let _ = app.emit("bots-changed", ());
+    let _ = crate::events::emit(&app, "bots-changed", ());
     Ok(schedule)
 }
 
 #[tauri::command]
 pub async fn bot_schedule_set_enabled(app: tauri::AppHandle, state: State<'_, AppState>, schedule_id: String, enabled: bool) -> Result<Schedule> {
     let schedule = set_enabled(&*state.store.lock().map_err(|e| e.to_string())?, &schedule_id, enabled, crate::storage::now())?;
-    let _ = app.emit("bots-changed", ());
+    let _ = crate::events::emit(&app, "bots-changed", ());
     Ok(schedule)
 }
 
 #[tauri::command]
 pub async fn bot_schedule_delete(app: tauri::AppHandle, state: State<'_, AppState>, bot_id: String, schedule_id: String) -> Result<()> {
     delete(&*state.store.lock().map_err(|e| e.to_string())?, &bot_id, &schedule_id)?;
-    let _ = app.emit("bots-changed", ());
+    let _ = crate::events::emit(&app, "bots-changed", ());
     Ok(())
 }
 

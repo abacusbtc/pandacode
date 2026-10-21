@@ -9,7 +9,7 @@ use std::{
     },
     time::Duration,
 };
-use tauri::{Emitter, Manager};
+use tauri::Manager;
 
 use super::{screen, tart, Vms};
 use crate::cloud::commands as cloud;
@@ -151,7 +151,7 @@ fn manage(app: &tauri::AppHandle, session_id: &str, vms: &Vms, args: &Value) -> 
             }
         }
     };
-    let _ = app.emit("vm-changed", json!({"show": matches!(action.as_str(), "create" | "start" | "show")}));
+    let _ = crate::events::emit(app, "vm-changed", json!({"show": matches!(action.as_str(), "create" | "start" | "show")}));
     Ok(json!(report))
 }
 
