@@ -6,6 +6,7 @@
 pub mod config;
 
 mod dispatch;
+mod events;
 mod rpc;
 mod server;
 mod static_files;
@@ -35,6 +36,9 @@ pub struct GatewayHandle {
     pub addr: SocketAddr,
     pub shutdown: tokio::sync::oneshot::Sender<()>,
     pub join: tokio::task::JoinHandle<()>,
+    /// This gateway's own sink, so a test never depends on which process-wide sink
+    /// won a race.
+    sink: Arc<events::BroadcastSink>,
 }
 
 impl GatewayHandle {
@@ -42,6 +46,14 @@ impl GatewayHandle {
     pub async fn stop(self) {
         let _ = self.shutdown.send(());
         let _ = self.join.await;
+    }
+
+    /// Emits as the server would, straight into this gateway's `/events` sockets.
+    /// Broadcasting is synchronous, so there is nothing to await; the plan's
+    /// sketch made this async and that was ceremony.
+    pub fn emit<T: serde::Serialize>(&self, name: &str, payload: T) {
+        self.sink
+            .publish(name, serde_json::to_value(payload).unwrap_or(serde_json::Value::Null));
     }
 }
 
@@ -57,10 +69,16 @@ pub async fn spawn(config: GatewayConfig) -> std::io::Result<GatewayHandle> {
         }
     };
     let state = crate::gateway_state(&config.data_dir).map_err(std::io::Error::other)?;
+    let sink = events::BroadcastSink::new();
+    // First gateway in this process owns the sink. A second one is a second port on
+    // the same data directory, which the lock already refuses, so this is only a
+    // guard against two sinks in one process.
+    let _ = crate::events::set_sink(sink.clone());
     let router = server::router(server::RouterState {
         token: config.token.clone(),
         allowed_origins: config.allowed_origins.clone(),
         static_dir: config.static_dir.clone(),
+        events: sink.clone(),
         ctx: dispatch::Ctx {
             state: Arc::new(state),
         },
@@ -84,5 +102,6 @@ pub async fn spawn(config: GatewayConfig) -> std::io::Result<GatewayHandle> {
         addr,
         shutdown,
         join,
+        sink,
     })
 }

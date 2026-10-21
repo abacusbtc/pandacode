@@ -51,7 +51,7 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 tauri-plugin-updater = ">=2, <2.10"
 tauri-plugin-process = ">=2, <2.4"
 # Only the `gateway` feature pulls these in; nothing in the desktop build links them.
-axum = { version = "0.8", optional = true }
+axum = { version = "0.8", optional = true, features = ["ws"] }
 tower-http = { version = "0.6", default-features = false, features = ["cors"], optional = true }
 tempfile = { version = "3", optional = true }
 

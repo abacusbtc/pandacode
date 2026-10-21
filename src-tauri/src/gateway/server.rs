@@ -3,21 +3,26 @@
 use std::time::Duration;
 
 use axum::{
-    extract::{DefaultBodyLimit, Request, State},
-    http::{header, HeaderValue, Method, StatusCode, Uri},
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        DefaultBodyLimit, Request, State,
+    },
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     Router,
 };
+use tokio::sync::broadcast;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
-use super::{dispatch, rpc, static_files};
+use super::{dispatch, events::BroadcastSink, rpc, static_files};
 use serde_json::json;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// The only paths a token protects. The SPA's own files must load before a
-/// client can present one, and `/events` joins this list in Task 6.
-const GUARDED: &[&str] = &["/rpc", "/capabilities"];
+/// client can present one.
+const GUARDED: &[&str] = &["/rpc", "/capabilities", "/events"];
 
 /// 64 MB, the same number docs/gateway.md tells the reverse proxy to use for
 /// `client_max_body_size`, so the proxy and the gateway refuse the same body
@@ -31,6 +36,7 @@ pub(crate) struct RouterState {
     pub(crate) token: String,
     pub(crate) allowed_origins: Vec<String>,
     pub(crate) static_dir: Option<PathBuf>,
+    pub(crate) events: Arc<BroadcastSink>,
     pub(crate) ctx: dispatch::Ctx,
 }
 
@@ -40,6 +46,7 @@ pub(crate) fn router(state: RouterState) -> Router {
         .route("/healthz", axum::routing::get(|| async { "ok" }))
         .route("/capabilities", axum::routing::get(capabilities))
         .route("/rpc", axum::routing::post(rpc::handle))
+        .route("/events", axum::routing::get(events_socket))
         .fallback(spa)
         // Layer order is load-bearing: the last layer is outermost, so CORS
         // answers the browser's token-less preflight and auth guards the rest.
@@ -85,6 +92,34 @@ fn not_found() -> Response {
     (StatusCode::NOT_FOUND, "not found").into_response()
 }
 
+/// One socket per client, each receiving every event the sink emits.
+async fn events_socket(State(state): State<RouterState>, upgrade: WebSocketUpgrade) -> Response {
+    let receiver = state.events.subscribe();
+    upgrade.on_upgrade(move |socket| forward(socket, receiver))
+}
+
+async fn forward(mut socket: WebSocket, mut receiver: broadcast::Receiver<String>) {
+    loop {
+        tokio::select! {
+            incoming = socket.recv() => match incoming {
+                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
+                _ => {}
+            },
+            event = receiver.recv() => match event {
+                Ok(frame) => {
+                    if socket.send(Message::Text(frame.into())).await.is_err() {
+                        break;
+                    }
+                }
+                // A client that fell behind skips ahead rather than stalling the
+                // emitter; the UI reloads state on reconnect anyway.
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
+        }
+    }
+}
+
 async fn authorize(State(state): State<RouterState>, request: Request, next: Next) -> Response {
     // CORS is outermost, so a real preflight never reaches this point: what this
     // middleware sees are the app's own requests. Guard by the canonical path,
@@ -94,15 +129,34 @@ async fn authorize(State(state): State<RouterState>, request: Request, next: Nex
     if !GUARDED.contains(&path.as_str()) {
         return next.run(request).await;
     }
-    let presented = request
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "));
-    if presented != Some(state.token.as_str()) {
+    let presented = bearer(request.headers()).or_else(|| {
+        // A browser cannot set headers on a WebSocket handshake, so the socket
+        // accepts the token as a query parameter too. Nothing else does: a token
+        // in a URL is more likely to end up in a log.
+        (path == "/events")
+            .then(|| query_token(request.uri()))
+            .flatten()
+    });
+    if presented.as_deref() != Some(state.token.as_str()) {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }
     next.run(request).await
+}
+
+fn bearer(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::to_string)
+}
+
+/// The gateway's own token is hex, so it needs no percent-decoding.
+fn query_token(uri: &Uri) -> Option<String> {
+    uri.query()?
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("token="))
+        .map(str::to_string)
 }
 
 /// Collapses the spellings axum does not route to a handler, so `/rpc/` and

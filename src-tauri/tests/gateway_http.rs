@@ -6,6 +6,7 @@
 
 use std::path::Path;
 
+use futures_util::StreamExt;
 use pandacode_lib::gateway::{config, spawn, GatewayHandle, GatewayConfig};
 use serde_json::{json, Value};
 
@@ -271,6 +272,77 @@ async fn force_owner_cannot_take_a_live_lock() {
     assert!(
         error.contains("--force-owner does not take a live lock"),
         "{error}"
+    );
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn websocket_clients_receive_emitted_events() {
+    install_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = start(dir.path()).await;
+    let url = format!("ws://{}/events?token=test-token", handle.addr);
+    let (mut socket, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+
+    // The exact bytes a streaming text delta puts on the wire. The frame must not
+    // wrap, rename or re-nest them: a client reads these fields by name.
+    let delta = json!({
+        "sessionId": "s1",
+        "kind": "text",
+        "text": "hi",
+        "requestId": null,
+        "data": null,
+    });
+    handle.emit("agent-event", delta.clone());
+
+    let message = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let frame: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+    assert_eq!(frame["event"], "agent-event");
+    assert_eq!(frame["payload"], delta, "payload was rewritten in transit");
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn the_sessions_changed_frame_carries_a_null_payload() {
+    install_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = start(dir.path()).await;
+    let url = format!("ws://{}/events?token=test-token", handle.addr);
+    let (mut socket, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+
+    // Every sessions-changed call site passes (). A payload that turned into {} or
+    // a struct would still arrive and still be ignored, until a client read it.
+    handle.emit("sessions-changed", ());
+    let message = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let frame: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+    assert_eq!(frame["event"], "sessions-changed");
+    assert_eq!(frame["payload"], Value::Null);
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn the_events_socket_refuses_a_missing_or_wrong_token() {
+    install_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = start(dir.path()).await;
+
+    let bare = format!("ws://{}/events", handle.addr);
+    assert!(
+        tokio_tungstenite::connect_async(bare).await.is_err(),
+        "the socket accepted a handshake with no token"
+    );
+    let wrong = format!("ws://{}/events?token=nope", handle.addr);
+    assert!(
+        tokio_tungstenite::connect_async(wrong).await.is_err(),
+        "the socket accepted a wrong token"
     );
     handle.stop().await;
 }
