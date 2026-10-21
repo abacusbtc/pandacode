@@ -6,7 +6,6 @@
 
 use axum::{
     extract::{rejection::JsonRejection, State},
-    http::StatusCode,
     response::{IntoResponse, Response},
     Json,
 };
@@ -39,7 +38,9 @@ pub async fn handle(
 ) -> Response {
     let Json(request) = match body {
         Ok(body) => body,
-        Err(rejection) => return (StatusCode::BAD_REQUEST, rejection.body_text()).into_response(),
+        // The rejection carries the status: a malformed body is a client error
+        // and an oversized one is 413, which must not be flattened to 400.
+        Err(rejection) => return (rejection.status(), rejection.body_text()).into_response(),
     };
     let command = request.command;
     let args = request.args;

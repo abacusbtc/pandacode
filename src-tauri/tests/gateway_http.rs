@@ -413,6 +413,42 @@ async fn serves_index_for_unknown_routes_and_types_assets() {
 }
 
 #[tokio::test]
+async fn an_oversized_rpc_body_is_refused_with_413() {
+    install_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = start(dir.path()).await;
+    // One byte past the 64 MB the router allows; the JSON wrapper adds a little.
+    let padding = "x".repeat(64 * 1024 * 1024);
+    let response = reqwest::Client::new()
+        .post(format!("http://{}/rpc", handle.addr))
+        .header("Authorization", "Bearer test-token")
+        .json(&json!({
+            "id": "1",
+            "command": "list_projects",
+            "args": { "padding": padding },
+        }))
+        .send()
+        .await
+        .unwrap();
+    // 413, not 400 from the JSON rejection and not 500 from a buffered body.
+    assert_eq!(response.status(), 413);
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn a_large_body_under_the_cap_still_reaches_the_dispatcher() {
+    install_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = start(dir.path()).await;
+    // Well over the 2 MB default this router no longer inherits, and far under
+    // the cap it sets, so the boundary is the coded one rather than a default.
+    let padding = "x".repeat(4 * 1024 * 1024);
+    let body = rpc(&handle, "list_projects", json!({ "padding": padding })).await;
+    assert_eq!(body["ok"], true, "{body:?}");
+    handle.stop().await;
+}
+
+#[tokio::test]
 async fn unknown_routes_are_404_without_a_built_frontend() {
     install_crypto_provider();
     let dir = tempfile::tempdir().unwrap();

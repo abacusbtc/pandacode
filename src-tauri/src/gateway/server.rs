@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use axum::{
-    extract::{Request, State},
+    extract::{DefaultBodyLimit, Request, State},
     http::{header, HeaderValue, Method, StatusCode, Uri},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -18,6 +18,12 @@ use std::path::PathBuf;
 /// The only paths a token protects. The SPA's own files must load before a
 /// client can present one, and `/events` joins this list in Task 6.
 const GUARDED: &[&str] = &["/rpc", "/capabilities"];
+
+/// 64 MB, the same number docs/gateway.md tells the reverse proxy to use for
+/// `client_max_body_size`, so the proxy and the gateway refuse the same body
+/// instead of disagreeing. Base64 attachments are the largest thing this surface
+/// will carry; the limit is ours, not a framework default nobody chose.
+const MAX_BODY: usize = 64 * 1024 * 1024;
 
 /// What a request needs to be authorised and answered.
 #[derive(Clone)]
@@ -40,6 +46,8 @@ pub(crate) fn router(state: RouterState) -> Router {
         // Swapping these two breaks the app's client with an opaque browser error.
         .layer(middleware::from_fn_with_state(state.clone(), authorize))
         .layer(cors)
+        // Outermost, so no handler buffers a body before the cap is applied.
+        .layer(DefaultBodyLimit::max(MAX_BODY))
         .with_state(state)
 }
 
