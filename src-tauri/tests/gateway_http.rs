@@ -6,8 +6,18 @@
 
 use pandacode_lib::gateway::{spawn, GatewayConfig};
 
+/// The crate builds rustls without a default provider (`rustls-no-provider`), so
+/// any process that builds a reqwest client installs one first — the same call
+/// `cloud::http::client` makes for the app.
+fn install_crypto_provider() {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+}
+
 #[tokio::test]
 async fn healthz_returns_ok() {
+    install_crypto_provider();
     let dir = tempfile::tempdir().unwrap();
     let config = GatewayConfig {
         data_dir: dir.path().to_path_buf(),
