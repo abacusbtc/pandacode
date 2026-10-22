@@ -533,6 +533,159 @@ async fn capabilities_come_from_the_table_the_dispatcher_answers() {
 }
 
 #[tokio::test]
+async fn lists_directories_on_the_server_filesystem() {
+    install_crypto_provider();
+    let data = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("alpha")).unwrap();
+    std::fs::create_dir(root.path().join("beta")).unwrap();
+    std::fs::write(root.path().join("file.txt"), "x").unwrap();
+    std::fs::create_dir(root.path().join(".git")).unwrap();
+    let handle = start(data.path()).await;
+
+    let listing = call(
+        &handle,
+        "gateway_list_dirs",
+        json!({ "path": root.path().to_str().unwrap() }),
+    )
+    .await;
+
+    // Folders only: a file is not a folder a project could be opened in, and a
+    // dot directory stays hidden until asked for.
+    let entries = listing["entries"].as_array().unwrap();
+    let names: Vec<&str> = entries
+        .iter()
+        .map(|entry| entry["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["alpha", "beta"]);
+    assert!(entries.iter().all(|entry| entry["isDir"] == true));
+    assert_eq!(listing["path"], root.path().to_str().unwrap());
+    assert_eq!(
+        listing["parent"],
+        root.path().parent().unwrap().to_str().unwrap()
+    );
+
+    // The returned path is what the client appends entry names to, so a trailing
+    // slash is normalised away rather than doubling up in the next request.
+    let slashed = call(
+        &handle,
+        "gateway_list_dirs",
+        json!({ "path": format!("{}/", root.path().display()) }),
+    )
+    .await;
+    assert_eq!(slashed["path"], root.path().to_str().unwrap());
+
+    let hidden = call(
+        &handle,
+        "gateway_list_dirs",
+        json!({ "path": root.path().to_str().unwrap(), "showHidden": true }),
+    )
+    .await;
+    // Sorted case-insensitively, so the caller can render the list as received.
+    let names: Vec<&str> = hidden["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec![".git", "alpha", "beta"]);
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn a_listing_path_the_server_cannot_use_is_refused() {
+    install_crypto_provider();
+    let data = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("file.txt"), "x").unwrap();
+    let handle = start(data.path()).await;
+
+    // A relative path is ambiguous on a remote server: it would resolve against
+    // the gateway's own working directory, which is not the client's view.
+    let body = rpc(&handle, "gateway_list_dirs", json!({ "path": "src" })).await;
+    assert_eq!(body["error"], "not_a_directory: src");
+
+    let missing = root.path().join("does-not-exist");
+    let body = rpc(
+        &handle,
+        "gateway_list_dirs",
+        json!({ "path": missing.to_str().unwrap() }),
+    )
+    .await;
+    assert_eq!(
+        body["error"],
+        format!("not_a_directory: {}", missing.display())
+    );
+
+    // A regular file is not a directory either, and says so the same way.
+    let file = root.path().join("file.txt");
+    let body = rpc(
+        &handle,
+        "gateway_list_dirs",
+        json!({ "path": file.to_str().unwrap() }),
+    )
+    .await;
+    assert_eq!(body["error"], format!("not_a_directory: {}", file.display()));
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn an_omitted_listing_path_starts_at_the_server_home() {
+    install_crypto_provider();
+    let data = tempfile::tempdir().unwrap();
+    let handle = start(data.path()).await;
+
+    let omitted = call(&handle, "gateway_list_dirs", json!({})).await;
+    // Explicit null and an omitted key mean the same thing, so a client that
+    // always sends the field gets the same starting point.
+    let null = call(&handle, "gateway_list_dirs", json!({ "path": null })).await;
+    assert_eq!(omitted["path"], null["path"]);
+
+    if let Some(home) = std::env::var_os("HOME") {
+        assert_eq!(omitted["path"], home.to_string_lossy().as_ref());
+        assert!(omitted["entries"].is_array());
+    }
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn directory_listing_is_advertised_and_answered() {
+    install_crypto_provider();
+    let data = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let handle = start(data.path()).await;
+
+    let response = reqwest::Client::new()
+        .get(format!("http://{}/capabilities", handle.addr))
+        .header("Authorization", "Bearer test-token")
+        .send()
+        .await
+        .unwrap();
+    let body: Value = response.json().await.unwrap();
+    let commands: Vec<&str> = body["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|command| command.as_str())
+        .collect();
+    // The other direction of the pin: a command the table answers must be
+    // advertised, or a client hides a surface the server supports.
+    assert!(
+        commands.contains(&"gateway_list_dirs"),
+        "gateway_list_dirs answers but is not advertised: {commands:?}"
+    );
+
+    let listing = call(
+        &handle,
+        "gateway_list_dirs",
+        json!({ "path": root.path().to_str().unwrap() }),
+    )
+    .await;
+    assert_eq!(listing["entries"].as_array().unwrap().len(), 0);
+    handle.stop().await;
+}
+
+#[tokio::test]
 async fn serves_index_for_unknown_routes_and_types_assets() {
     install_crypto_provider();
     let dist = tempfile::tempdir().unwrap();

@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
+use super::commands;
 use crate::AppState;
 
 /// The M1 commands. `handle` and `/capabilities` both read this list, so the
@@ -18,6 +19,7 @@ pub(crate) const COMMANDS: &[&str] = &[
     "list_sessions",
     "create_session",
     "get_messages",
+    "gateway_list_dirs",
     "gateway_status",
 ];
 
@@ -101,6 +103,17 @@ pub fn handle(command: &str, args: Value, ctx: &Ctx) -> Result<Value, String> {
                 args.session_id,
                 args.before_id,
             )?)
+        }
+        "gateway_list_dirs" => {
+            #[derive(serde::Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct Args {
+                path: Option<String>,
+                #[serde(default)]
+                show_hidden: bool,
+            }
+            let args: Args = from_value(args)?;
+            commands::list_dirs(args.path, args.show_hidden)
         }
         other => Err(format!("unsupported_command: {other}")),
     }
