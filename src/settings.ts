@@ -158,8 +158,10 @@ export function mountSettings(host: HTMLElement, options: SettingsOptions): Sett
     mounted.add(id);
     const panel = panels.get(id)!;
     if (id === 'general') {
-      // The quick launcher is a Tauri window; a gateway does not serve it.
+      // The quick launcher is a Tauri window; a gateway does not serve it, so drop its
+      // heading with its panel rather than leave an empty section behind.
       if (capabilityEnabled('overlay_toggle')) cleanups.push(mountOverlaySettings(panel.querySelector<HTMLElement>('#launcher-settings')!));
+      else for (const selector of ['#launcher-heading', '#launcher-settings']) panel.querySelector(selector)?.setAttribute('hidden', '');
       if (options.gateway) cleanups.push(options.gateway(panel.querySelector<HTMLElement>('#gateway-settings')!));
     }
     if (id === 'github' && options.github) cleanups.push(options.github(panel.querySelector<HTMLElement>('#github-settings')!));

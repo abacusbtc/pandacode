@@ -18,7 +18,22 @@ const previewWorkspaceFiles = ['index.html', '.gitignore', 'README.md', 'package
 const sampleTestOutput = 'PASS src/components/search.test.ts\n  ✓ filters results as the query changes\n  ✓ preserves keyboard selection\n\nTests: 12 passed, 12 total\nTime: 0.8s\nSample output — no command was executed.';
 function encodeTool(tool: ToolActivity): string { return JSON.stringify({ type: 'tool_activity', version: 1, ...tool }); }
 /** The gateway address the preview has saved; the real one lives in the OS keychain. */
-let previewGateway: { url: string; token: string } | null = null;
+const PREVIEW_GATEWAY_KEY = 'pandacode.preview.gateway';
+/** The browser has no keychain, so localStorage stands in and a reload behaves like a relaunch. */
+function readSavedGateway(): { url: string; token: string } | null {
+  try {
+    const raw = localStorage.getItem(PREVIEW_GATEWAY_KEY);
+    if (!raw) return null;
+    const value = JSON.parse(raw) as { url?: unknown; token?: unknown };
+    return typeof value.url === 'string' && typeof value.token === 'string' ? { url: value.url, token: value.token } : null;
+  } catch { return null; }
+}
+function writeSavedGateway(value: { url: string; token: string } | null): void {
+  try {
+    if (value) localStorage.setItem(PREVIEW_GATEWAY_KEY, JSON.stringify(value));
+    else localStorage.removeItem(PREVIEW_GATEWAY_KEY);
+  } catch { /* storage can be unavailable; the preview still works without it */ }
+}
 let projects: Project[] = [{ id: 'project-1', name: 'orbit', path: '/Users/you/Projects/orbit' }, { id: 'project-2', name: 'pandacode', path: '/Users/you/Projects/pandacode' }];
 let sessions: Session[] = [
   { id: 'session-1', projectId: 'project-1', title: 'Make search feel instant', provider: 'claude', model: 'sonnet', mode: 'ask', status: 'idle', createdAt: now - 420000, updatedAt: now, archived: false, worktreePath: null, resumeId: 'preview-session', lastResponseAt: now - 300000 },
@@ -1204,9 +1219,14 @@ export async function invoke<T>(command: string, args: Record<string, any>): Pro
     case 'get_run_script': result = null; break;
     case 'get_run_script_preview': result = null; break;
     case 'get_terminal_preferences': result = {}; break;
-    case 'gateway_config': result = previewGateway; break;
-    case 'gateway_connect': previewGateway = { url: String(args.url), token: String(args.token) }; result = previewGateway; break;
-    case 'gateway_disconnect': previewGateway = null; break;
+    case 'gateway_config': result = readSavedGateway(); break;
+    case 'gateway_connect': {
+      const saved = { url: String(args.url), token: String(args.token) };
+      writeSavedGateway(saved);
+      result = saved;
+      break;
+    }
+    case 'gateway_disconnect': writeSavedGateway(null); break;
     case 'start_run_script_terminal':
     case 'start_harness_terminal': case 'start_terminal': {
       const terminalId = 'preview-terminal-' + crypto.randomUUID(); result = terminalId;
