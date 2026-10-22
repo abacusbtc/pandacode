@@ -5,6 +5,7 @@
 
 pub mod config;
 
+mod commands;
 mod dispatch;
 mod events;
 mod rpc;
