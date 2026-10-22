@@ -10,6 +10,8 @@ let remote: GatewayClient | null = null;
 
 /** Remote mode is chosen at boot, before the first `call`. */
 export function setMode(next: Mode, client?: GatewayClient | null): void {
+  // A replaced or discarded remote client stops its socket and reconnect timer.
+  if (remote && remote !== client) remote.close();
   mode = next;
   remote = client ?? null;
 }
@@ -52,21 +54,21 @@ export async function subscribe(name: string, callback: (event: any) => void): P
     if (!remote) throw 'gateway_disconnected: no gateway is connected';
     return remote.subscribe(name, callback);
   }
-  if (preview) return (await import('./preview')).listen(name, callback);
+  if (mode === 'preview') return (await import('./preview')).listen(name, callback);
   return (await import('@tauri-apps/api/event')).listen(name, event => callback(event.payload));
 }
 export async function chooseFolder(title = 'Open a project in PandaCode'): Promise<string | null> {
   // A local dialog would return a path on this machine, which does not exist on the
   // gateway; the remote folder picker takes over from here.
   if (mode === 'remote') return null;
-  if (preview) return '/Users/you/Projects/new-project';
+  if (mode === 'preview') return '/Users/you/Projects/new-project';
   const result = await (await import('@tauri-apps/plugin-dialog')).open({ directory: true, multiple: false, title });
   return typeof result === 'string' ? result : null;
 }
 /** Files to attach to a message. The preview returns a fixed sample selection. */
 export async function chooseAttachments(): Promise<string[]> {
   if (mode === 'remote') return [];
-  if (preview) return (await import('./preview')).samplePick('files');
+  if (mode === 'preview') return (await import('./preview')).samplePick('files');
   const result = await (await import('@tauri-apps/plugin-dialog')).open({ multiple: true, title: 'Attach to your message', filters: [
     { name: 'Images and documents', extensions: ['png', 'jpg', 'jpeg', 'webp', 'pdf', 'txt', 'md', 'markdown', 'csv', 'json', 'yaml', 'yml', 'xml', 'html', 'rtf', 'doc', 'docx', 'odt', 'pages', 'key', 'numbers', 'pptx', 'xlsx', 'epub', 'log'] },
     { name: 'All files', extensions: ['*'] },
@@ -76,13 +78,13 @@ export async function chooseAttachments(): Promise<string[]> {
 /** A VS Code extension package holding color themes. */
 export async function chooseVsix(): Promise<string | null> {
   if (mode === 'remote') return null;
-  if (preview) return '/Users/you/Downloads/tokyo-night.vsix';
+  if (mode === 'preview') return '/Users/you/Downloads/tokyo-night.vsix';
   const result = await (await import('@tauri-apps/plugin-dialog')).open({ multiple: false, title: 'Import a VS Code theme', filters: [{ name: 'VS Code extension', extensions: ['vsix'] }] });
   return typeof result === 'string' ? result : null;
 }
 export async function chooseAttachmentFolder(): Promise<string | null> {
   if (mode === 'remote') return null;
-  if (preview) return (await import('./preview')).samplePick('folder')[0] ?? null;
+  if (mode === 'preview') return (await import('./preview')).samplePick('folder')[0] ?? null;
   const result = await (await import('@tauri-apps/plugin-dialog')).open({ directory: true, multiple: false, title: 'Attach a folder to your message' });
   return typeof result === 'string' ? result : null;
 }
