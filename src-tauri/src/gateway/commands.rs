@@ -36,11 +36,22 @@ pub fn list_dirs(path: Option<String>, show_hidden: bool) -> Result<Value, Strin
 /// joined onto this string, so `/srv/` and `/` would otherwise produce `//`.
 fn text(path: &Path) -> String {
     let mut text = path.display().to_string();
-    // A Windows drive root (`C:\`) ends in its own separator and must keep it.
-    while text.len() > 1 && text.ends_with(std::path::MAIN_SEPARATOR) && !text.ends_with(':') {
+    trim_trailing_separators(&mut text, std::path::MAIN_SEPARATOR);
+    text
+}
+
+/// Removes trailing separators from a path's display text.
+///
+/// A bare root keeps its separator (`/`), and so does a Windows drive root
+/// (`C:\`): dropping that one leaves `C:`, which Win32 reads as "the current
+/// directory on drive C" — a different directory from the drive root.
+fn trim_trailing_separators(text: &mut String, separator: char) {
+    while text.len() > 1 && text.ends_with(separator) {
+        if text.len() == 3 && text.as_bytes()[1] == b':' {
+            break;
+        }
         text.pop();
     }
-    text
 }
 
 /// The starting point when the client sends no path.
@@ -116,5 +127,36 @@ mod tests {
         assert_eq!(listing["path"], "/");
         // The picker's "up" affordance has nothing to point at above the root.
         assert_eq!(listing["parent"], serde_json::Value::Null);
+    }
+
+    /// Windows separators are passed in explicitly, so this host — which never
+    /// runs the Windows branch — still covers it.
+    #[test]
+    fn a_windows_drive_root_keeps_its_separator() {
+        // `C:` is the current directory on drive C, not the drive root, so the
+        // separator is the whole difference between two directories.
+        let mut drive_root = String::from("C:\\");
+        trim_trailing_separators(&mut drive_root, '\\');
+        assert_eq!(drive_root, "C:\\");
+
+        let mut nested = String::from("C:\\Users\\x\\");
+        trim_trailing_separators(&mut nested, '\\');
+        assert_eq!(nested, "C:\\Users\\x");
+
+        // A bare drive letter has no separator to trim.
+        let mut letter = String::from("C:");
+        trim_trailing_separators(&mut letter, '\\');
+        assert_eq!(letter, "C:");
+    }
+
+    #[test]
+    fn a_unix_root_keeps_one_separator_and_paths_lose_theirs() {
+        let mut root = String::from("/");
+        trim_trailing_separators(&mut root, '/');
+        assert_eq!(root, "/");
+
+        let mut doubled = String::from("/home/x//");
+        trim_trailing_separators(&mut doubled, '/');
+        assert_eq!(doubled, "/home/x");
     }
 }
