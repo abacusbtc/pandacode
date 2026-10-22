@@ -12,6 +12,7 @@ mod conversation_fork;
 mod conversation_import;
 mod file_preview;
 mod run_script;
+mod gateway_client;
 mod github;
 mod github_pull;
 mod github_hub;
@@ -2017,6 +2018,24 @@ async fn list_provider_models(provider: String, force: Option<bool>) -> Result<V
     providers::list_models(&provider).await
 }
 
+/// The saved gateway, or `None` when the app runs against its own backend.
+#[tauri::command]
+fn gateway_config() -> Option<gateway_client::GatewayConfig> {
+    gateway_client::config()
+}
+
+/// Saves a gateway address and its token, replacing any previous connection.
+#[tauri::command]
+fn gateway_connect(url: String, token: String) -> Result<gateway_client::GatewayConfig> {
+    gateway_client::connect(&url, &token)
+}
+
+/// Forgets the gateway, returning the app to its own backend on the next boot.
+#[tauri::command]
+fn gateway_disconnect() {
+    gateway_client::disconnect();
+}
+
 #[tauri::command]
 async fn respond_user_input(
     state: State<'_, AppState>,
@@ -3144,6 +3163,9 @@ pub fn run() {
                 browser::browser_inspect,
                 list_providers,
                 list_provider_models,
+                gateway_config,
+                gateway_connect,
+                gateway_disconnect,
                 git_status,
                 git_diff,
                 git_stage,
