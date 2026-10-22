@@ -12,7 +12,7 @@ use std::{
     },
     time::Duration,
 };
-use tauri::{Emitter, Manager, State};
+use tauri::{Manager, State};
 use tokio::sync::oneshot;
 
 struct PendingUi {
@@ -735,7 +735,7 @@ async fn dispatch(
             let store = state.store.lock().map_err(|e| e.to_string())?;
             let entry = crate::message_queue::add(&store, &target.id, &string(&args, "text"), &json!([]))?;
             drop(store);
-            let _ = app.emit("queue-changed", json!({"sessionId": target.id}));
+            let _ = crate::events::emit(&app, "queue-changed", json!({"sessionId": target.id}));
             value(entry)?
         }
         "pandacode_remove_queued" => {
@@ -747,7 +747,7 @@ async fn dispatch(
             }
             crate::message_queue::remove(&store, &id)?;
             drop(store);
-            let _ = app.emit("queue-changed", json!({"sessionId": owner}));
+            let _ = crate::events::emit(&app, "queue-changed", json!({"sessionId": owner}));
             json!({"removed": true})
         }
         "pandacode_steer_task" | "pandacode_interrupt_task" => {
@@ -756,7 +756,7 @@ async fn dispatch(
             }
             if name == "pandacode_steer_task" {
                 crate::message_queue::steer_task(state, target.id.clone(), string(&args, "text")).await?;
-                let _ = app.emit("sessions-changed", ());
+                let _ = crate::events::emit(&app, "sessions-changed", ());
                 json!({"steered": true})
             } else {
                 crate::stop_session(app.clone(), state, target.id.clone()).await?;
@@ -796,7 +796,7 @@ async fn dispatch(
             | "pandacode_create_worktree"
             | "pandacode_pin_task"
     ) {
-        let _ = app.emit("sessions-changed", ());
+        let _ = crate::events::emit(&app, "sessions-changed", ());
     }
     Ok(result)
 }
@@ -833,12 +833,11 @@ async fn request_ui(
         app: app.clone(),
         id: id.clone(),
     };
-    app.emit_to(
+    crate::events::emit_to(&app, 
         "main",
         "agent-ui-action",
         json!({"requestId":id,"sessionId":sid,"action":action,"args":args}),
-    )
-    .map_err(|e| e.to_string())?;
+    )?;
     tokio::time::timeout(Duration::from_secs(12), rx)
         .await
         .map_err(|_| "App action timed out.".to_string())?

@@ -6,7 +6,6 @@ use std::{
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
 };
-use tauri::Emitter;
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -400,7 +399,7 @@ pub async fn provider_set_executable(
         configuration()
     })
     .await?;
-    let _ = app.emit(
+    let _ = crate::events::emit(&app, 
         "provider-models-changed",
         serde_json::json!({"provider":changed}),
     );
@@ -482,7 +481,7 @@ pub async fn save_opencode_models(
         Ok(models)
     })
     .await?;
-    let _ = app.emit(
+    let _ = crate::events::emit(&app, 
         "provider-models-changed",
         serde_json::json!({"provider":"opencode"}),
     );
@@ -581,7 +580,7 @@ pub async fn provider_set_claude_connection_mode(
         crate::agent_usage::invalidate("claude");
         configuration()
     }).await?;
-    let _ = app.emit("provider-models-changed", serde_json::json!({"provider":"claude"}));
+    let _ = crate::events::emit(&app, "provider-models-changed", serde_json::json!({"provider":"claude"}));
     Ok(result)
 }
 /// Choose the MiMo cluster shown on the Token Plan page, or pay-as-you-go.
@@ -607,7 +606,7 @@ pub async fn provider_set_mimo_endpoint(
         configuration()
     })
     .await?;
-    let _ = app.emit(
+    let _ = crate::events::emit(&app, 
         "provider-models-changed",
         serde_json::json!({"provider":"mimo"}),
     );

@@ -2,7 +2,7 @@
 use serde::Serialize;
 use serde_json::Value;
 use std::path::PathBuf;
-use tauri::{ipc::Response, AppHandle, Emitter, Manager};
+use tauri::{ipc::Response, AppHandle, Manager};
 
 use super::{screen, tart, Image, VmStatus, Vms, IMAGES};
 use crate::Result;
@@ -56,7 +56,7 @@ pub async fn vm_create(app: AppHandle, image: String, name: String) -> Result<St
         // A new VM starts at once; Linux ones then get their desktop.
         vms.start(&name, None)?;
         super::desktop::ensure_in_background(app.clone(), name);
-        let _ = app.emit("vm-changed", serde_json::json!({}));
+        let _ = crate::events::emit(&app, "vm-changed", serde_json::json!({}));
         status(&vms)
     })
     .await
@@ -79,7 +79,7 @@ pub async fn vm_power(app: AppHandle, name: String, action: String, share: Optio
             "delete" => vms.delete(&name)?,
             _ => return Err("Unknown VM action.".into()),
         }
-        let _ = app.emit("vm-changed", serde_json::json!({}));
+        let _ = crate::events::emit(&app, "vm-changed", serde_json::json!({}));
         status(&vms)
     })
     .await

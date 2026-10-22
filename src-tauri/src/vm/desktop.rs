@@ -3,7 +3,7 @@
 //! with automatic login in the background. The panel streams the console meanwhile and
 //! shows the progress; agents can use commands right away.
 use std::{thread, time::{Duration, Instant}};
-use tauri::{Emitter, Manager};
+use tauri::Manager;
 
 use super::{tart, Vms};
 
@@ -51,12 +51,12 @@ pub fn ensure_in_background(app: tauri::AppHandle, name: String) {
     if vms.is_macos(&name).unwrap_or(true) || !vms.begin_desktop(&name) {
         return;
     }
-    let _ = app.emit("vm-changed", serde_json::json!({}));
+    let _ = crate::events::emit(&app, "vm-changed", serde_json::json!({}));
     thread::spawn(move || {
         let vms = app.state::<Vms>();
         let result = has_desktop(&name).and_then(|present| if present { Ok(String::new()) } else { install(&vms, &name) });
         vms.end_desktop(&name, result.err());
-        let _ = app.emit("vm-changed", serde_json::json!({}));
+        let _ = crate::events::emit(&app, "vm-changed", serde_json::json!({}));
     });
 }
 

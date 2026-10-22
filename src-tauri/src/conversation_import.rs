@@ -13,7 +13,7 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use tauri::{Emitter, Manager};
+use tauri::Manager;
 
 const CLAUDE_SCAN_LIMIT: usize = 400;
 const MAX_IMPORT: usize = 50;
@@ -269,7 +269,7 @@ pub async fn import_conversations(app: tauri::AppHandle, window: tauri::WebviewW
         }
     }
     if !result.imported.is_empty() {
-        let _ = app.emit("sessions-changed", ());
+        let _ = crate::events::emit(&app, "sessions-changed", ());
     }
     Ok(result)
 }

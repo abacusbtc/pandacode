@@ -20,7 +20,7 @@ use std::{
         Arc,
     },
 };
-use tauri::{Emitter, Manager, State};
+use tauri::{Manager, State};
 
 /// 2: dispatch_workers accepts a provider/model per assignment (auto teams).
 const TOOL_CATALOG_VERSION: u32 = 2;
@@ -276,8 +276,8 @@ fn save(store: &Store, team: &mut TeamSnapshot) -> Result<()> {
     Ok(())
 }
 fn emit(app: &tauri::AppHandle, team: &TeamSnapshot) {
-    let _ = app.emit("architect-event", team);
-    let _ = app.emit("sessions-changed", ());
+    let _ = crate::events::emit(app, "architect-event", team);
+    let _ = crate::events::emit(app, "sessions-changed", ());
 }
 pub(crate) fn parent_of(store: &Store, sid: &str) -> Result<Option<String>> {
     store
@@ -472,7 +472,7 @@ pub async fn architect_configure(
         emit(&app, team);
         wake(app.clone());
     } else {
-        let _ = app.emit(
+        let _ = crate::events::emit(&app, 
             "architect-event",
             json!({"sessionId":session_id,"removed":true}),
         );

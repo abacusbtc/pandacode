@@ -12,7 +12,7 @@ use std::{
         Arc, Mutex,
     },
 };
-use tauri::{AppHandle, Emitter};
+use tauri::AppHandle;
 
 // Linux can keep a blocking PTY write asleep after its child exits. The writer
 // must observe close independently, and its destructor must never send input.
@@ -778,7 +778,7 @@ fn start_command(
                     if valid > 0 {
                         let data = String::from_utf8_lossy(&pending[..valid]).to_string();
                         pending.drain(..valid);
-                        let _ = app.emit(
+                        let _ = crate::events::emit(&app, 
                             "terminal-event",
                             TerminalEvent {
                                 terminal_id: tid.clone(),
@@ -790,7 +790,7 @@ fn start_command(
                     if pending.len() > 4 {
                         let data = String::from_utf8_lossy(&pending).to_string();
                         pending.clear();
-                        let _ = app.emit(
+                        let _ = crate::events::emit(&app, 
                             "terminal-event",
                             TerminalEvent {
                                 terminal_id: tid.clone(),
@@ -808,7 +808,7 @@ fn start_command(
         reader_closed.store(true, Ordering::SeqCst);
         let terminal = registry.lock().ok().and_then(|mut m| m.remove(&tid));
         drop(terminal);
-        let _ = app.emit(
+        let _ = crate::events::emit(&app, 
             "terminal-event",
             TerminalEvent {
                 terminal_id: tid,

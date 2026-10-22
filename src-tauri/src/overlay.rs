@@ -9,7 +9,7 @@ use std::{
         Mutex,
     },
 };
-use tauri::{Emitter, Manager, State};
+use tauri::{Manager, State};
 use tauri_plugin_global_shortcut::{GlobalShortcut, Shortcut, ShortcutState};
 
 const LABEL: &str = "launcher";
@@ -458,7 +458,7 @@ fn select_model(
 }
 fn hide(app: &tauri::AppHandle) -> Result<()> {
     if let Some(window) = app.get_webview_window(LABEL) {
-        let _ = window.emit("overlay-visibility", false);
+        let _ = crate::events::emit_window(&window, "overlay-visibility", false);
         window.hide().map_err(|e| e.to_string())?;
     }
     Ok(())
@@ -475,7 +475,7 @@ fn toggle(app: &tauri::AppHandle) -> Result<()> {
         position_near_cursor(app, &window);
         window.show().map_err(|e| e.to_string())?;
         window.set_focus().map_err(|e| e.to_string())?;
-        let _ = window.emit("overlay-visibility", true);
+        let _ = crate::events::emit_window(&window, "overlay-visibility", true);
         return Ok(());
     }
     let window = tauri::WebviewWindowBuilder::new(
@@ -965,7 +965,7 @@ pub async fn overlay_launch(
         None,
     )
     .await;
-    let _ = app.emit("sessions-changed", ());
+    let _ = crate::events::emit(&app, "sessions-changed", ());
     result.map_err(|error| format!("{error} Your task is saved in Pending."))?;
     Ok(task.id)
 }
@@ -1104,9 +1104,7 @@ pub async fn overlay_open_task(
     window.unminimize().map_err(|e| e.to_string())?;
     window.show().map_err(|e| e.to_string())?;
     window.set_focus().map_err(|e| e.to_string())?;
-    window
-        .emit("overlay-open-task", target)
-        .map_err(|e| e.to_string())
+    crate::events::emit_window(&window, "overlay-open-task", target)
 }
 
 #[cfg(test)]

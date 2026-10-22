@@ -9,7 +9,7 @@ use crate::{AppState, Result};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tauri::{Emitter, Manager};
+use tauri::Manager;
 
 pub(crate) fn catalog() -> Vec<Value> {
     let text = json!({"type":"string","maxLength":8000});
@@ -112,6 +112,6 @@ pub(crate) async fn dispatch(app: &tauri::AppHandle, session_id: &str, name: &st
             }
         }
     };
-    let _ = app.emit("bots-changed", ());
+    let _ = crate::events::emit(app, "bots-changed", ());
     Ok(result)
 }

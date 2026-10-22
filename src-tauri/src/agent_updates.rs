@@ -14,7 +14,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tauri::{Emitter, Manager};
+use tauri::Manager;
 use tokio::sync::{Mutex, Semaphore};
 
 #[path = "agent_updates_install.rs"]
@@ -601,7 +601,7 @@ pub async fn update_agent(
             return Err("The agent's release channel changed. Check for updates again.".into());
         }
         let progress = |phase, message| {
-            let _ = app.emit(
+            let _ = crate::events::emit(&app, 
                 "agent-update-progress",
                 Progress {
                     provider: provider.clone(),
@@ -624,7 +624,7 @@ pub async fn update_agent(
             crate::providers::acp_catalog::invalidate(alias);
             crate::slash_commands::invalidate_provider(alias);
             crate::agent_usage::invalidate(alias);
-            let _ = app.emit(
+            let _ = crate::events::emit(&app, 
                 "provider-models-changed",
                 serde_json::json!({"provider":alias}),
             );

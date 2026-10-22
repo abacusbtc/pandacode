@@ -120,7 +120,7 @@ pub(super) async fn task_goal(
                 store.record_goal(&session_id, goal.as_ref())?;
                 let mut refreshed = event(&session_id, "goal", "");
                 refreshed.data = serde_json::to_value(&goal).ok();
-                let _ = app.emit("agent-event", refreshed);
+                let _ = crate::events::emit(&app, "agent-event", refreshed);
                 None
             }
         };
@@ -390,7 +390,7 @@ pub(super) async fn fork_session_at_message(
         crate::conversation_fork::at_message(&store, &session_id, message_id)
     })
     .await?;
-    let _ = app.emit("sessions-changed", ());
+    let _ = crate::events::emit(&app, "sessions-changed", ());
     Ok(task)
 }
 

@@ -15,7 +15,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tauri::{Emitter, Manager};
+use tauri::Manager;
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, Command},
@@ -746,7 +746,7 @@ pub async fn jev_install_runtime(app: tauri::AppHandle) -> Result<Doctor> {
     let _guard = InstallGuard;
     let uv = crate::providers::executable("uv");
     let python = venv_python(&dir);
-    let _ = app.emit(
+    let _ = crate::events::emit(&app, 
         "jev-install",
         json!({"status":"installing","message":"Preparing Python 3.12 environment…"}),
     );
@@ -790,7 +790,7 @@ pub async fn jev_install_runtime(app: tauri::AppHandle) -> Result<Doctor> {
         command.current_dir(&dir);
         process_output(command, None, 240, MAX_OUTPUT).await?;
     }
-    let _ = app.emit(
+    let _ = crate::events::emit(&app, 
         "jev-install",
         json!({"status":"installing","message":"Installing the pinned Jev browser runtime…"}),
     );
@@ -820,7 +820,7 @@ pub async fn jev_install_runtime(app: tauri::AppHandle) -> Result<Doctor> {
     process_output(command, None, 300, MAX_OUTPUT).await.map_err(|_| "Jev installation failed. Check your internet connection and Python installation, then retry.".to_string())?;
     write_runner(&dir)?;
     let report = doctor().await?;
-    let _ = app.emit(
+    let _ = crate::events::emit(&app, 
         "jev-install",
         json!({"status":"finished","message":"Jev runtime installed."}),
     );
@@ -1237,7 +1237,7 @@ async fn start(
         })?
     };
     let response = report.clone();
-    let _ = app.emit("jev-run", &report);
+    let _ = crate::events::emit(&app, "jev-run", &report);
     tauri::async_runtime::spawn(async move {
         execute(app, dir, saved, request, report, stopped, parent_stopped).await;
     });
@@ -1423,7 +1423,7 @@ fn publish(app: &tauri::AppHandle, report: &Report) {
             active.report = report.clone();
         }
     }
-    let _ = app.emit("jev-run", report);
+    let _ = crate::events::emit(app, "jev-run", report);
 }
 
 fn sync_watch_marker(profile: &Path, report: &Report, previous: &mut Option<(Instant, u64)>) {
@@ -1520,7 +1520,7 @@ fn publish_frame(
             return;
         }
         *last_sequence = frame.sequence;
-        let _ = app.emit_to("main", "jev-frame", &frame);
+        let _ = crate::events::emit_to(app, "main", "jev-frame", &frame);
     }
 }
 
@@ -1631,7 +1631,7 @@ async fn execute(
     if let Ok(mut state) = runtime() {
         state.active.remove(&report.id);
     }
-    let _ = app.emit("jev-run", &report);
+    let _ = crate::events::emit(&app, "jev-run", &report);
 }
 
 #[cfg(test)]

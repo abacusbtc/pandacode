@@ -6,7 +6,7 @@
 use crate::{storage::Store, AppState, Result};
 use rusqlite::params;
 use serde::Serialize;
-use tauri::{Emitter, State};
+use tauri::State;
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -122,13 +122,13 @@ pub(crate) fn delete_rule(store: &Store, bot_id: &str, id: &str) -> Result<()> {
 #[tauri::command]
 pub async fn bot_rule_add(app: tauri::AppHandle, state: State<'_, AppState>, bot_id: String, pattern: String, decision: String) -> Result<Rule> {
     let rule = add_rule(&*state.store.lock().map_err(|e| e.to_string())?, &bot_id, &pattern, &decision)?;
-    let _ = app.emit("bots-changed", ());
+    let _ = crate::events::emit(&app, "bots-changed", ());
     Ok(rule)
 }
 
 #[tauri::command]
 pub async fn bot_rule_delete(app: tauri::AppHandle, state: State<'_, AppState>, bot_id: String, rule_id: String) -> Result<()> {
     delete_rule(&*state.store.lock().map_err(|e| e.to_string())?, &bot_id, &rule_id)?;
-    let _ = app.emit("bots-changed", ());
+    let _ = crate::events::emit(&app, "bots-changed", ());
     Ok(())
 }

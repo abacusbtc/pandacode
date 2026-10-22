@@ -20,6 +20,8 @@ mod simulator;
 mod vm;
 mod secret_store;
 mod cloud;
+mod data_lock;
+mod events;
 mod vsix_themes;
 mod token_saver;
 mod goal_state;
@@ -49,6 +51,10 @@ mod usage_keychain;
 mod usage_ledger;
 mod workspace;
 
+// The standalone HTTP gateway; the desktop build never links it.
+#[cfg(feature = "gateway")]
+pub mod gateway;
+
 pub use usage_keychain::handle_usage_keychain_helper;
 
 use providers::{AgentEvent, RunConfig, RunInput};
@@ -62,7 +68,7 @@ use std::{
     },
 };
 use storage::{ContextUsage, MessagePage, Project, Session, Store};
-use tauri::{Emitter, Manager, State};
+use tauri::{Manager, State};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
 type Result<T> = std::result::Result<T, String>;
@@ -473,10 +479,16 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'sta
 
 #[tauri::command]
 async fn list_projects(state: State<'_, AppState>) -> Result<Vec<Project>> {
+    list_projects_inner(&state)
+}
+pub(crate) fn list_projects_inner(state: &AppState) -> Result<Vec<Project>> {
     state.store.lock().map_err(|e| e.to_string())?.projects()
 }
 #[tauri::command]
 async fn add_project(state: State<'_, AppState>, path: String) -> Result<Project> {
+    add_project_inner(&state, path)
+}
+pub(crate) fn add_project_inner(state: &AppState, path: String) -> Result<Project> {
     state
         .store
         .lock()
@@ -485,6 +497,9 @@ async fn add_project(state: State<'_, AppState>, path: String) -> Result<Project
 }
 #[tauri::command]
 async fn remove_project(state: State<'_, AppState>, project_id: String) -> Result<()> {
+    remove_project_inner(&state, project_id)
+}
+pub(crate) fn remove_project_inner(state: &AppState, project_id: String) -> Result<()> {
     let agents = state.agents.lock().map_err(|e| e.to_string())?;
     let store = state.store.lock().map_err(|e| e.to_string())?;
     for session_id in agents.keys() {
@@ -500,6 +515,12 @@ async fn remove_project(state: State<'_, AppState>, project_id: String) -> Resul
 }
 #[tauri::command]
 async fn list_sessions(state: State<'_, AppState>) -> Result<Vec<Session>> {
+    list_sessions_inner(&state)
+}
+/// A read that can write: a row claiming to run with no live agent is settled by
+/// `reconcile_inactive_task`. The gateway holds the only writer lock and has no
+/// agents, so this is the correct sweep there — the body stays shared verbatim.
+pub(crate) fn list_sessions_inner(state: &AppState) -> Result<Vec<Session>> {
     let agents = state.agents.lock().map_err(|e| e.to_string())?;
     let store = state.store.lock().map_err(|e| e.to_string())?;
     Ok(store
@@ -524,14 +545,14 @@ async fn prompt_activity(state: State<'_, AppState>) -> Result<Vec<(i64, String,
 #[tauri::command]
 async fn pin_session(app: tauri::AppHandle, state: State<'_, AppState>, session_id: String, pinned: bool) -> Result<Session> {
     let task = state.store.lock().map_err(|e| e.to_string())?.pin_session(&session_id, pinned)?;
-    let _ = app.emit("sessions-changed", ());
+    let _ = crate::events::emit(&app, "sessions-changed", ());
     Ok(task)
 }
 #[tauri::command]
 async fn reorder_sessions(app: tauri::AppHandle, state: State<'_, AppState>, session_ids: Vec<String>) -> Result<Vec<Session>> {
     let store = state.store.clone();
     let tasks = blocking(move || store.lock().map_err(|e| e.to_string())?.reorder_sessions(&session_ids)).await?;
-    let _ = app.emit("sessions-changed", ());
+    let _ = crate::events::emit(&app, "sessions-changed", ());
     Ok(tasks)
 }
 #[tauri::command]
@@ -562,6 +583,16 @@ async fn configure_window_appearance(
 #[tauri::command]
 async fn create_session(
     state: State<'_, AppState>,
+    project_id: String,
+    provider: String,
+    model: String,
+    mode: Option<String>,
+    draft: Option<bool>,
+) -> Result<Session> {
+    create_session_inner(&state, project_id, provider, model, mode, draft)
+}
+pub(crate) fn create_session_inner(
+    state: &AppState,
     project_id: String,
     provider: String,
     model: String,
@@ -728,6 +759,13 @@ async fn get_messages(
     session_id: String,
     before_id: Option<i64>,
 ) -> Result<MessagePage> {
+    get_messages_inner(&state, session_id, before_id)
+}
+pub(crate) fn get_messages_inner(
+    state: &AppState,
+    session_id: String,
+    before_id: Option<i64>,
+) -> Result<MessagePage> {
     state
         .store
         .lock()
@@ -803,10 +841,10 @@ fn persist_turn_changes(
         Ok((message_id, summary)) => {
             let mut e = event(sid, "turn_changes", "");
             e.data = Some(serde_json::json!({"messageId":message_id,"turnChanges":summary}));
-            let _ = app.emit("agent-event", e);
+            let _ = crate::events::emit(app, "agent-event", e);
         }
         Err(error) => {
-            let _ = app.emit(
+            let _ = crate::events::emit(app, 
                 "agent-event",
                 event(
                     sid,
@@ -1495,7 +1533,7 @@ async fn launch_operation_admitted(
             team: team_admission,
         },
     )?;
-    let _ = app.emit("agent-event", event(&session_id, "status", "running"));
+    let _ = crate::events::emit(&app, "agent-event", event(&session_id, "status", "running"));
     let store = state.store.clone();
     let agents = state.agents.clone();
     // Optional metadata must never block a conversation when its storage cannot
@@ -1677,7 +1715,7 @@ async fn launch_operation_admitted(
             }
             let completed = e.kind == "turn_complete";
             let changes_sid = e.session_id.clone();
-            let _ = app_sink.emit("agent-event", e);
+            let _ = crate::events::emit(&app_sink, "agent-event", e);
             if completed {
                 if let Some(tracker) = &tracker_sink {
                     let capture = blocking_snapshot(|| {
@@ -1781,7 +1819,7 @@ async fn launch_operation_admitted(
             for child in changed {
                 let mut activity = event(&session_id, "subagent", "");
                 activity.data = serde_json::to_value(child).ok();
-                let _ = app.emit("agent-event", activity);
+                let _ = crate::events::emit(&app, "agent-event", activity);
             }
             if let Err(error) = saved {
                 if let Ok(mut slot) = persistence_error.lock() {
@@ -1819,7 +1857,7 @@ async fn launch_operation_admitted(
                     if db.record_goal(&session_id, Some(&goal)).is_ok() {
                         let mut e = event(&session_id, "goal", "");
                         e.data = serde_json::to_value(goal).ok();
-                        let _ = app.emit("agent-event", e);
+                        let _ = crate::events::emit(&app, "agent-event", e);
                     }
                 }
             }
@@ -1852,7 +1890,7 @@ async fn launch_operation_admitted(
             }
             if let Some(title) = &title_run {
                 if title.finish(&db, successful).unwrap_or(false) {
-                    let _ = app.emit("sessions-changed", ());
+                    let _ = crate::events::emit(&app, "sessions-changed", ());
                 }
             }
         } else {
@@ -1860,7 +1898,7 @@ async fn launch_operation_admitted(
         }
         if let Ok(error) = persistence_error.lock() {
             if let Some(error) = error.as_ref() {
-                let _ = app.emit(
+                let _ = crate::events::emit(&app, 
                     "agent-event",
                     event(
                         &session_id,
@@ -1873,7 +1911,7 @@ async fn launch_operation_admitted(
         if let Some(registry) = registry.as_mut() {
             registry.remove(&session_id);
         }
-        let _ = app.emit(
+        let _ = crate::events::emit(&app, 
             "agent-event",
             event(
                 &session_id,
@@ -2836,6 +2874,20 @@ pub fn prepare_environment() {
     providers::widen_process_path();
 }
 
+/// The gateway's state: the struct the desktop app builds, with no live agents,
+/// terminals or shutdown flag. The gateway holds the only writer lock on the data
+/// directory, so an empty registry is the truth here rather than a placeholder.
+#[cfg(feature = "gateway")]
+pub(crate) fn gateway_state(data_dir: &std::path::Path) -> Result<AppState> {
+    let store = gateway::config::open_store(data_dir)?;
+    Ok(AppState {
+        store: Arc::new(Mutex::new(store)),
+        agents: Arc::new(Mutex::new(HashMap::new())),
+        terminals: Arc::new(Mutex::new(HashMap::new())),
+        shutdown: AtomicU8::new(0),
+    })
+}
+
 pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -2843,11 +2895,38 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
+            // One sink per process: here the app's own webviews, so every emit
+            // takes the same path a gateway would. Installed first, so nothing
+            // emitted during startup falls back to a different route.
+            let _ = crate::events::set_sink(std::sync::Arc::new(app.handle().clone()));
             if let Ok(cache) = app.path().app_cache_dir() {
                 turn_changes::cleanup_cache(&cache.join("turn-captures"));
             }
             let dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&dir)?;
+            // The gateway takes the same lock before it opens this database, so a
+            // lock held elsewhere means another writer and this copy must not
+            // start. Every other outcome is a warning: a lock that cannot be taken
+            // is not a reason to keep someone out of their own workspace.
+            match data_lock::claim(&dir, false) {
+                data_lock::Claim::Held(lock) => {
+                    let _ = app.manage(lock);
+                }
+                data_lock::Claim::Busy(message) => {
+                    // A message box is what this deserves, but this hook runs on
+                    // the main thread and the dialog plugin's blocking call needs
+                    // the main loop that setup itself owns: it never draws and
+                    // never returns (measured, see the commit message). So say it
+                    // plainly and leave. Continuing would open a second store on
+                    // the same file, which is the failure the lock exists for.
+                    eprintln!("{message}");
+                    std::process::exit(1);
+                }
+                data_lock::Claim::Unavailable(reason) => eprintln!(
+                    "PandaCode could not lock {}: {reason}\nThe gateway cannot run beside this app until that is resolved.",
+                    dir.display()
+                ),
+            }
             provider_settings::setup(&dir).map_err(std::io::Error::other)?;
             // Optional integration storage must never prevent the workspace from opening.
             if jev::setup(&dir).is_err() {
@@ -2890,7 +2969,7 @@ pub fn run() {
                         .and_then(|store| store.archive_completed(storage::now()));
                     match archived {
                         Ok(count) if count > 0 => {
-                            let _ = handle.emit("sessions-changed", ());
+                            let _ = crate::events::emit(&handle, "sessions-changed", ());
                         }
                         Err(error) => eprintln!("Completed task archive failed: {error}"),
                         _ => {}
