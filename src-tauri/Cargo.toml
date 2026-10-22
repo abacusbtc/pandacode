@@ -23,6 +23,11 @@ required-features = ["gateway"]
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+# `tauri::test::mock_app` gives a unit test an AppHandle without a window, which is
+# how the sink's error path is proven. Test builds only; it never reaches release.
+[dev-dependencies]
+tauri = { version = "2", features = ["test"] }
+
 [dependencies]
 tauri = { version = "2", features = ["macos-private-api", "unstable"] }
 tauri-plugin-dialog = "2"

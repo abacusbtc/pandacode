@@ -33,15 +33,18 @@ impl BroadcastSink {
 }
 
 impl Emitter for BroadcastSink {
-    fn emit(&self, name: &str, payload: serde_json::Value) {
+    fn emit(&self, name: &str, payload: serde_json::Value) -> Result<(), String> {
         self.publish(name, payload);
+        // Broadcasting has no per-client failure: a socket that is gone is gone,
+        // and the sender cannot report it.
+        Ok(())
     }
 
     /// A remote client has no windows to target, so a targeted event reaches every
     /// connected client: the closest honest equivalent, and the only one that does
     /// not silently drop the event.
-    fn emit_to(&self, _target: &str, name: &str, payload: serde_json::Value) {
-        self.publish(name, payload);
+    fn emit_to(&self, _target: &str, name: &str, payload: serde_json::Value) -> Result<(), String> {
+        self.emit(name, payload)
     }
 }
 
