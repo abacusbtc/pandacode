@@ -42,6 +42,12 @@ export function createGatewayClient(options: GatewayOptions): GatewayClient {
   let seq = 0;
 
   const connect = () => {
+    // A subscribe during the backoff window connects right away; the pending
+    // timer must not fire afterwards and open a second, orphaned socket.
+    if (reconnect) {
+      clearTimeout(reconnect);
+      reconnect = null;
+    }
     const Impl = options.WebSocketImpl ?? (WebSocket as unknown as GatewaySocketImpl);
     socket = new Impl(`${base.replace(/^http/, 'ws')}/events?token=${encodeURIComponent(token)}`);
     socket.onmessage = event => {
@@ -95,7 +101,14 @@ export function createGatewayClient(options: GatewayOptions): GatewayClient {
       if (!listeners.has(name)) listeners.set(name, new Set());
       listeners.get(name)!.add(callback);
       if (!socket && !closed) connect();
-      return () => listeners.get(name)?.delete(callback);
+      return () => {
+        const set = listeners.get(name);
+        if (!set) return;
+        set.delete(callback);
+        // Prune empty event names so the reconnect guard in socket.onclose
+        // sees zero listeners once the last one goes.
+        if (set.size === 0) listeners.delete(name);
+      };
     },
     close() {
       closed = true;

@@ -122,3 +122,36 @@ test('a dropped socket reconnects, and close() stops it', async () => {
   await new Promise(resolve => setTimeout(resolve, 25));
   assert.equal(WebSocketImpl.instances.length, 2, 'close() cancels reconnecting');
 });
+
+test('subscribe during the reconnect backoff does not open a second socket', async () => {
+  const WebSocketImpl = sockets();
+  const client = createGatewayClient({ url: 'http://gw.test', token: 't', fetchImpl: async () => ok(null), WebSocketImpl, reconnectDelayMs: 25 });
+  await client.subscribe('sessions-changed', () => {});
+  assert.equal(WebSocketImpl.instances.length, 1);
+
+  // The socket drops and reconnect is scheduled; a new listener joins during
+  // the backoff window. That must connect immediately, and the pending timer
+  // must not fire a second socket afterwards.
+  WebSocketImpl.instances[0].closed();
+  await client.subscribe('agent-event', () => {});
+  assert.equal(WebSocketImpl.instances.length, 2, 'the new listener connects immediately');
+  await new Promise(resolve => setTimeout(resolve, 60));
+  assert.equal(WebSocketImpl.instances.length, 2, 'the cancelled timer opens nothing further');
+
+  client.close();
+});
+
+test('unsubscribing every listener stops the dropped socket from reconnecting', async () => {
+  const WebSocketImpl = sockets();
+  const client = createGatewayClient({ url: 'http://gw.test', token: 't', fetchImpl: async () => ok(null), WebSocketImpl, reconnectDelayMs: 10 });
+  const off = await client.subscribe('sessions-changed', () => {});
+  assert.equal(WebSocketImpl.instances.length, 1);
+
+  // With the last listener gone, a dropped socket must stay down.
+  off();
+  WebSocketImpl.instances[0].closed();
+  await new Promise(resolve => setTimeout(resolve, 30));
+  assert.equal(WebSocketImpl.instances.length, 1, 'zero active listeners: the socket is not reopened');
+
+  client.close();
+});
