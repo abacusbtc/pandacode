@@ -68,14 +68,17 @@ pub fn connect(url: &str, token: &str) -> Result<GatewayConfig, String> {
         return Err("Enter the gateway's token.".into());
     }
     // One connection at a time: an old URL's token is removed rather than left in
-    // the keychain where nothing will ever read it again.
-    if let Some(previous) = settings().url {
+    // the keychain where nothing will ever read it again. The removal happens only
+    // after the new token and settings are saved, so a failed save cannot leave
+    // the settings pointing at a token that is already gone.
+    let previous = settings().url;
+    secret_store::set(SERVICE, &url, token)?;
+    save_settings(&Settings { url: Some(url.clone()) })?;
+    if let Some(previous) = previous {
         if previous != url {
             secret_store::remove(SERVICE, &previous);
         }
     }
-    secret_store::set(SERVICE, &url, token)?;
-    save_settings(&Settings { url: Some(url.clone()) })?;
     Ok(GatewayConfig { url, token: token.to_owned() })
 }
 
@@ -91,6 +94,16 @@ pub fn disconnect() {
 mod tests {
     use super::*;
 
+    // Under #[cfg(test)] the secret store is one process-wide in-memory map
+    // (secret_store.rs), so store-touching tests clear each other's keys when
+    // Cargo runs them in parallel. Serialize them; a poisoned lock is unwound
+    // so one failing test does not mask the rest.
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock() -> std::sync::MutexGuard<'static, ()> {
+        TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[test]
     fn an_address_must_be_http_and_loses_its_trailing_slash() {
         assert_eq!(normalize_url(" http://127.0.0.1:4175/ ").unwrap(), "http://127.0.0.1:4175");
@@ -105,6 +118,7 @@ mod tests {
 
     #[test]
     fn connect_then_config_round_trips_through_the_secure_store() {
+        let _guard = lock();
         disconnect();
         assert_eq!(config(), None);
         let saved = connect("http://gw.test/", "secret-token").unwrap();
@@ -114,6 +128,7 @@ mod tests {
 
     #[test]
     fn a_connection_without_a_token_is_not_config() {
+        let _guard = lock();
         disconnect();
         save_settings(&Settings { url: Some("http://gw.test".into()) }).unwrap();
         assert_eq!(config(), None);
@@ -121,6 +136,7 @@ mod tests {
 
     #[test]
     fn switching_gateways_drops_the_previous_token() {
+        let _guard = lock();
         disconnect();
         connect("http://first.test", "one").unwrap();
         connect("http://second.test", "two").unwrap();
@@ -130,6 +146,7 @@ mod tests {
 
     #[test]
     fn disconnect_forgets_both_halves() {
+        let _guard = lock();
         connect("http://gw.test", "secret-token").unwrap();
         disconnect();
         assert_eq!(config(), None);
@@ -138,6 +155,7 @@ mod tests {
 
     #[test]
     fn an_empty_token_is_refused() {
+        let _guard = lock();
         disconnect();
         assert!(connect("http://gw.test", "   ").is_err());
         assert_eq!(config(), None);
