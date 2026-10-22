@@ -17,6 +17,8 @@ const sampleSource = '// Browser preview — sample source\nexport function crea
 const previewWorkspaceFiles = ['index.html', '.gitignore', 'README.md', 'package.json', 'tsconfig.json', 'src/main.ts', 'src/style.css', 'src/components/search.ts', 'src/components/search.test.ts', 'src/lib/search-index.ts', 'public/favicon.svg', 'docs/design notes.md'];
 const sampleTestOutput = 'PASS src/components/search.test.ts\n  ✓ filters results as the query changes\n  ✓ preserves keyboard selection\n\nTests: 12 passed, 12 total\nTime: 0.8s\nSample output — no command was executed.';
 function encodeTool(tool: ToolActivity): string { return JSON.stringify({ type: 'tool_activity', version: 1, ...tool }); }
+/** The gateway address the preview has saved; the real one lives in the OS keychain. */
+let previewGateway: { url: string; token: string } | null = null;
 let projects: Project[] = [{ id: 'project-1', name: 'orbit', path: '/Users/you/Projects/orbit' }, { id: 'project-2', name: 'pandacode', path: '/Users/you/Projects/pandacode' }];
 let sessions: Session[] = [
   { id: 'session-1', projectId: 'project-1', title: 'Make search feel instant', provider: 'claude', model: 'sonnet', mode: 'ask', status: 'idle', createdAt: now - 420000, updatedAt: now, archived: false, worktreePath: null, resumeId: 'preview-session', lastResponseAt: now - 300000 },
@@ -1202,6 +1204,9 @@ export async function invoke<T>(command: string, args: Record<string, any>): Pro
     case 'get_run_script': result = null; break;
     case 'get_run_script_preview': result = null; break;
     case 'get_terminal_preferences': result = {}; break;
+    case 'gateway_config': result = previewGateway; break;
+    case 'gateway_connect': previewGateway = { url: String(args.url), token: String(args.token) }; result = previewGateway; break;
+    case 'gateway_disconnect': previewGateway = null; break;
     case 'start_run_script_terminal':
     case 'start_harness_terminal': case 'start_terminal': {
       const terminalId = 'preview-terminal-' + crypto.randomUUID(); result = terminalId;

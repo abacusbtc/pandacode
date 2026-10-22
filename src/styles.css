@@ -865,6 +865,18 @@ html[data-native-platform=macos] .github-view .gh-repos-head{padding-left:calc(8
 .settings-metric{font-family:var(--mono);font-size:.82rem;color:var(--text)}
 .preview-status{color:var(--muted);font-size:.72rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:220px}
 @media (max-width:900px){.preview-status{display:none}}
+/* Which backend this window talks to (src/gateway-settings.ts). Hidden until a gateway answers. */
+.gateway-badge{display:inline-flex;align-items:center;max-width:220px;padding:2px 9px;border-radius:999px;border:1px solid color-mix(in srgb,var(--accent) 35%,transparent);background:var(--accent-dim);color:var(--accent-ink);font-size:.72rem;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.gateway-badge:hover{background:color-mix(in srgb,var(--accent) 30%,transparent)}
+.gateway-badge:active{scale:.97}
+.gateway-badge[hidden]{display:none}
+.gateway-badge[data-state="unreachable"]{background:color-mix(in srgb,var(--danger) 12%,transparent);border-color:color-mix(in srgb,var(--danger) 45%,transparent);color:var(--text)}
+@media (max-width:900px){.gateway-badge{max-width:140px}}
+/* A surface the connected gateway does not serve. Removing the attribute restores whatever the platform decided. */
+[data-gateway-hidden]{display:none!important}
+.gateway-group input{width:min(300px,42vw);height:30px;padding:0 9px;border-radius:3px;border:1px solid color-mix(in srgb,var(--text) 14%,transparent);background:color-mix(in srgb,var(--text) 4%,transparent);color:var(--text);font:inherit;font-size:.8rem}
+.gateway-group input:focus-visible{outline:2px solid var(--focus);outline-offset:1px}
+.gateway-group #gateway-settings-status.gateway-error{color:var(--danger)}
 /* The prompt box and the bar above it have no border, except under increased contrast. */
 @media (prefers-contrast:more){html[data-theme] .workspace :is(.composer,.composer-context,.composer:focus-within),html[data-theme] .workspace[data-wallpaper] .conversation-pane :is(.composer,.composer-context,.composer:focus-within){border-color:var(--text)}}
 /* Dropdowns and popovers are one solid surface with no border (dialogs and toasts keep the glass).

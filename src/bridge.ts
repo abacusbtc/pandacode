@@ -19,13 +19,21 @@ export function currentMode(): Mode {
   return mode;
 }
 
+/**
+ * Commands only this computer answers, in every mode: the gateway settings themselves
+ * and the native dialogs. In remote mode the gateway is the command transport, so it
+ * cannot be asked to save the address it is reached at.
+ */
+export async function callShell<T>(command: string, args: Record<string, unknown> = {}): Promise<T> {
+  if (preview) return (await import('./preview')).invoke<T>(command, args);
+  return (await import('@tauri-apps/api/core')).invoke<T>(command, args);
+}
 export async function call<T>(command: string, args: Record<string, unknown> = {}): Promise<T> {
   if (mode === 'remote') {
     if (!remote) throw 'gateway_disconnected: no gateway is connected';
     return remote.call<T>(command, args);
   }
-  if (mode === 'preview') return (await import('./preview')).invoke<T>(command, args);
-  return (await import('@tauri-apps/api/core')).invoke<T>(command, args);
+  return callShell<T>(command, args);
 }
 export async function subscribe(name: 'agent-update-progress', callback: (event: import('./agent-updates').AgentUpdateProgress) => void): Promise<() => void>;
 export async function subscribe(name: 'jev-run', callback: (event: import('./jev').JevReport) => void): Promise<() => void>;

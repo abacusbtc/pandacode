@@ -11,6 +11,7 @@ import { mountResourceUsage, resourceUsageHtml } from './resource-usage-settings
 import { colorsSummary } from './theme-settings';
 import { mountAgentTeams, type AgentTeamsOptions } from './agent-teams';
 import { mountCloudSettings, type CloudSettingsHost } from './cloud-settings';
+import { capabilityEnabled } from './gateway-settings';
 
 /** Panels that live elsewhere and are embedded here: each mounts into a host and returns its cleanup. */
 type Embed = (host: HTMLElement) => Promise<() => void>;
@@ -28,6 +29,8 @@ interface SettingsOptions {
   discover(): Promise<Provider[]>;
   /** Mounts the optional GitHub row; returns its cleanup. */
   github?(host: HTMLElement): () => void;
+  /** Remote gateway address and token; returns its cleanup. */
+  gateway?(host: HTMLElement): () => void;
   /** Named agent teams and the classic Team setup switch. */
   teams?: Omit<AgentTeamsOptions, 'providers'>;
   /** Cloud sandbox connections (Daytona, Cloudflare, AWS). */
@@ -58,7 +61,8 @@ function sectionHtml(id: SettingsSection, options: SettingsOptions): string {
   const defaultName = options.providers.find(provider => provider.id === options.defaultProvider)?.name ?? options.defaultProvider;
   switch (id) {
     case 'general': return `<div class="settings-group">${uiSizeControls()}${switchRow('compact-mode', 'Compact conversation', 'Less space between messages.', options.compact)}</div>
-      <h3 class="settings-heading">Quick launcher</h3><div id="launcher-settings"></div>`;
+      <h3 class="settings-heading" id="launcher-heading">Quick launcher</h3><div id="launcher-settings"></div>
+      <h3 class="settings-heading" id="gateway-heading">Remote gateway</h3><div id="gateway-settings"></div>`;
     case 'appearance': return `<div class="settings-group">
         <div class="setting-row"><div><strong>Theme</strong><small>${options.theme === 'dark' ? 'Dark' : 'Light'}. Imported VS Code themes keep their own.</small></div><button type="button" class="secondary-button" data-action="toggle-theme">${icon(options.theme === 'dark' ? 'sun' : 'moon')}Use ${options.theme === 'dark' ? 'light' : 'dark'}</button></div>
         <div class="setting-row"><div><strong>Daily wallpapers</strong><small>A new scene for each part of the day.</small></div><input type="checkbox" class="settings-switch" id="daily-wallpapers" aria-label="Daily wallpapers" ${options.wallpapers ? 'checked' : ''}></div>
@@ -153,7 +157,11 @@ export function mountSettings(host: HTMLElement, options: SettingsOptions): Sett
     if (mounted.has(id)) return;
     mounted.add(id);
     const panel = panels.get(id)!;
-    if (id === 'general') cleanups.push(mountOverlaySettings(panel.querySelector<HTMLElement>('#launcher-settings')!));
+    if (id === 'general') {
+      // The quick launcher is a Tauri window; a gateway does not serve it.
+      if (capabilityEnabled('overlay_toggle')) cleanups.push(mountOverlaySettings(panel.querySelector<HTMLElement>('#launcher-settings')!));
+      if (options.gateway) cleanups.push(options.gateway(panel.querySelector<HTMLElement>('#gateway-settings')!));
+    }
     if (id === 'github' && options.github) cleanups.push(options.github(panel.querySelector<HTMLElement>('#github-settings')!));
     if (id === 'teams' && options.teams) cleanups.push(mountAgentTeams(panel.querySelector<HTMLElement>('#agent-teams-settings')!, { ...options.teams, providers: options.providers }));
     if (id === 'cloud' && options.cloud) cleanups.push(mountCloudSettings(panel.querySelector<HTMLElement>('#cloud-settings')!, options.cloud));
