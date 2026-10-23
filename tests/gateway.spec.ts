@@ -262,3 +262,25 @@ test('a runtime connect moves event subscriptions onto the gateway', async ({ pa
     await gateway.close();
   }
 });
+test('a remote session reload never asks the gateway for get_task', async ({ page }) => {
+  // get_task is not in the M1 command table (D4). Now that the event socket really
+  // delivers `sessions-changed`, an unguarded reloadSessions() would call it and throw
+  // "unsupported_command: get_task" out of the reload.
+  const gateway = await startGateway(seeded());
+  try {
+    await openApp(page);
+    await waitForBoot(page);
+    await connect(page, gateway);
+    await expect.poll(() => gateway.sockets()).toBeGreaterThan(0);
+
+    const before = gateway.calls.filter(command => command === 'list_sessions').length;
+    gateway.emit('sessions-changed');
+    await expect.poll(() => gateway.calls.filter(command => command === 'list_sessions').length).toBeGreaterThan(before);
+
+    expect(gateway.calls).not.toContain('get_task');
+    // The reload finished: the task the gateway listed is still the open one.
+    await expect(page.locator('#navigation')).toContainText('Seeded from the server');
+  } finally {
+    await gateway.close();
+  }
+});

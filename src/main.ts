@@ -1771,8 +1771,13 @@ async function selectProject(id: string): Promise<void> {
 }
 async function reloadSessions(): Promise<void> {
   const selectedId = state.sessionId, generation = state.generation, request = ++sessionsReload, previousDetails = fullTaskDescription;
+  // `get_task` is a desktop command; a gateway does not serve it (D4), and asking would
+  // fail the whole reload with "unsupported_command: get_task". The row `list_sessions`
+  // just returned carries the same fields, so remote mode reads it instead (as
+  // `selectSession` does).
+  const savedDetails = selectedId ? session() ?? null : null;
   const [sessions, detailResult] = await Promise.all([call<Session[]>('list_sessions'),
-    Promise.allSettled([selectedId ? call<Session>('get_task', { sessionId: selectedId }) : Promise.resolve(null)]).then(results => results[0])]);
+    Promise.allSettled([selectedId && currentMode() !== 'remote' ? call<Session>('get_task', { sessionId: selectedId }) : Promise.resolve(savedDetails)]).then(results => results[0])]);
   if (request !== sessionsReload) return;
   if (detailResult.status === 'rejected' && !deletedSessions.has(selectedId)) throw detailResult.reason;
   const details = detailResult.status === 'fulfilled' ? detailResult.value : null;
