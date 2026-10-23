@@ -1,5 +1,6 @@
 import './github.css';
 import { escape, icon } from './dom';
+import { capabilityEnabled } from './gateway-settings';
 import type { FileEntry, GithubIssue, GithubItem, GithubReference, GithubStatus, Project, Session, TaskLink } from './types';
 
 /* GitHub through the user's signed-in `gh`. Everything here is optional: when the
@@ -71,7 +72,9 @@ export function createGithub(host: GithubHost) {
   }
   /** Connection state for a project; cached, and never queried while switched off. */
   function status(projectId: string, force = false): Promise<GithubStatus | null> {
-    if (!githubEnabled() || !projectId) return Promise.resolve(null);
+    // A gateway has no `gh` of its own to ask: the neutral answer is the same `null` a
+    // switched-off or unreachable GitHub already gives, so every affordance stays hidden.
+    if (!githubEnabled() || !capabilityEnabled('github_status') || !projectId) return Promise.resolve(null);
     const entry = statuses.get(projectId);
     if (entry?.pending) return entry.pending;
     if (entry && !force && Date.now() - entry.at < STATUS_TTL) return Promise.resolve(entry.value);

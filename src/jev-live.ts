@@ -1,6 +1,7 @@
 import './jev-live.css';
 import { call, subscribe } from './bridge';
 import { escape, icon } from './dom';
+import { capabilityEnabled } from './gateway-settings';
 import type { JevReport } from './jev';
 
 export interface JevFrame {
@@ -154,6 +155,9 @@ export async function mountJevLive(host: HTMLElement, options: Options): Promise
     session = options.session(); ++revision; selected = undefined; stopping = undefined; finalRead = undefined;
     reports.clear(); eventVersions.clear(); resetFrame(); tell(''); render();
     if (!session) { listPending = undefined; return; }
+    // A gateway serves no Jev runs, so there is no list to read; the pane shows its own
+    // empty state instead of an error about a command the backend never claimed.
+    if (!capabilityEnabled('jev_list_runs')) { listPending = undefined; return; }
     const task = session, ticket = revision, started = eventVersion;
     listPending = (async () => {
       try {

@@ -100,18 +100,16 @@ async function stop(child: ChildProcess): Promise<void> {
   clearTimeout(forced);
 }
 
-test('a project added through the real gateway is in the browser, and the fixtures are not', async ({ page }) => {
-  // A cold `cargo run --features gateway` on a loaded host is minutes, not seconds.
-  test.setTimeout(300_000);
+type Gateway = { base: string; token: string; stop(): Promise<void> };
+
+/** The real gateway on a free port, serving the built app, over its own fresh database. */
+async function startGateway(): Promise<Gateway> {
   expect(
     existsSync(join(STATIC_DIR, 'index.html')),
     'the gateway serves the built app: run `npm run build` first (npm run gateway:test does it)',
   ).toBe(true);
 
   const data = mkdtempSync(join(tmpdir(), 'pc-gw-data-'));
-  // The project name is the folder's own name, as `Store::add_project` derives it.
-  const repo = realpathSync(mkdtempSync(join(tmpdir(), 'pc-gw-repo-')));
-  const name = basename(repo);
   const port = await freePort();
   const base = `http://127.0.0.1:${port}`;
   let output = '';
@@ -126,13 +124,37 @@ test('a project added through the real gateway is in the browser, and the fixtur
 
   try {
     await waitForHealth(base, child, () => output);
-    const token = readFileSync(join(data, 'gateway-token'), 'utf8').trim();
-    expect(token, 'the gateway wrote its own token on first run').toMatch(/^[0-9a-f]{64}$/);
+  } catch (error) {
+    await stop(child);
+    throw error;
+  }
+  const token = readFileSync(join(data, 'gateway-token'), 'utf8').trim();
+  return {
+    base,
+    token,
+    async stop() {
+      await stop(child);
+      // Cleanup never becomes the failure: a directory that cannot be removed is a
+      // leftover in the system temp directory, not a reason to hide the real error.
+      try { rmSync(data, { recursive: true, force: true }); } catch { /* Left for the OS to reap. */ }
+    },
+  };
+}
 
-    await openApp(page, base);
+test('a project added through the real gateway is in the browser, and the fixtures are not', async ({ page }) => {
+  // A cold `cargo run --features gateway` on a loaded host is minutes, not seconds.
+  test.setTimeout(300_000);
+  const gateway = await startGateway();
+  expect(gateway.token, 'the gateway wrote its own token on first run').toMatch(/^[0-9a-f]{64}$/);
+  // The project name is the folder's own name, as `Store::add_project` derives it.
+  const repo = realpathSync(mkdtempSync(join(tmpdir(), 'pc-gw-repo-')));
+  const name = basename(repo);
+
+  try {
+    await openApp(page, gateway.base);
     await page.evaluate(
       ([url, secret]) => (window as any).__connectGatewayForTest(url, secret),
-      [base, token],
+      [gateway.base, gateway.token],
     );
     await expect(page.locator('#gateway-badge')).toContainText('Connected to 127.0.0.1');
 
@@ -148,21 +170,93 @@ test('a project added through the real gateway is in the browser, and the fixtur
 
     // ...and it is in the gateway's database, not in the page's memory: ask the same
     // endpoint independently of everything the app just did.
-    const projects = await rpc(base, token, 'list_projects') as { name: string; path: string }[];
+    const projects = await rpc(gateway.base, gateway.token, 'list_projects') as { name: string; path: string }[];
     expect(projects.map(project => project.path)).toEqual([repo]);
 
     // The fixture's text is nowhere in the document, not merely out of the sidebar.
     await expect(page.locator('body')).not.toContainText(FIXTURE_PROJECT);
   } finally {
-    await stop(child);
-    // Cleanup never becomes the failure: a directory that cannot be removed is a
-    // leftover in the system temp directory, not a reason to hide the real error.
-    for (const directory of [data, repo]) {
-      try {
-        rmSync(directory, { recursive: true, force: true });
-      } catch {
-        // Left for the OS to reap.
-      }
-    }
+    await gateway.stop();
+    try { rmSync(repo, { recursive: true, force: true }); } catch { /* Left for the OS to reap. */ }
   }
 });
+
+/**
+ * PAN-86/PAN-91/PAN-100: a connected workspace must ask the gateway only for commands
+ * it advertises, must not call itself a preview, and must not offer the .vsix import
+ * that has no upload route. The record is the gateway's own answer to every /rpc the
+ * page made, so a surface that quietly re-adds a call turns this red.
+ */
+test('a workspace loaded over the real gateway asks it only for what it serves', async ({ page }) => {
+  test.setTimeout(300_000);
+  const gateway = await startGateway();
+  // A workspace with something in it: an empty database loads no project and asks no
+  // surface for anything, which would make this proof pass for the wrong reason.
+  // Both rows are written through the gateway's own commands, not the app's UI.
+  const repo = realpathSync(mkdtempSync(join(tmpdir(), 'pc-gw-repo-')));
+  const project = await rpc(gateway.base, gateway.token, 'add_project', { path: repo }) as { id: string };
+  await rpc(gateway.base, gateway.token, 'create_session', { projectId: project.id, provider: 'claude', model: 'sonnet' });
+  /** Every /rpc answer the page received, with the command it answered. */
+  const answers: { command: string; error: string }[] = [];
+  const recording: Promise<void>[] = [];
+  page.on('response', response => {
+    if (!response.url().endsWith('/rpc')) return;
+    recording.push((async () => {
+      let command = '?';
+      try { command = String((response.request().postDataJSON() as { command?: string })?.command ?? '?'); }
+      catch { /* a body that is not JSON is not one of the app's own commands */ }
+      let error = '';
+      try { error = String((await response.json() as { error?: unknown }).error ?? ''); }
+      catch { /* an HTTP-level refusal, not a command answer */ }
+      answers.push({ command, error });
+    })());
+  });
+  /** The Colors pane's import row lives in Settings → Appearance. */
+  async function openColors(): Promise<void> {
+    await page.getByRole('button', { name: 'Settings', exact: true }).click();
+    await page.getByRole('region', { name: 'Settings', exact: true }).getByRole('tab', { name: 'Appearance', exact: true }).click();
+    await expect(page.locator('.vsix-list')).toHaveAttribute('aria-busy', 'false');
+  }
+  const importVsix = page.locator('[data-colors="import"]');
+
+  try {
+    await openApp(page, gateway.base);
+    // The control: this window really is the browser preview before it connects, so the
+    // sample-data label and the import row are both there to be lost.
+    await expect(page.locator('#preview-status')).toContainText('sample data');
+    await openColors();
+    await expect(importVsix).toBeVisible();
+    await page.keyboard.press('Escape');
+    await expect(page.locator('#settings-page')).toBeHidden();
+
+    await page.evaluate(
+      ([url, secret]) => (window as any).__connectGatewayForTest(url, secret),
+      [gateway.base, gateway.token],
+    );
+    await expect(page.locator('#gateway-badge')).toContainText('Connected to 127.0.0.1');
+    await expect(page.getByRole('region', { name: `${FIXTURE_PROJECT} tasks`, exact: true })).toHaveCount(0);
+    await page.waitForLoadState('networkidle');
+    await Promise.all(recording);
+
+    const unsupported = answers.filter(answer => answer.error.includes('unsupported_command'));
+    expect(answers.length, 'the page really did talk to the gateway: an empty record would pass vacuously').toBeGreaterThan(0);
+    expect(
+      [...new Set(unsupported.map(answer => answer.command))],
+      `the workspace asked for commands the gateway does not serve (${answers.length} answers recorded)`,
+    ).toEqual([]);
+
+    // It still says which backend answers, and no longer claims to be sample data.
+    await expect(page.locator('#preview-status')).toBeHidden();
+    // `innerText` rather than `textContent`: a hidden claim is not on the screen.
+    expect(await page.locator('body').innerText()).not.toContain('sample data');
+
+    // The import row is gone while the gateway cannot accept a file, and the gateway's
+    // own capability list is what decides that — not a hardcoded remote check.
+    await openColors();
+    await expect(importVsix).toBeHidden();
+  } finally {
+    await gateway.stop();
+    try { rmSync(repo, { recursive: true, force: true }); } catch { /* Left for the OS to reap. */ }
+  }
+});
+

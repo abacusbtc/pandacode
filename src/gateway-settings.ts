@@ -7,6 +7,7 @@
 // transport, because in remote mode that transport is the gateway itself.
 
 import { createGatewayClient, type GatewayClient } from './gateway-client';
+import { GATED, serves } from './gateway-gating';
 import { callShell, currentMode, preview, setMode, type Mode } from './bridge';
 import { escape } from './dom';
 
@@ -25,7 +26,7 @@ export function gatewayStatus(): { url: string; mode: Mode } | null {
 
 /** Whether the connected gateway serves a command. The local transports serve everything. */
 export function capabilityEnabled(command: string): boolean {
-  return !connection || connection.commands.includes(command);
+  return serves(connection ? connection.commands : null, command);
 }
 
 export function gatewayHost(url: string): string {
@@ -36,13 +37,13 @@ export function gatewayHost(url: string): string {
   }
 }
 
-/** The surfaces a gateway is not expected to serve, and the command that would make each real. */
-const GATED: { command: string; selector: string }[] = [
-  { command: 'browser_open', selector: '#browser-toggle, [data-action="browser"]' },
-  { command: 'vm_status', selector: '[data-action="tab-vm"]' },
-  { command: 'simulator_status', selector: '[data-action="tab-simulator"]' },
-  { command: 'overlay_toggle', selector: '#launcher-heading, #launcher-settings' },
-];
+/** Hides `selector` wherever `command` is not served, inside `root`. */
+function paint(root: ParentNode, commands: string[] | null): void {
+  for (const gated of GATED) {
+    const allowed = serves(commands, gated.command);
+    for (const element of root.querySelectorAll<HTMLElement>(gated.selector)) element.toggleAttribute('data-gateway-hidden', !allowed);
+  }
+}
 
 /**
  * Hides what the gateway cannot serve, and shows it again when it can. The attribute
@@ -51,11 +52,17 @@ const GATED: { command: string; selector: string }[] = [
  * forcing a surface open. `null` means the local transports, so nothing is hidden.
  */
 export function applyCapabilities(commands: string[] | null): void {
-  for (const gated of GATED) {
-    const served = !commands || commands.includes(gated.command);
-    for (const element of document.querySelectorAll<HTMLElement>(gated.selector)) element.toggleAttribute('data-gateway-hidden', !served);
-  }
+  paint(document, commands);
   document.body.classList.toggle('gateway-remote', commands !== null);
+}
+
+/**
+ * Re-applies the current connection's gating inside `root`. Settings views and dialogs
+ * mount after connect, so the attribute set on the document at connect time never
+ * reaches them; a surface that mounts later calls this for its own subtree.
+ */
+export function syncCapabilities(root: ParentNode = document): void {
+  paint(root, connection ? connection.commands : null);
 }
 
 /** The header badge: which backend this window talks to, and whether it answers. */

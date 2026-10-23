@@ -152,9 +152,13 @@ answered implies advertised.
 | `gateway_list_dirs` | `{path?, showHidden?}` | `{path, parent, entries}` |
 | `gateway_status` | — | `{commands, features}` |
 
-`features` is `["projects", "sessions"]`. The app hides what a gateway does not
-serve — the browser toggle, the VM and simulator tabs, the quick launcher — and
-shows them again on disconnect.
+`features` is `["projects", "sessions"]`. The app asks a connected gateway only
+for what this list names, and hides what it does not serve — the browser toggle,
+the VM and simulator tabs, the quick launcher, the GitHub view, the Run button
+and the `.vsix` import — then shows them again on disconnect. The inspector's
+Changes and Files tabs say the backend does not read them rather than claiming a
+clean tree or an empty folder, and a window connected to a gateway never calls
+itself the browser preview.
 
 `GET /events` upgrades to a WebSocket and sends one JSON text frame per event,
 `{"event": "sessions-changed", "payload": null}`, with the same event names the

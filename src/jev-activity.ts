@@ -1,6 +1,7 @@
 import './jev-activity.css';
 import { call, subscribe } from './bridge';
 import { icon } from './dom';
+import { capabilityEnabled } from './gateway-settings';
 import type { JevReport } from './jev';
 
 /** A small live entry point shared by conversation and board detail views. */
@@ -22,7 +23,9 @@ export class JevActivity {
     if (task === this.task) return;
     this.task = task; this.report = undefined; this.host.hidden = true;
     const revision = ++this.revision;
-    if (!task) return;
+    // A backend with no runs has no test history to show: the chip stays hidden rather
+    // than asking for a command it does not serve.
+    if (!task || !capabilityEnabled('jev_list_runs')) return;
     void call<JevReport[]>('jev_list_runs', { sessionId: task }).then(reports => {
       if (revision !== this.revision || !reports.length) return;
       this.accept(reports[0]);

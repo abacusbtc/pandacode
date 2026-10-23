@@ -1,5 +1,6 @@
 import { call } from './bridge';
 import { icon } from './dom';
+import { capabilityEnabled } from './gateway-settings';
 
 export interface RunContext { projectId: string; sessionId?: string }
 export interface RunScript { path: string; previewUrl?: string; previewPath?: string }
@@ -33,8 +34,12 @@ export class ProjectRunner {
     if (!context) { this.paint(); return; }
     const id = key(context), revision = (this.revisions.get(id) ?? 0) + 1;
     this.revisions.set(id, revision);
-    // Malformed or removed scripts should not leave a stale launch affordance.
-    const script = await call<RunScript | null>('get_run_script', { ...context }).catch(() => null);
+    // Malformed or removed scripts should not leave a stale launch affordance, and a
+    // gateway serves no run script at all. Both answers are the same `null`, which is
+    // what keeps the button hidden.
+    const script = capabilityEnabled('get_run_script')
+      ? await call<RunScript | null>('get_run_script', { ...context }).catch(() => null)
+      : null;
     if (this.revisions.get(id) !== revision) return;
     this.scripts.set(id, script); this.paint();
   }
@@ -45,6 +50,7 @@ export class ProjectRunner {
     if (this.starting.has(id)) return { started: false, previewPending: true };
     this.starting.add(id); this.paint();
     try {
+      if (!capabilityEnabled('get_run_script')) throw new Error('This backend cannot run project scripts.');
       const script = await call<RunScript | null>('get_run_script', { ...context });
       if (!script) throw new Error('Add pandacode-run.sh to this checkout to run the project.');
       this.scripts.set(id, script);
