@@ -8,24 +8,66 @@ export type Mode = 'native' | 'preview' | 'remote';
 let mode: Mode = preview ? 'preview' : 'native';
 let remote: GatewayClient | null = null;
 
+/** One live subscription, kept so a transport change can move it instead of orphaning it. */
+type Subscription = { name: string; callback: (event: any) => void };
+const subscriptions = new Set<Subscription>();
+const disposers = new Map<Subscription, () => void | Promise<void>>();
+
+/** Attaches one subscription to whichever transport is active right now. */
+async function attach(sub: Subscription): Promise<void> {
+  let dispose: () => void | Promise<void>;
+  if (mode === 'remote') {
+    if (!remote) throw 'gateway_disconnected: no gateway is connected';
+    dispose = await remote.subscribe(sub.name, sub.callback);
+  } else if (mode === 'preview') dispose = (await import('./preview')).listen(sub.name, sub.callback);
+  else dispose = await (await import('@tauri-apps/api/event')).listen(sub.name, event => sub.callback(event.payload));
+  disposers.set(sub, dispose);
+}
+
+/**
+ * Moves every live subscription to the transport that is now active. Without this a
+ * window connected at runtime would keep reacting to the backend it left behind: the
+ * desktop process still runs (and still emits) while the workspace shows gateway data.
+ */
+export async function rebindSubscriptions(): Promise<void> {
+  if (!subscriptions.size) return;
+  const entries = [...disposers];
+  disposers.clear();
+  for (const [, dispose] of entries) {
+    try { await dispose(); } catch { /* a transport that already closed cannot unsubscribe */ }
+  }
+  for (const sub of subscriptions) {
+    try { await attach(sub); } catch (error) { console.warn(`Could not move the ${sub.name} subscription`, error); }
+  }
+}
+
 /** Remote mode is chosen at boot, before the first `call`. */
-export function setMode(next: Mode, client?: GatewayClient | null): void {
+export async function setMode(next: Mode, client?: GatewayClient | null): Promise<void> {
   // A replaced or discarded remote client stops its socket and reconnect timer.
   if (remote && remote !== client) remote.close();
   mode = next;
   remote = client ?? null;
+  await rebindSubscriptions();
 }
 export function currentMode(): Mode {
   return mode;
 }
 
+/**
+ * Commands only this computer answers, in every mode: the gateway settings themselves
+ * and the native dialogs. In remote mode the gateway is the command transport, so it
+ * cannot be asked to save the address it is reached at.
+ */
+export async function callShell<T>(command: string, args: Record<string, unknown> = {}): Promise<T> {
+  if (preview) return (await import('./preview')).invoke<T>(command, args);
+  return (await import('@tauri-apps/api/core')).invoke<T>(command, args);
+}
 export async function call<T>(command: string, args: Record<string, unknown> = {}): Promise<T> {
   if (mode === 'remote') {
     if (!remote) throw 'gateway_disconnected: no gateway is connected';
     return remote.call<T>(command, args);
   }
-  if (mode === 'preview') return (await import('./preview')).invoke<T>(command, args);
-  return (await import('@tauri-apps/api/core')).invoke<T>(command, args);
+  return callShell<T>(command, args);
 }
 export async function subscribe(name: 'agent-update-progress', callback: (event: import('./agent-updates').AgentUpdateProgress) => void): Promise<() => void>;
 export async function subscribe(name: 'jev-run', callback: (event: import('./jev').JevReport) => void): Promise<() => void>;
@@ -50,12 +92,15 @@ export async function subscribe(name: 'terminal-event', callback: (event: Termin
 export async function subscribe(name: 'browser-state', callback: (event: BrowserStatus) => void): Promise<() => void>;
 export async function subscribe(name: 'browser-element', callback: (event: BrowserElement) => void): Promise<() => void>;
 export async function subscribe(name: string, callback: (event: any) => void): Promise<() => void> {
-  if (mode === 'remote') {
-    if (!remote) throw 'gateway_disconnected: no gateway is connected';
-    return remote.subscribe(name, callback);
-  }
-  if (mode === 'preview') return (await import('./preview')).listen(name, callback);
-  return (await import('@tauri-apps/api/event')).listen(name, event => callback(event.payload));
+  const sub: Subscription = { name, callback };
+  subscriptions.add(sub);
+  await attach(sub);
+  return async () => {
+    subscriptions.delete(sub);
+    const dispose = disposers.get(sub);
+    disposers.delete(sub);
+    await dispose?.();
+  };
 }
 export async function chooseFolder(title = 'Open a project in PandaCode'): Promise<string | null> {
   // A local dialog would return a path on this machine, which does not exist on the

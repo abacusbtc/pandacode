@@ -22,7 +22,7 @@ import { renderTurnChanges, changeRequest, captureChangeCards, restoreChangeCard
 import { mountWallpapers } from './wallpapers';
 import type { AgentEvent, BrowserAttachment, ContextUsage, FileEntry, GitStatus, Message, MessagePage, Mode, Project, Provider, ProviderId, ProviderModel, Session, TaskLink, ToolActivity, TurnChanges } from './types';
 import type { BrowserPanel } from './browser';
-import { call, chooseFolder, preview, subscribe } from './bridge';
+import { call, chooseFolder, currentMode, preview, subscribe } from './bridge';
 import { $, button, escape, icon, markdown, morph } from './dom';
 import { bindMessageActions, messageActionsHtml } from './message-actions';
 import { providerLogo } from './provider-logos';
@@ -65,6 +65,7 @@ import { teamActive, type TeamSnapshot, type TeamEvent, type TeamLibrary, type T
 import type { ArchitectView } from './architect';
 import { syncOverlayContext } from './overlay-client';
 import { initializeAgentUpdates } from './agent-updates';
+import { connectGateway, gatewayStatus, mountGatewaySettings, startGatewaySession } from './gateway-settings';
 
 /* Visual thesis: calm surfaces, system typography, yellow selection, and bamboo details.
  * Content: project navigation → conversation → contextual source review.
@@ -171,6 +172,9 @@ function onArchitect(team: TeamEvent): void {
   scheduleNavigation();
 }
 async function loadTeam(id: string): Promise<TeamSnapshot | null> {
+  // Agent teams are a desktop surface: the architect commands are not in the gateway's
+  // command table, so there is nothing to ask a remote backend for.
+  if (currentMode() === 'remote') return null;
   const known = teams.has(id), before = teams.get(id);
   const loaded = await call<TeamSnapshot | null>('architect_get', { sessionId: id });
   if (deletedSessions.has(id)) return null;
@@ -269,7 +273,7 @@ $app.innerHTML = `<div class="workspace">
     <div class="sidebar-bottom">${button('support', 'Help & support', 'help', 'support-button', 'id="support-button"')}${button('agent-usage', 'Agent usage', 'activity', '', 'id="agent-usage-button"')}<button data-action="archive-view" id="archive-toggle" title="Archived tasks" aria-label="Archived tasks">${icon('archive')}</button><button data-action="settings" title="Settings (${shortcut(',')})" aria-label="Settings">${icon('settings')}</button><button data-action="toggle-theme" id="theme-toggle" aria-label="Dark mode" aria-pressed="false"></button></div>
   </aside>
   <main class="main-pane">
-    <header class="workspace-header" data-tauri-drag-region="deep"><div class="header-leading" data-tauri-drag-region>${button('toggle-sidebar', 'Hide sidebar', 'sidebar', 'sidebar-toggle', 'id="sidebar-toggle" aria-controls="workspace-sidebar" aria-expanded="true" aria-keyshortcuts="Meta+B Control+B"')}<div id="breadcrumb" class="breadcrumb" data-tauri-drag-region></div></div><div class="header-actions">${preview ? '<span class="preview-status">Browser preview · sample data</span>' : ''}<button type="button" id="update-status" class="update-status" hidden>${icon('refresh')}<span>Restart to update</span></button><div class="view-switch" role="group" aria-label="Workspace view"><button data-action="conversation-view" aria-label="Conversation view" aria-pressed="true">${icon('chat')}<span>Conversation</span></button><button data-action="board-view" aria-label="Board view" aria-pressed="false">${icon('board')}<span>Board</span></button><button data-action="github-view" aria-label="GitHub view" aria-pressed="false">${icon('github')}<span>GitHub</span></button></div><button type="button" class="header-run" id="run-project-button" data-action="run-project" aria-label="Run project" title="Run pandacode-run.sh" hidden>${icon('play')}<span>Run</span></button>${button('deploy', 'Deploy', 'upload', '', 'id="deploy-button" aria-haspopup="dialog"')}<span class="header-divider" aria-hidden="true"></span>${button('moodboards', 'Project moodboards', 'images')}${button('browser', 'Open browser', 'globe', '', 'id="browser-toggle"')}${button('terminal', `Toggle terminal (${shortcut('J')})`, 'terminal', '', 'id="terminal-toggle" aria-controls="terminal-drawer" aria-expanded="false"')}<span class="header-divider" aria-hidden="true"></span>${button('toggle-inspector', `Toggle inspector (${shortcut('B', true)})`, 'panel', 'active', 'id="inspector-toggle"')}${button('task-menu', 'Task actions', 'more', '', 'id="task-menu-trigger" aria-haspopup="dialog" aria-expanded="false"')}</div></header>
+    <header class="workspace-header" data-tauri-drag-region="deep"><div class="header-leading" data-tauri-drag-region>${button('toggle-sidebar', 'Hide sidebar', 'sidebar', 'sidebar-toggle', 'id="sidebar-toggle" aria-controls="workspace-sidebar" aria-expanded="true" aria-keyshortcuts="Meta+B Control+B"')}<div id="breadcrumb" class="breadcrumb" data-tauri-drag-region></div></div><div class="header-actions">${preview ? '<span class="preview-status">Browser preview · sample data</span>' : ''}<button type="button" id="gateway-badge" class="gateway-badge" data-action="gateway-settings" hidden><span id="gateway-badge-text"></span></button><button type="button" id="update-status" class="update-status" hidden>${icon('refresh')}<span>Restart to update</span></button><div class="view-switch" role="group" aria-label="Workspace view"><button data-action="conversation-view" aria-label="Conversation view" aria-pressed="true">${icon('chat')}<span>Conversation</span></button><button data-action="board-view" aria-label="Board view" aria-pressed="false">${icon('board')}<span>Board</span></button><button data-action="github-view" aria-label="GitHub view" aria-pressed="false">${icon('github')}<span>GitHub</span></button></div><button type="button" class="header-run" id="run-project-button" data-action="run-project" aria-label="Run project" title="Run pandacode-run.sh" hidden>${icon('play')}<span>Run</span></button>${button('deploy', 'Deploy', 'upload', '', 'id="deploy-button" aria-haspopup="dialog"')}<span class="header-divider" aria-hidden="true"></span>${button('moodboards', 'Project moodboards', 'images')}${button('browser', 'Open browser', 'globe', '', 'id="browser-toggle"')}${button('terminal', `Toggle terminal (${shortcut('J')})`, 'terminal', '', 'id="terminal-toggle" aria-controls="terminal-drawer" aria-expanded="false"')}<span class="header-divider" aria-hidden="true"></span>${button('toggle-inspector', `Toggle inspector (${shortcut('B', true)})`, 'panel', 'active', 'id="inspector-toggle"')}${button('task-menu', 'Task actions', 'more', '', 'id="task-menu-trigger" aria-haspopup="dialog" aria-expanded="false"')}</div></header>
     <div class="work-area"><section id="project-board" class="project-board" aria-label="Project board" hidden></section><section id="github-hub" aria-label="GitHub" hidden></section><section class="conversation-pane"><div id="task-details-heading" class="task-details-heading" hidden></div><div id="subagents-host" class="subagents-host" hidden></div><div id="transcript" class="transcript" role="log" aria-label="Conversation" aria-live="off"></div><div id="composer-area" class="composer-area"></div></section></div>
     <div id="terminal-drawer" class="terminal-drawer" hidden><div class="drawer-heading"><span>${icon('terminal')}<span id="terminal-project" class="muted"></span></span><div class="terminal-tabs" role="tablist" aria-label="Terminal tabs"></div><div class="terminal-heading-actions"><button class="icon-button" data-terminal-action="new" aria-label="New terminal" title="New terminal">${icon('plus')}</button><button class="icon-button" data-terminal-action="minimize" aria-label="Minimize terminal" title="Minimize terminal">${icon('minimize')}</button><button class="icon-button" data-terminal-action="close" aria-label="Close terminal" title="Close terminal" aria-haspopup="dialog">${icon('close')}</button></div></div><div id="terminal-host"></div></div>
   </main>
@@ -1720,7 +1724,12 @@ async function selectSession(id: string, focusComposer = false): Promise<void> {
   if (remembered) stickTranscript();
   if (focusComposer) document.querySelector<HTMLTextAreaElement>('#prompt')?.focus();
   let page: MessagePage, details: Session;
-  try { [page, details] = await Promise.all([latestMessagePage(id), call<Session>('get_task', { sessionId: id }), loadTeam(id)]); }
+  try { [page, details] = await Promise.all([
+    latestMessagePage(id),
+    // `get_task` is a desktop command; a remote task keeps the metadata list_sessions gave.
+    currentMode() === 'remote' ? Promise.resolve(s) : call<Session>('get_task', { sessionId: id }),
+    loadTeam(id),
+  ]); }
   catch (error) {
     if (generation !== state.generation) return;
     state.messagesLoading = false;
@@ -1762,8 +1771,13 @@ async function selectProject(id: string): Promise<void> {
 }
 async function reloadSessions(): Promise<void> {
   const selectedId = state.sessionId, generation = state.generation, request = ++sessionsReload, previousDetails = fullTaskDescription;
+  // `get_task` is a desktop command; a gateway does not serve it (D4), and asking would
+  // fail the whole reload with "unsupported_command: get_task". The row `list_sessions`
+  // just returned carries the same fields, so remote mode reads it instead (as
+  // `selectSession` does).
+  const savedDetails = selectedId ? session() ?? null : null;
   const [sessions, detailResult] = await Promise.all([call<Session[]>('list_sessions'),
-    Promise.allSettled([selectedId ? call<Session>('get_task', { sessionId: selectedId }) : Promise.resolve(null)]).then(results => results[0])]);
+    Promise.allSettled([selectedId && currentMode() !== 'remote' ? call<Session>('get_task', { sessionId: selectedId }) : Promise.resolve(savedDetails)]).then(results => results[0])]);
   if (request !== sessionsReload) return;
   if (detailResult.status === 'rejected' && !deletedSessions.has(selectedId)) throw detailResult.reason;
   const details = detailResult.status === 'fulfilled' ? detailResult.value : null;
@@ -2991,6 +3005,7 @@ async function showSettings(section?: import('./settings').SettingsSection): Pro
       compact: document.body.classList.contains('compact'), wallpapers: wallpapers.enabled,
       theme: currentTheme(), preview, section, discover: discoverSettingsProviders,
       github: target => github.mountSettings(target, project()?.id ?? state.projects[0]?.id ?? ''),
+      gateway: target => mountGatewaySettings(target, { notify, reload: loadWorkspace }),
       teams: { loadModels, call },
       cloud: { call, listen: (name, callback) => subscribe(name, callback) },
       embed: {
@@ -3345,6 +3360,7 @@ async function action(name: string, element: HTMLElement): Promise<void> {
     case 'search': showCommands(); break;
     case 'retry-response': { const finishing = finishingStreams.get(state.sessionId); if (finishing) await finishResponse(state.sessionId, finishing); break; }
     case 'settings': case 'refresh-settings': await showSettings(); break;
+    case 'gateway-settings': await showSettings('general'); break;
     case 'wallpaper-settings': await showWallpaperSettings(); break;
     case 'provider-connections': await showProviderConnections(); break;
     case 'opencode-models': await showOpenCodeModels(); break;
@@ -3518,6 +3534,15 @@ window.addEventListener('focus', renderNavigation);
 document.addEventListener('visibilitychange', () => { renderNavigation(); if (!document.hidden) { renderHeader(); renderStream(); } updateWorkTimer(); });
 if (localStorage.getItem('pandacode.compact') === 'true') document.body.classList.add('compact');
 async function boot(): Promise<void> {
+  // The gateway is chosen before the first command: projects, sessions and events all
+  // route through it, so switching later would race the boot fetches. A saved gateway
+  // that does not answer stays selected and says so, rather than falling back to this
+  // computer's database without telling anyone.
+  if (!(await startGatewaySession())) {
+    render();
+    notify(`Cannot reach the gateway at ${gatewayStatus()?.url ?? 'the saved address'}. Open Settings to fix it, or disconnect to use this computer.`);
+    return;
+  }
   await subscribe('agent-event', onAgent);
   await subscribe('provider-models-changed', event => invalidateModels(event.provider));
   await subscribe('architect-event', onArchitect);
@@ -3558,20 +3583,31 @@ async function boot(): Promise<void> {
     }
   })()));
   await connectAgentUiActions(() => transcriptVisible() ? state.sessionId : '', performAgentUiAction);
-  [state.projects, state.sessions, state.providers] = await Promise.all([call<Project[]>('list_projects'), call<Session[]>('list_sessions'), call<Provider[]>('list_providers')]);
   // Queues from an earlier launch wait for an explicit Resume.
   for (const entry of await call<QueuedMessage[]>('queue_list').catch(() => [])) {
     state.queues.set(entry.sessionId, [...(state.queues.get(entry.sessionId) ?? []), entry]);
     state.queueHolds.set(entry.sessionId, 'restart');
   }
   scheduleLimitResumes();
+  await loadWorkspace();
+  if (!preview && currentMode() === 'native' && !state.providers.some(p => p.installed)) notify('Open Settings to check your installed agent CLIs.');
+}
+/** Projects and sessions over whichever transport is active, then the first task. */
+async function loadWorkspace(): Promise<void> {
+  const [projects, sessions, providers] = await Promise.all([
+    call<Project[]>('list_projects'),
+    call<Session[]>('list_sessions'),
+    // The gateway serves no agent catalog (agent turns are the next milestone), so
+    // asking would fail the whole load on a command the table does not have.
+    currentMode() === 'remote' ? Promise.resolve<Provider[]>([]) : call<Provider[]>('list_providers'),
+  ]);
+  state.projects = projects; state.sessions = sessions; state.providers = providers;
   if (state.projectFilter && !state.projects.some(p => p.id === state.projectFilter)) setProjectFilter('');
   const savedProject = localStorage.getItem('pandacode.project');
   const recent = state.sessions.find(s => !s.archived);
   activateProject(state.projects.find(p => p.id === savedProject)?.id ?? recent?.projectId ?? state.projects[0]?.id ?? '');
   const first = state.sessions.find(s => !s.archived && s.projectId === state.projectId); if (first) await selectSession(first.id); else { render(); await refreshInspector(); }
   if (state.view !== 'conversation') { state.boardPanel = false; renderInspector(); renderBoardView(); }
-  if (!preview && !state.providers.some(p => p.installed)) notify('Open Settings to check your installed agent CLIs.');
 }
 // PandaCode's own updates: checked on GitHub Releases, installed when no agent is working.
 const updates = startAppUpdates({ busy: () => state.sessions.some(task => isRunning(task.id)), notify });
@@ -3595,3 +3631,12 @@ const agentUpdates = initializeAgentUpdates({
 window.addEventListener('pagehide', () => agentUpdates.dispose(), { once: true });
 renderThemeToggle(); render(); renderInspector(); run(boot());
 if (!preview) initializeNativeAppearance();
+if (preview) {
+  // The browser preview has no native shell to save a gateway in, so the gateway suite
+  // drives the same connect path the Settings row uses.
+  (window as any).__connectGatewayForTest = async (url: string, token: string) => {
+    const answered = await connectGateway(url, token);
+    if (answered) await loadWorkspace();
+    return answered;
+  };
+}
