@@ -936,12 +936,13 @@ git commit -m "docs(gateway): document running the gateway and prove real data e
 
 ```bash
 sudo install -m 0755 target/release/pandacode-gateway /usr/local/bin/pandacode-gateway
-sudo install -d -o abacus -g abacus /var/lib/pandacode
+# Do NOT create /var/lib/pandacode: the unit's StateDirectory=pandacode creates and owns it
+# for the DynamicUser (a pre-created root- or abacus-owned directory breaks the lock/database).
 sudo cp scripts/gateway/pandacode-gateway.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now pandacode-gateway
 ```
 
-- [ ] **Step 2:** Verify locally: `curl -s -H "Authorization: Bearer $(cat /var/lib/pandacode/gateway-token)" http://127.0.0.1:47399/capabilities | jq .commands` lists the M1 commands.
+- [ ] **Step 2:** Verify locally (the state directory is 0700 and owned by the ephemeral user, so the token needs sudo): `curl -s -H "Authorization: Bearer $(sudo cat /var/lib/pandacode/gateway-token)" http://127.0.0.1:47399/capabilities | jq .commands` lists the M1 commands.
 
 - [ ] **Step 3:** Point the existing Nginx Proxy Manager host at it: Forward Hostname `pandacode-gateway`, port `47399`, Websockets on, `client_max_body_size 64m`, certificate `*.lan`. No new certificate, no new DNS record.
 
