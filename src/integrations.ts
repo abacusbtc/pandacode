@@ -1,5 +1,5 @@
 import './integrations.css';
-import { call, preview } from './bridge';
+import { call, currentMode } from './bridge';
 import { escape, icon } from './dom';
 
 interface Tool { name: string; description: string; }
@@ -29,7 +29,7 @@ export async function showIntegrations(dialog: HTMLDialogElement, context: { pro
     const target = host.querySelector('.integration-content')!;
     const catalog = results[0].status === 'fulfilled' ? results[0].value : undefined;
     const tools = results[1].status === 'fulfilled' ? results[1].value : [];
-    target.innerHTML = `${preview ? '<div class="preview-notice">Browser preview · integration status is sample data.</div>' : ''}
+    target.innerHTML = `${currentMode() === 'preview' ? '<div class="preview-notice">Browser preview · integration status is sample data.</div>' : ''}
       <div class="integration-note">Shell commands, file editing, image inspection, web search, and subagents are supplied by Codex when available under its configuration and your task permissions.</div>
       <div class="integration-row"><div><strong>Jev · Optional add-on</strong><small>Browser tests, work review, context matching, and worker suggestions. No Jev key is needed for normal agent work.</small></div><button class="secondary-button" data-action="jev-settings">Set up Jev</button></div>
       <details class="integration-group"><summary>PandaCode tools <span>${tools.length}</span></summary><p class="integration-note">Core app tools are available in new Codex tasks and their continuations. Older tasks keep their original catalog. When enabled, Jev joins new and resumed tasks across connected harnesses. App actions use your approval mode; embedded browser controls require the task to be visible.</p>${tools.map(tool => row({ ...tool, name: tool.name.replace(/^pandacode_/, '').replaceAll('_', ' ') })).join('')}</details>

@@ -1,5 +1,6 @@
 import './theme-settings.css';
 import { escape, icon } from './dom';
+import { syncCapabilities } from './gateway-settings';
 import { CLASSIC, SWATCHES, palette, type AccentChoice, type VsixTheme } from './palette';
 
 /* Colors: the accent (wallpaper, classic, a swatch or any color) and VS Code themes
@@ -41,6 +42,9 @@ export function mountThemeSettings(host: HTMLElement, options: ThemeSettingsHost
       </div>
       <p class="vsix-status" role="status" aria-live="polite"></p>
     </section>`;
+  // This pane is mounted long after connect, so it asks for its own gating: a gateway
+  // that cannot import a .vsix must not offer the picker.
+  syncCapabilities(host);
   const accents = host.querySelector<HTMLElement>('.accent-choices')!, list = host.querySelector<HTMLElement>('.vsix-list')!;
   const status = host.querySelector<HTMLElement>('.vsix-status')!;
   const say = (text: string) => { status.textContent = text; };

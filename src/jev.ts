@@ -1,6 +1,7 @@
 import './jev.css';
 import { call, preview, subscribe } from './bridge';
 import { escape, icon } from './dom';
+import { capabilityEnabled } from './gateway-settings';
 import { hidePopover, showPopover } from './popover-motion';
 import type { LocalServer } from './types';
 
@@ -419,7 +420,7 @@ async function mountTests(view: JevView, context: TestContext, compact = false):
   async function refresh() {
     const ticket = ++refreshRevision, versions = new Map(eventVersions);
     query<HTMLButtonElement>('[data-jev-refresh]').disabled = true;
-    const results = await Promise.allSettled([call<JevConfiguration>('jev_configuration'), call<JevReport[]>('jev_list_runs', { sessionId: context.sessionId }), call<LocalServer[]>('list_local_servers')]);
+    const results = await Promise.allSettled([call<JevConfiguration>('jev_configuration'), capabilityEnabled('jev_list_runs') ? call<JevReport[]>('jev_list_runs', { sessionId: context.sessionId }) : Promise.resolve<JevReport[]>([]), call<LocalServer[]>('list_local_servers')]);
     if (!view.alive() || ticket !== refreshRevision) return;
     query<HTMLButtonElement>('[data-jev-refresh]').disabled = false;
     if (results[0].status === 'fulfilled') setConfig(results[0].value);

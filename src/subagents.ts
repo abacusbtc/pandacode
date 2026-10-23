@@ -1,6 +1,7 @@
 import './subagents.css';
 import { call } from './bridge';
 import { icon } from './dom';
+import { capabilityEnabled } from './gateway-settings';
 import { showPopover, hidePopover } from './popover-motion';
 import { streamMarkdown } from './streaming-markdown';
 import { bindFileLinkContext, refreshFileLinks, type FileLinkContext } from './file-links';
@@ -119,6 +120,10 @@ export class Subagents {
   }
 
   private async load(id: string): Promise<void> {
+    // A gateway has no agent turns, so there is no worker history to come back. Asking
+    // would be an unsupported_command; an empty task is the same answer, and the host
+    // stays hidden because nothing was ever added to it.
+    if (!capabilityEnabled('list_subagents')) return;
     const task = this.task(id), request = ++task.request, revision = this.revision;
     task.loading = true; task.error = false;
     try {

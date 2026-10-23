@@ -65,7 +65,7 @@ import { teamActive, type TeamSnapshot, type TeamEvent, type TeamLibrary, type T
 import type { ArchitectView } from './architect';
 import { syncOverlayContext } from './overlay-client';
 import { initializeAgentUpdates } from './agent-updates';
-import { connectGateway, gatewayStatus, mountGatewaySettings, startGatewaySession } from './gateway-settings';
+import { capabilityEnabled, connectGateway, gatewayStatus, mountGatewaySettings, startGatewaySession } from './gateway-settings';
 import { pickRemoteFolder } from './remote-files';
 
 /* Visual thesis: calm surfaces, system typography, yellow selection, and bamboo details.
@@ -274,7 +274,7 @@ $app.innerHTML = `<div class="workspace">
     <div class="sidebar-bottom">${button('support', 'Help & support', 'help', 'support-button', 'id="support-button"')}${button('agent-usage', 'Agent usage', 'activity', '', 'id="agent-usage-button"')}<button data-action="archive-view" id="archive-toggle" title="Archived tasks" aria-label="Archived tasks">${icon('archive')}</button><button data-action="settings" title="Settings (${shortcut(',')})" aria-label="Settings">${icon('settings')}</button><button data-action="toggle-theme" id="theme-toggle" aria-label="Dark mode" aria-pressed="false"></button></div>
   </aside>
   <main class="main-pane">
-    <header class="workspace-header" data-tauri-drag-region="deep"><div class="header-leading" data-tauri-drag-region>${button('toggle-sidebar', 'Hide sidebar', 'sidebar', 'sidebar-toggle', 'id="sidebar-toggle" aria-controls="workspace-sidebar" aria-expanded="true" aria-keyshortcuts="Meta+B Control+B"')}<div id="breadcrumb" class="breadcrumb" data-tauri-drag-region></div></div><div class="header-actions">${preview ? '<span class="preview-status">Browser preview · sample data</span>' : ''}<button type="button" id="gateway-badge" class="gateway-badge" data-action="gateway-settings" hidden><span id="gateway-badge-text"></span></button><button type="button" id="update-status" class="update-status" hidden>${icon('refresh')}<span>Restart to update</span></button><div class="view-switch" role="group" aria-label="Workspace view"><button data-action="conversation-view" aria-label="Conversation view" aria-pressed="true">${icon('chat')}<span>Conversation</span></button><button data-action="board-view" aria-label="Board view" aria-pressed="false">${icon('board')}<span>Board</span></button><button data-action="github-view" aria-label="GitHub view" aria-pressed="false">${icon('github')}<span>GitHub</span></button></div><button type="button" class="header-run" id="run-project-button" data-action="run-project" aria-label="Run project" title="Run pandacode-run.sh" hidden>${icon('play')}<span>Run</span></button>${button('deploy', 'Deploy', 'upload', '', 'id="deploy-button" aria-haspopup="dialog"')}<span class="header-divider" aria-hidden="true"></span>${button('moodboards', 'Project moodboards', 'images')}${button('browser', 'Open browser', 'globe', '', 'id="browser-toggle"')}${button('terminal', `Toggle terminal (${shortcut('J')})`, 'terminal', '', 'id="terminal-toggle" aria-controls="terminal-drawer" aria-expanded="false"')}<span class="header-divider" aria-hidden="true"></span>${button('toggle-inspector', `Toggle inspector (${shortcut('B', true)})`, 'panel', 'active', 'id="inspector-toggle"')}${button('task-menu', 'Task actions', 'more', '', 'id="task-menu-trigger" aria-haspopup="dialog" aria-expanded="false"')}</div></header>
+    <header class="workspace-header" data-tauri-drag-region="deep"><div class="header-leading" data-tauri-drag-region>${button('toggle-sidebar', 'Hide sidebar', 'sidebar', 'sidebar-toggle', 'id="sidebar-toggle" aria-controls="workspace-sidebar" aria-expanded="true" aria-keyshortcuts="Meta+B Control+B"')}<div id="breadcrumb" class="breadcrumb" data-tauri-drag-region></div></div><div class="header-actions"><span class="preview-status" id="preview-status"${currentMode() === 'preview' ? '' : ' hidden'}>Browser preview · sample data</span><button type="button" id="gateway-badge" class="gateway-badge" data-action="gateway-settings" hidden><span id="gateway-badge-text"></span></button><button type="button" id="update-status" class="update-status" hidden>${icon('refresh')}<span>Restart to update</span></button><div class="view-switch" role="group" aria-label="Workspace view"><button data-action="conversation-view" aria-label="Conversation view" aria-pressed="true">${icon('chat')}<span>Conversation</span></button><button data-action="board-view" aria-label="Board view" aria-pressed="false">${icon('board')}<span>Board</span></button><button data-action="github-view" aria-label="GitHub view" aria-pressed="false">${icon('github')}<span>GitHub</span></button></div><button type="button" class="header-run" id="run-project-button" data-action="run-project" aria-label="Run project" title="Run pandacode-run.sh" hidden>${icon('play')}<span>Run</span></button>${button('deploy', 'Deploy', 'upload', '', 'id="deploy-button" aria-haspopup="dialog"')}<span class="header-divider" aria-hidden="true"></span>${button('moodboards', 'Project moodboards', 'images')}${button('browser', 'Open browser', 'globe', '', 'id="browser-toggle"')}${button('terminal', `Toggle terminal (${shortcut('J')})`, 'terminal', '', 'id="terminal-toggle" aria-controls="terminal-drawer" aria-expanded="false"')}<span class="header-divider" aria-hidden="true"></span>${button('toggle-inspector', `Toggle inspector (${shortcut('B', true)})`, 'panel', 'active', 'id="inspector-toggle"')}${button('task-menu', 'Task actions', 'more', '', 'id="task-menu-trigger" aria-haspopup="dialog" aria-expanded="false"')}</div></header>
     <div class="work-area"><section id="project-board" class="project-board" aria-label="Project board" hidden></section><section id="github-hub" aria-label="GitHub" hidden></section><section class="conversation-pane"><div id="task-details-heading" class="task-details-heading" hidden></div><div id="subagents-host" class="subagents-host" hidden></div><div id="transcript" class="transcript" role="log" aria-label="Conversation" aria-live="off"></div><div id="composer-area" class="composer-area"></div></section></div>
     <div id="terminal-drawer" class="terminal-drawer" hidden><div class="drawer-heading"><span>${icon('terminal')}<span id="terminal-project" class="muted"></span></span><div class="terminal-tabs" role="tablist" aria-label="Terminal tabs"></div><div class="terminal-heading-actions"><button class="icon-button" data-terminal-action="new" aria-label="New terminal" title="New terminal">${icon('plus')}</button><button class="icon-button" data-terminal-action="minimize" aria-label="Minimize terminal" title="Minimize terminal">${icon('minimize')}</button><button class="icon-button" data-terminal-action="close" aria-label="Close terminal" title="Close terminal" aria-haspopup="dialog">${icon('close')}</button></div></div><div id="terminal-host"></div></div>
   </main>
@@ -932,6 +932,10 @@ function responseAge(timestamp: number, now: number): string {
 }
 function renderHeader(): void {
   renderBoardView();
+  // A gateway is served by a browser too, so `preview` (no Tauri shell) is not what
+  // decides this: the label belongs to windows that really are the sample preview.
+  const label = $('#preview-status');
+  if (label) label.hidden = currentMode() !== 'preview';
   const p = project();
   terminalPanel.select(p ? workspaceContext() : undefined, p?.name ?? '');
   projectRunner.paint();
@@ -2372,9 +2376,17 @@ async function refreshInspector(): Promise<void> {
   void projectRunner.refresh();
   const request = ++inspectorRequest;
   const p = project(); if (!p) { state.git = null; state.files = []; state.gitError = ''; state.filesError = ''; state.inspectorLoading = false; renderInspector(); return; }
-  state.inspectorLoading = true; renderInspector();
+  // A gateway that does not serve these is not a failure to report: the tab says so
+  // itself, and asking anyway is what put `unsupported_command` on the screen. The
+  // gate is per command, so a backend that starts serving either one is used again
+  // with no further change here.
+  const servesGit = capabilityEnabled('git_status'), servesFiles = capabilityEnabled('list_files');
+  state.inspectorLoading = servesGit || servesFiles; renderInspector();
   const id = p.id, folder = state.filePath, context = workspaceContext(), key = workspaceKey();
-  const results = await Promise.allSettled([call<GitStatus>('git_status', context), call<FileEntry[]>('list_files', { ...context, path: folder })]);
+  const results = await Promise.allSettled([
+    servesGit ? call<GitStatus>('git_status', context) : Promise.resolve<GitStatus | null>(null),
+    servesFiles ? call<FileEntry[]>('list_files', { ...context, path: folder }) : Promise.resolve<FileEntry[]>([]),
+  ]);
   if (request !== inspectorRequest || id !== state.projectId || key !== workspaceKey() || folder !== state.filePath) return;
   state.inspectorLoading = false;
   state.git = results[0].status === 'fulfilled' ? results[0].value : null;
@@ -2517,6 +2529,14 @@ function renderInspector(): void {
   if (loadError) {
     target.innerHTML = `<div class="inspector-empty" role="alert">${icon('alert')}<h3>${state.inspectorTab === 'changes' ? 'Unable to load changes' : 'Unable to read folder'}</h3><p>${escape(loadError)}</p><button class="secondary-button" data-action="refresh-inspector">${icon('refresh')}Retry</button></div>`;
     target.querySelector('p')!.style.overflowWrap = 'anywhere';
+    return;
+  }
+  // Neither answer exists because neither was asked for: saying "This folder is empty"
+  // or "No Git repository" here would be a claim about a folder nobody looked at.
+  const unserved = state.inspectorTab === 'files' ? 'list_files' : state.inspectorTab === 'changes' ? 'git_status' : '';
+  if (unserved && !capabilityEnabled(unserved)) {
+    const what = unserved === 'list_files' ? `${escape(project()!.name)}’s files` : 'changes';
+    target.innerHTML = `<div class="inspector-empty">${icon('globe')}<h3>Not served by this gateway</h3><p>The backend you are connected to does not read ${what} yet.</p></div>`;
     return;
   }
   if (state.selectedKind) {
@@ -2928,7 +2948,7 @@ async function showSidebarTaskMenu(anchor: HTMLElement): Promise<void> {
 }
 /** A project's favicon or app icon; the sidebar redraws once a new one has loaded. */
 function projectAppIcon(projectId: string, name: string): string {
-  return projectIconHtml(projectId, name, id => call<string | null>('project_icon', { projectId: id }), () => renderNavigation());
+  return projectIconHtml(projectId, name, id => capabilityEnabled('project_icon') ? call<string | null>('project_icon', { projectId: id }) : Promise.resolve(null), () => renderNavigation());
 }
 async function showProjectFilter(anchor: HTMLElement): Promise<void> {
   await showChoices(anchor, { title: 'Filter projects', searchPlaceholder: 'Search projects…', items: [
