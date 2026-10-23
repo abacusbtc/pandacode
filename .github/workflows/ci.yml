@@ -54,5 +54,10 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
+      # The gateway sits behind an off-by-default feature, so these two steps are
+      # what compiles src-tauri/src/gateway/** and tests/gateway_http.rs in CI.
+      - run: cargo test --locked --manifest-path src-tauri/Cargo.toml --features gateway --test gateway_http
       - if: ${{ !cancelled() }}
         run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+      - if: ${{ !cancelled() }}
+        run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml --features gateway --all-targets -- -D warnings
