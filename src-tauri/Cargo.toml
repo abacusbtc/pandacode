@@ -20,6 +20,13 @@ name = "pandacode-gateway"
 path = "src/bin/pandacode-gateway.rs"
 required-features = ["gateway"]
 
+# The HTTP suite only has tests under the feature. Declaring that here makes
+# `cargo test --test gateway_http` without `--features gateway` a hard error,
+# instead of a green run of zero tests (PAN-54).
+[[test]]
+name = "gateway_http"
+required-features = ["gateway"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
