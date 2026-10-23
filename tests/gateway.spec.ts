@@ -428,3 +428,73 @@ test('attaching files says why a gateway cannot read them', async ({ page }) => 
     await gateway.close();
   }
 });
+
+test('dismissing the picker from its backdrop settles it and leaves no key handler behind', async ({ page }) => {
+  // main.ts closes the dialog on a backdrop press (outsideDialog -> closeModal), a path
+  // that never runs the picker's own Cancel. If that left the keydown handler attached,
+  // Backspace in the app would keep asking the server for folders.
+  const gateway = await startGateway({
+    ...seeded([...M1, 'gateway_list_dirs']),
+    gateway_list_dirs: () => ({ path: '/srv/repos', parent: '/srv', entries: [{ name: 'pandacode', isDir: true }] }),
+  });
+  try {
+    await openApp(page);
+    await waitForBoot(page);
+    await connect(page, gateway);
+    await page.locator('.sidebar-projects [data-action="add-project"]').click();
+    await page.locator('[data-action="browse-project"]').click();
+    await expect(page.locator('.remote-files .entry')).toHaveText(['pandacode']);
+
+    // The backdrop is the dialog's own area outside its panel.
+    await page.mouse.click(4, 4);
+    await expect(page.locator('#dialog')).not.toHaveAttribute('open', '');
+
+    const before = gateway.calls.filter(command => command === 'gateway_list_dirs').length;
+    await page.keyboard.press('Backspace');
+    // Give a leaked handler time to fire before concluding there is none.
+    await expect.poll(() => gateway.calls.filter(command => command === 'gateway_list_dirs').length, { timeout: 1500 }).toBe(before);
+  } finally {
+    await gateway.close();
+  }
+});
+
+test('arrow keys walk the folder list and Enter opens the highlighted folder', async ({ page }) => {
+  const asked: string[] = [];
+  const gateway = await startGateway({
+    ...seeded([...M1, 'gateway_list_dirs']),
+    gateway_list_dirs: (args: any) => {
+      const path = args?.path ?? null;
+      asked.push(path ?? '<home>');
+      if (path === null || path === '/srv/repos') {
+        return { path: '/srv/repos', parent: '/srv', entries: [
+          { name: 'alpha', isDir: true }, { name: 'beta', isDir: true }, { name: 'gamma', isDir: true },
+        ] };
+      }
+      return { path, parent: '/srv/repos', entries: [] };
+    },
+  });
+  try {
+    await openApp(page);
+    await waitForBoot(page);
+    await connect(page, gateway);
+    await page.locator('.sidebar-projects [data-action="add-project"]').click();
+    await page.locator('[data-action="browse-project"]').click();
+    await expect(page.locator('.remote-files .entry')).toHaveText(['alpha', 'beta', 'gamma']);
+
+    // Opening the picker focuses the first folder, so the keys work without a click.
+    await expect(page.locator('.remote-files .entry').first()).toBeFocused();
+    await page.keyboard.press('ArrowDown');
+    await expect(page.locator('.remote-files .entry').nth(1)).toBeFocused();
+    await page.keyboard.press('ArrowDown');
+    await expect(page.locator('.remote-files .entry').nth(2)).toBeFocused();
+    await page.keyboard.press('ArrowUp');
+    await expect(page.locator('.remote-files .entry').nth(1)).toBeFocused();
+
+    // Enter opens the highlighted folder, not the first or the last one.
+    await page.keyboard.press('Enter');
+    await expect.poll(() => asked[asked.length - 1]).toBe('/srv/repos/beta');
+    await expect(page.locator('.remote-files-path')).toHaveText('/srv/repos/beta');
+  } finally {
+    await gateway.close();
+  }
+});

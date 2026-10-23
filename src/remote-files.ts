@@ -60,12 +60,12 @@ export function pickRemoteFolder(shell: RemoteFilesShell, title = 'Open a projec
     /** Up leaves a listed folder, and leaves a failure for the folder that worked. */
     const upTarget = (): string | null => (current ? current.parent ?? null : here);
 
-    // The Open project dialog's Browse swaps this content in *during* the click gesture
-    // that opened it, so the trailing click of that same gesture arrives with the pointer
-    // already over a row — and would navigate, or on the footer choose a folder nobody
-    // looked at. Clicks are ignored for a moment after opening; a new gesture is always
-    // far slower than that.
-    const openedAt = performance.now();
+    // No settle window here: actions are dispatched on `click`, so the gesture that opened
+    // the picker has already delivered its one click by the time this content exists, and
+    // a browser does not mint a second one. An earlier 250 ms guard was protecting against
+    // a click-through that does not happen — and it silently dropped real clicks.
+
+    const root = dialog.querySelector<HTMLElement>('.remote-files');
 
     function finish(path: string | null): void {
       if (done) return;
@@ -73,6 +73,7 @@ export function pickRemoteFolder(shell: RemoteFilesShell, title = 'Open a projec
       dialog.removeEventListener('click', onClick);
       document.removeEventListener('keydown', onKey);
       dialog.removeEventListener('close', onClose);
+      observer.disconnect();
       shell.close();
       resolve(path);
     }
@@ -118,8 +119,15 @@ export function pickRemoteFolder(shell: RemoteFilesShell, title = 'Open a projec
       }
     }
 
+    /** The dialog is gone: `close` is queued, so `open` is the synchronous truth. */
+    function gone(): boolean {
+      if (dialog.open) return false;
+      finish(null);
+      return true;
+    }
+
     function onClick(event: MouseEvent): void {
-      if (performance.now() - openedAt < 250) return;
+      if (gone()) return;
       const target = event.target instanceof Element ? event.target : null;
       if (!target) return;
       const action = target.closest<HTMLElement>('[data-remote-action]')?.dataset.remoteAction;
@@ -130,6 +138,7 @@ export function pickRemoteFolder(shell: RemoteFilesShell, title = 'Open a projec
     }
 
     function onKey(event: KeyboardEvent): void {
+      if (gone()) return;
       // Escape is handled here rather than left to the dialog: re-rendering the list can
       // drop focus to the body, where a modal dialog no longer reacts to it.
       if (event.key === 'Escape') { event.preventDefault(); finish(null); return; }
@@ -157,11 +166,17 @@ export function pickRemoteFolder(shell: RemoteFilesShell, title = 'Open a projec
       }
     }
 
+    // Another `modal()` call replaces the dialog's body without closing it, so `close`
+    // alone is not every ending: the picker is finished as soon as its root leaves the
+    // dialog, whichever path removed it.
+    const observer = new MutationObserver(() => { if (!root || !dialog.contains(root)) finish(null); });
+
     dialog.addEventListener('click', onClick);
     // On the document, not the dialog: re-rendering the list removes the focused row, and
     // focus then falls back to the body — where a dialog-scoped listener never fires.
     document.addEventListener('keydown', onKey);
     dialog.addEventListener('close', onClose);
+    observer.observe(dialog, { childList: true });
     void load();
   });
 }
