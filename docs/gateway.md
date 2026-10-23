@@ -215,19 +215,31 @@ serves one data directory:
 
 ```sh
 sudo install -m 0755 src-tauri/target/release/pandacode-gateway /usr/local/bin/pandacode-gateway
-sudo install -d /var/lib/pandacode /srv/pandacode
 sudo install -d /srv/pandacode/dist && sudo cp -r dist/. /srv/pandacode/dist/
 sudo install -m 0644 scripts/gateway/pandacode-gateway.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now pandacode-gateway
 curl -s http://127.0.0.1:47399/healthz
+sudo cat /var/lib/pandacode/gateway-token
 ```
 
 Build the release binary with `cargo build --release --manifest-path
-src-tauri/Cargo.toml --features gateway --bin pandacode-gateway`. The token is
-created on first start at `/var/lib/pandacode/gateway-token`; read it with
-`sudo cat` and keep it out of shell history. The unit binds loopback, so the
-proxy must run on the same host or share its network namespace; a network bind
-needs `--host` **and** an explicit `--token-file` (see above).
+src-tauri/Cargo.toml --features gateway --bin pandacode-gateway`.
+
+**Do not create `/var/lib/pandacode` by hand.** The unit runs as `DynamicUser=yes`,
+an ephemeral user, and `StateDirectory=pandacode` is what makes the data directory
+work: systemd creates it, owns it as that user, and puts it in the write path
+itself. The real directory is `/var/lib/private/pandacode` (mode `0700`, which
+`StateDirectoryMode=` and `UMask=` pin down) and `/var/lib/pandacode` is a symlink
+to it, so another local user cannot read the database. A root-owned
+`/var/lib/pandacode` already in the way defeats that and the gateway fails on its
+lock with `Permission denied`; `ReadWritePaths=` would not have helped, because it
+only opens the mount namespace and never grants ownership.
+
+The token is created on first start at `/var/lib/pandacode/gateway-token` — the
+same path, reached through the symlink. `sudo cat` reads it as root; keep it out of
+shell history. The unit binds loopback, so the proxy must run on the same host or
+share its network namespace; a network bind needs `--host` **and** an explicit
+`--token-file` (see above).
 
 ## Tests
 
@@ -247,6 +259,21 @@ npm run gateway:test                # npm run build, then the spec with one work
 Its own run is serial because it owns a port and a data directory, and it kills
 the child process in a `finally`. Running it by hand is
 `npx playwright test tests/gateway-e2e.spec.ts --workers=1`.
+
+It is **not** part of a plain `npx playwright test`: that suite runs against the
+Vite dev server and has to stay usable on a clean checkout, where this spec would
+fail without `dist/` and fight three browser workers for four cores while cargo
+compiles. `playwright.config.ts` adds it to `testMatch` when it is named on the
+command line (both commands above do that) or when `PANDACODE_GATEWAY_E2E=1` is
+set; otherwise the suite skips it.
+
+`npm run gateway:test` launches Chrome from the path in
+`PANDACODE_TEST_CHROME`, which defaults to macOS Chrome
+(`/Applications/Google Chrome.app/…`). On Linux, name the browser:
+
+```sh
+PANDACODE_TEST_CHROME=/usr/bin/google-chrome npm run gateway:test
+```
 
 The Rust side is `src-tauri/tests/gateway_http.rs`, gated on the feature:
 `cargo test --manifest-path src-tauri/Cargo.toml --features gateway`.

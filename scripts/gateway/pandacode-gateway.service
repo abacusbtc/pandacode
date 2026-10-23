@@ -3,10 +3,11 @@
 #
 # Install:
 #   sudo install -m 0755 src-tauri/target/release/pandacode-gateway /usr/local/bin/
-#   sudo install -d /var/lib/pandacode /srv/pandacode/dist
+#   sudo install -d /srv/pandacode/dist
 #   sudo install -m 0644 scripts/gateway/pandacode-gateway.service /etc/systemd/system/
 #   sudo systemctl daemon-reload && sudo systemctl enable --now pandacode-gateway
 #   sudo cat /var/lib/pandacode/gateway-token     # paste into Settings → Remote gateway
+# /var/lib/pandacode is created by this unit (StateDirectory=), never by hand.
 
 [Unit]
 Description=PandaCode gateway
@@ -25,11 +26,21 @@ Restart=always
 RestartSec=2
 
 # An ephemeral user, because the gateway needs no identity of its own: the token is
-# what authorises, and the database is the only state. systemd hands the paths below
-# to that user; on a systemd that does not, `StateDirectory=pandacode` creates and
-# owns /var/lib/pandacode instead.
+# what authorises, and the database is the only state. StateDirectory= is what makes
+# that work: systemd creates /var/lib/pandacode for this service, owns it as the
+# ephemeral user (the real directory lives in /var/lib/private with a symlink here so
+# other users cannot read it), and adds it to the writable paths itself. Do NOT
+# pre-create /var/lib/pandacode as root: a real root-owned directory in the way stops
+# the ephemeral user from writing the lock and the database (docs/gateway.md).
+#
+# ReadWritePaths is therefore deliberately absent: it only opens the mount namespace
+# and never grants ownership, which is the trap this unit used to fall into.
 DynamicUser=yes
-ReadWritePaths=/var/lib/pandacode
+StateDirectory=pandacode
+# Nobody else reads the database, and the token is written 0600 in any case; the
+# default umask would leave the SQLite file world-readable inside the directory.
+StateDirectoryMode=0700
+UMask=0077
 
 # The database and the token are the whole attack surface: nothing outside /var/lib
 # is writable, and the process gains no privilege it did not start with.
