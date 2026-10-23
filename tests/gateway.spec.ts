@@ -53,7 +53,7 @@ async function startGateway(replies: Replies): Promise<Stub> {
     }
     let body = '';
     request.on('data', chunk => { body += chunk; });
-    request.on('end', () => {
+    request.on('end', async () => {
       if (request.method !== 'POST' || !request.url?.startsWith('/rpc')) {
         response.writeHead(404, allow);
         response.end('not found');
@@ -68,9 +68,20 @@ async function startGateway(replies: Replies): Promise<Stub> {
         response.end(JSON.stringify({ id: frame.id, ok: false, error: `unsupported_command: ${frame.command}` }));
         return;
       }
-      const result = typeof reply === 'function' ? (reply as (args: unknown) => unknown)(frame.args) : reply;
+      // A reply may be a promise, so a test can hold a request open and watch a loading
+      // state. A command that fails is an error envelope, exactly what the real server sends.
+      let result: { ok: true; value: unknown } | { ok: false; value: unknown };
+      try {
+        const raw = typeof reply === 'function' ? (reply as (args: unknown) => unknown)(frame.args) : reply;
+        result = { ok: true, value: await raw };
+      } catch (error) {
+        result = { ok: false, value: error instanceof Error ? error.message : String(error) };
+      }
+      if (response.writableEnded) return;
       response.writeHead(200, footer);
-      response.end(JSON.stringify({ id: frame.id, ok: true, result }));
+      response.end(result.ok
+        ? JSON.stringify({ id: frame.id, ok: true, result: result.value })
+        : JSON.stringify({ id: frame.id, ok: false, error: result.value }));
     });
   });
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
@@ -304,6 +315,115 @@ test('the Settings Test probe reports the gateway without moving onto it', async
     await page.locator('[data-settings-close]').click();
     await expect(badge(page)).toBeHidden();
     await expect(page.getByRole('region', { name: 'orbit tasks', exact: true })).toBeVisible();
+  } finally {
+    await gateway.close();
+  }
+});
+
+// ---- Task 10: the remote folder picker -------------------------------------------------
+// The native dialog returns a path on *this* computer, which does not exist on the
+// gateway (D6). These drive the real surfaces: the sidebar's Open project button, the
+// form's Browse…, and the composer's attach menu.
+
+const ATTACH_FILES = 'Attach files for context';
+
+test('picks a project folder from the server in remote mode', async ({ page }) => {
+  let projects = [PROJECT];
+  const gateway = await startGateway({
+    ...seeded([...M1, 'gateway_list_dirs']),
+    list_projects: () => projects,
+    // Task 7's shape: `path`/`parent` plus folder entries; only folders are listed.
+    // The root answer is held for a moment so the loading state is observable.
+    gateway_list_dirs: (args: any) => args?.path
+      ? { path: args.path, parent: '/srv/repos', entries: [] }
+      : new Promise(resolve => setTimeout(() => resolve({ path: '/srv/repos', parent: '/srv', entries: [{ name: 'pandacode', isDir: true }, { name: 'notes.txt', isDir: false }] }), 300)),
+    add_project: (args: any) => {
+      const path = String(args?.path);
+      const added = { id: 'project-srv-2', name: path.split('/').pop(), path };
+      projects = [...projects, added];
+      return added;
+    },
+  });
+  try {
+    await openApp(page);
+    await waitForBoot(page);
+    await connect(page, gateway);
+
+    await page.locator('.sidebar-projects [data-action="add-project"]').click();
+    await page.locator('[data-action="browse-project"]').click();
+
+    // While the server has not answered, no folder can be chosen.
+    await expect(page.locator('.remote-files .use-folder')).toBeDisabled();
+    await expect(page.locator('.remote-files-list')).toContainText('Loading…');
+
+    // The server's listing, folders only — notes.txt is not offered.
+    await expect(page.locator('.remote-files .entry')).toHaveText(['pandacode']);
+    await page.locator('.remote-files .entry').click();
+    await expect(page.locator('.remote-files-path')).toHaveText('/srv/repos/pandacode');
+    await expect(page.locator('.remote-files-list')).toContainText('No folders here');
+
+    // "Use this folder" returns the server path to the form, and opening it creates the
+    // project on the gateway.
+    await page.locator('.remote-files .use-folder').click();
+    await expect(page.locator('#project-folder')).toHaveValue('/srv/repos/pandacode');
+    await page.locator('#open-project-form .primary-button').click();
+    // The new project is its own region in the sidebar; the region's name is an
+    // aria-label, so the text of #navigation does not carry it.
+    await expect(page.getByRole('region', { name: 'pandacode tasks', exact: true })).toBeVisible();
+    expect(gateway.calls).toContain('add_project');
+  } finally {
+    await gateway.close();
+  }
+});
+
+test('the server picker reports a server error, walks up, and closes on Escape', async ({ page }) => {
+  const gateway = await startGateway({
+    ...seeded([...M1, 'gateway_list_dirs']),
+    gateway_list_dirs: (args: any) => {
+      const path = args?.path ?? null;
+      // The root is the server's starting folder, and asking for it by name must answer
+      // the same way — that is what Backspace does.
+      if (path === null || path === '/srv/repos') return { path: '/srv/repos', parent: null, entries: [{ name: 'private', isDir: true }] };
+      throw new Error(`not_a_directory: ${path}`);
+    },
+  });
+  try {
+    await openApp(page);
+    await waitForBoot(page);
+    await connect(page, gateway);
+    await page.locator('.sidebar-projects [data-action="add-project"]').click();
+    await page.locator('[data-action="browse-project"]').click();
+    await expect(page.locator('.remote-files .entry')).toHaveText(['private']);
+
+    // The server's own string, not a stack trace, and no folder is offered to use.
+    await page.locator('.remote-files .entry').click();
+    await expect(page.locator('.remote-files')).toContainText('not_a_directory: /srv/repos/private');
+    await expect(page.locator('.remote-files .use-folder')).toBeDisabled();
+
+    // Backspace walks back up to the listing that works.
+    await page.keyboard.press('Backspace');
+    await expect(page.locator('.remote-files .entry')).toHaveText(['private']);
+
+    // Escape closes the picker: the dialog is hidden and no picker is reachable.
+    await page.keyboard.press('Escape');
+    await expect(page.locator('.remote-files')).toBeHidden();
+    await expect(page.locator('#dialog')).not.toHaveAttribute('open', '');
+  } finally {
+    await gateway.close();
+  }
+});
+
+test('attaching files says why a gateway cannot read them', async ({ page }) => {
+  const gateway = await startGateway(seeded());
+  try {
+    await openApp(page);
+    await waitForBoot(page);
+    await connect(page, gateway);
+
+    await page.getByRole('button', { name: ATTACH_FILES }).click();
+    await page.getByRole('dialog', { name: 'Attach', exact: true }).getByRole('menuitem', { name: /Attach files…/ }).click();
+    // read_document lives in this computer's shell, not in the gateway's command table.
+    await expect(page.locator('#toast')).toContainText('gateway');
   } finally {
     await gateway.close();
   }

@@ -1,5 +1,5 @@
 import './attachments.css';
-import { call, chooseAttachmentFolder, chooseAttachments, preview } from './bridge';
+import { call, chooseAttachmentFolder, chooseAttachments, currentMode, preview } from './bridge';
 import { escape, icon } from './dom';
 
 /** Inputs the user adds to one message: images travel as native image blocks,
@@ -154,6 +154,10 @@ export function mountPromptAttachments(host: AttachmentsHost) {
     ], async choice => {
       if (choice === 'project') { host.projectFiles(); return; }
       if (choice === 'sketch') { host.sketch(taskId); return; }
+      // Documents and folders are read by this computer's own shell (`read_document`,
+      // `describe_folder`, `import_prompt_image`), which a gateway does not serve, so a
+      // server path could not become an attachment. Say so instead of offering nothing.
+      if (currentMode() === 'remote') { host.notify('Attachments need this computer; a gateway does not serve file reads yet.'); return; }
       if (choice === 'folder') { const path = await chooseAttachmentFolder(); if (path) await attachPaths([path], 'folder'); return; }
       const paths = await chooseAttachments();
       if (paths.length) await attachPaths(paths, 'files');
