@@ -364,3 +364,13 @@ notice. Worker snapshots use the worker's session ID. See
 Task-scoped Run Script discovery, execution, and preview readiness commands are
 documented in [Run and preview](run-project.md). Execution uses the existing
 managed terminal event/lifecycle contract; it never interpolates shell commands.
+
+## Remote gateway
+
+The standalone gateway serves this same contract over HTTP (`POST /rpc` with
+`{id, command, args}`) under the same command names, argument names and error
+strings, and its `/events` socket carries the same event names — a client is the
+same code with a different transport. It is a subset, not a second contract: what
+`/capabilities` (or the `gateway_status` command) reports is exactly what the
+dispatcher answers, and everything absent returns `unsupported_command` so a
+surface can be hidden instead of hanging. See [gateway](gateway.md).
