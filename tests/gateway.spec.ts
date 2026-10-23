@@ -284,3 +284,27 @@ test('a remote session reload never asks the gateway for get_task', async ({ pag
     await gateway.close();
   }
 });
+
+test('the Settings Test probe reports the gateway without moving onto it', async ({ page }) => {
+  // "Test" builds a throwaway client: it must answer the question without leaving the
+  // window on an address nobody chose to connect to.
+  const gateway = await startGateway(seeded());
+  try {
+    await openApp(page);
+    await waitForBoot(page);
+    await page.locator('.sidebar-bottom [data-action="settings"]').click();
+    await page.locator('#gateway-url').fill(gateway.url);
+    await page.locator('#gateway-token').fill('test-token');
+    await page.locator('[data-action="gateway-test"]').click();
+    await expect(page.locator('#gateway-settings-status')).toContainText('answers. It serves 7 commands.');
+
+    // A probe asks only what the gateway serves; a connection would reload the workspace.
+    expect(gateway.calls).toContain('gateway_status');
+    expect(gateway.calls).not.toContain('list_projects');
+    await page.locator('[data-settings-close]').click();
+    await expect(badge(page)).toBeHidden();
+    await expect(page.getByRole('region', { name: 'orbit tasks', exact: true })).toBeVisible();
+  } finally {
+    await gateway.close();
+  }
+});
