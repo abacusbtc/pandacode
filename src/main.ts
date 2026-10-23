@@ -66,6 +66,7 @@ import type { ArchitectView } from './architect';
 import { syncOverlayContext } from './overlay-client';
 import { initializeAgentUpdates } from './agent-updates';
 import { connectGateway, gatewayStatus, mountGatewaySettings, startGatewaySession } from './gateway-settings';
+import { pickRemoteFolder } from './remote-files';
 
 /* Visual thesis: calm surfaces, system typography, yellow selection, and bamboo details.
  * Content: project navigation → conversation → contextual source review.
@@ -2656,8 +2657,8 @@ async function openSavedDiff(sessionId: string, changes: TurnChanges, path?: str
     if (dialog.open && host.isConnected) host.innerHTML = `<p role="alert">Unable to load the diff viewer. Close this window and try again. ${escape(errorText(error))}</p>`;
   }
 }
-function showOpenProject(forTask = false): void {
-  modal('Open project', `<form id="open-project-form"><label class="field-label" for="project-folder">Project folder</label><input id="project-folder" name="path" placeholder="/Users/you/Projects/my-app" autocomplete="off" spellcheck="false" required><p class="field-help">Enter a full path or choose Browse.</p><div class="dialog-footer"><button type="button" class="secondary-button" data-action="browse-project">${icon('folder')}Browse…</button><button type="button" class="secondary-button" data-action="close-dialog">Cancel</button><button class="primary-button">Open project</button></div></form>`);
+function showOpenProject(forTask = false, initialPath = ''): void {
+  modal('Open project', `<form id="open-project-form"><label class="field-label" for="project-folder">Project folder</label><input id="project-folder" name="path" placeholder="/Users/you/Projects/my-app" autocomplete="off" spellcheck="false" value="${escape(initialPath)}" required><p class="field-help">Enter a full path or choose Browse.</p><div class="dialog-footer"><button type="button" class="secondary-button" data-action="browse-project">${icon('folder')}Browse…</button><button type="button" class="secondary-button" data-action="close-dialog">Cancel</button><button class="primary-button">Open project</button></div></form>`);
   if (forTask && newTaskView()) openingProjectForTask = { id: state.sessionId, generation: state.generation };
 }
 async function changeTaskProject(projectId: string): Promise<void> {
@@ -3341,8 +3342,19 @@ async function action(name: string, element: HTMLElement): Promise<void> {
     case 'add-project': showOpenProject(); break;
     case 'browse-project': {
       const input = document.querySelector<HTMLInputElement>('#project-folder'); if (!input) break;
+      const forTask = Boolean(openingProjectForTask);
       (element as HTMLButtonElement).disabled = true;
-      try { const path = await chooseFolder(); if (path && input.isConnected) { input.value = path; input.focus(); } }
+      try {
+        if (currentMode() === 'remote') {
+          // A native dialog answers with a folder on this computer, and the project lives
+          // on the gateway. The picker replaces this dialog, so the form comes back with
+          // the server path filled in rather than being dismissed.
+          const path = await pickRemoteFolder({ open: modal, close: closeModal });
+          if (path) showOpenProject(forTask, path);
+        } else {
+          const path = await chooseFolder(); if (path && input.isConnected) { input.value = path; input.focus(); }
+        }
+      }
       finally { if (element.isConnected) (element as HTMLButtonElement).disabled = false; }
       break;
     }
