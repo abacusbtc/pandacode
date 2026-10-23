@@ -1,17 +1,40 @@
 import { expect, test, type Page } from '@playwright/test';
+import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
+import type { Socket } from 'node:net';
 
 // The connect UI against a stub gateway that answers the same JSON-RPC envelope the
-// real server does: POST /rpc {id, command, args} -> {id, ok, result} or {id, ok: false, error}.
-// No events socket is opened here: nothing subscribes after the connection is made.
+// real server does: POST /rpc {id, command, args} -> {id, ok, result} or {id, ok: false, error},
+// plus a minimal RFC 6455 handshake on /events so a subscription can actually be seen.
 
 type Reply = unknown | ((args: any) => unknown);
 type Replies = Record<string, Reply>;
 
-type Stub = { url: string; calls: string[]; close: () => Promise<void> };
+type Stub = {
+  url: string;
+  calls: string[];
+  /** Open event sockets. Zero means the app never subscribed to this gateway. */
+  sockets: () => number;
+  /** Pushes one `{event, payload}` frame to every open socket, as the real gateway does. */
+  emit: (event: string, payload?: unknown) => void;
+  close: () => Promise<void>;
+};
+
+/** RFC 6455 appendix A: the accept key is SHA-1 of key + this GUID, base64. */
+const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
+
+/** One unmasked text frame; the server-to-client direction is never masked. */
+function textFrame(text: string): Buffer {
+  const payload = Buffer.from(text);
+  if (payload.length < 126) return Buffer.concat([Buffer.from([0x81, payload.length]), payload]);
+  const header = Buffer.alloc(4);
+  header[0] = 0x81; header[1] = 126; header.writeUInt16BE(payload.length, 2);
+  return Buffer.concat([header, payload]);
+}
 
 async function startGateway(replies: Replies): Promise<Stub> {
   const calls: string[] = [];
+  const sockets: Socket[] = [];
   const server = createServer((request, response) => {
     // The real gateway answers the browser's token-less preflight and names the
     // headers a client may send (src-tauri/src/gateway/server.rs, `cors`). Without
@@ -52,11 +75,33 @@ async function startGateway(replies: Replies): Promise<Stub> {
   });
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
   const port = (server.address() as { port: number }).port;
-  return { url: `http://127.0.0.1:${port}`, calls, close: () => new Promise<void>(resolve => {
-    // fetch keeps its connections alive; closing them keeps teardown instant.
-    server.closeAllConnections?.();
-    server.close(() => resolve());
-  }) };
+  // The gateway's /events socket (src-tauri/src/gateway/server.rs). Only the handshake
+  // and one-way text frames are needed: the client sends nothing on it.
+  server.on('upgrade', (request, socket) => {
+    const key = request.headers['sec-websocket-key'];
+    if (typeof key !== 'string') { socket.destroy(); return; }
+    const accept = createHash('sha1').update(key + WS_GUID).digest('base64');
+    socket.on('error', () => undefined);
+    socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`);
+    sockets.push(socket);
+  });
+  return {
+    url: `http://127.0.0.1:${port}`,
+    calls,
+    sockets: () => sockets.length,
+    emit: (event, payload = null) => {
+      const frame = textFrame(JSON.stringify({ event, payload }));
+      for (const socket of sockets) socket.write(frame);
+    },
+    close: () => new Promise<void>(resolve => {
+      // fetch keeps its connections alive and the event socket is long-lived;
+      // closing both keeps teardown instant.
+      for (const socket of sockets) socket.destroy();
+      sockets.length = 0;
+      server.closeAllConnections?.();
+      server.close(() => resolve());
+    }),
+  };
 }
 
 // A seeded project and task, so the assertions can tell the gateway's data from the
@@ -82,6 +127,16 @@ const badge = (page: Page) => page.locator('#gateway-badge');
 async function openApp(page: Page): Promise<void> {
   await page.goto('/');
   await page.waitForFunction(() => typeof (window as any).__connectGatewayForTest === 'function');
+}
+
+/**
+ * boot() attaches its event subscriptions before it renders the workspace, so a listed
+ * sample project means the preview transport already owns them. A test that connects
+ * before this point would race boot into subscribing straight to the gateway, which
+ * would hide a missing rebind on the runtime switch this suite is here to check.
+ */
+async function waitForBoot(page: Page): Promise<void> {
+  await expect(page.getByRole('region', { name: 'orbit tasks', exact: true })).toBeVisible();
 }
 
 async function connect(page: Page, gateway: Stub): Promise<void> {
@@ -187,4 +242,23 @@ test('an unreachable gateway is reported, not silently swapped for the local dat
   await page.evaluate(() => (window as any).__connectGatewayForTest('http://127.0.0.1:1', 'test-token').catch(() => {}));
   await expect(badge(page)).toBeVisible();
   await expect(badge(page)).toContainText('Cannot reach');
+});
+
+test('a runtime connect moves event subscriptions onto the gateway', async ({ page }) => {
+  // The preview boots on its own transport; connecting from Settings has to move the
+  // already-attached subscriptions, not leave them listening to this computer.
+  const gateway = await startGateway(seeded());
+  try {
+    await openApp(page);
+    await waitForBoot(page);
+    await connect(page, gateway);
+    await expect.poll(() => gateway.sockets(), { message: 'the app opened the gateway event socket' }).toBeGreaterThan(0);
+
+    // A frame from the gateway now reaches the handlers boot registered.
+    const before = gateway.calls.filter(command => command === 'list_sessions').length;
+    gateway.emit('sessions-changed');
+    await expect.poll(() => gateway.calls.filter(command => command === 'list_sessions').length).toBeGreaterThan(before);
+  } finally {
+    await gateway.close();
+  }
 });

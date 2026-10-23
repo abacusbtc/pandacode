@@ -84,7 +84,7 @@ export async function attachGateway(url: string, token: string): Promise<boolean
   client?.close();
   client = next;
   connection = { url: base, commands: [], reachable: false };
-  setMode('remote', next);
+  await setMode('remote', next);
   paintGatewayBadge();
   applyCapabilities([]);
   try {
@@ -134,7 +134,7 @@ export async function disconnectGateway(): Promise<void> {
   client?.close();
   client = null;
   connection = null;
-  setMode(preview ? 'preview' : 'native');
+  await setMode(preview ? 'preview' : 'native');
   paintGatewayBadge();
   applyCapabilities(null);
 }
