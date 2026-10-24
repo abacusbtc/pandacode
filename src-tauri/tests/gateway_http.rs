@@ -1768,6 +1768,28 @@ fn terminal_seqs(frames: &[Value]) -> Vec<u64> {
     frames.iter().filter_map(|frame| frame["seq"].as_u64()).collect()
 }
 
+/// Waits until the terminal's scrollback contains `marker`, by asking for the replay
+/// again each time. A live socket can be outrun by a flood (the subscriber queue
+/// lags and the frame that carried the marker is dropped), while a fresh socket
+/// always gets what the ring still holds.
+async fn wait_for_replay(handle: &GatewayHandle, id: &str, marker: &str) -> Vec<Value> {
+    for _ in 0..60 {
+        let mut socket = events_socket(handle.addr, &format!("&terminal={id}&since=0")).await;
+        let mut frames = Vec::new();
+        // The ring is drained for now: the shell may still be printing.
+        while let Ok(Some(Ok(message))) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), socket.next()).await
+        {
+            frames.push(serde_json::from_str(message.to_text().unwrap()).unwrap());
+            if terminal_text(&frames).contains(marker) {
+                return frames;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+    panic!("the shell never printed {marker:?} into its ring");
+}
+
 /// Types one line into the shell and returns everything printed until `expect`
 /// shows up. `expect` must be a value the shell computes.
 async fn run_command(
@@ -1822,7 +1844,6 @@ async fn a_reconnect_replays_the_tail_of_the_scrollback_in_order() {
 
     // A non-repeating sequence, long enough to be many PTY reads. The last number
     // is multiplied so the echo of the command cannot satisfy the wait.
-    let mut live = events_socket(handle.addr, &format!("&terminal={id}")).await;
     call(
         &handle,
         "write_terminal",
@@ -1832,18 +1853,9 @@ async fn a_reconnect_replays_the_tail_of_the_scrollback_in_order() {
         }),
     )
     .await;
-    let _ = frames_until(&mut live, |frames| {
-        terminal_text(frames).contains("tail 400")
-    })
-    .await;
-    drop(live);
 
     // Reconnect from the beginning: the ring's tail, in order, no duplicates.
-    let mut replay = events_socket(handle.addr, &format!("&terminal={id}&since=0")).await;
-    let frames = frames_until(&mut replay, |frames| {
-        terminal_text(frames).contains("tail 400")
-    })
-    .await;
+    let frames = wait_for_replay(&handle, &id, "tail 400").await;
     let text = terminal_text(&frames);
     let mut last = 0u32;
     let mut seen = 0;
@@ -1899,7 +1911,6 @@ async fn a_reconnect_from_before_the_ring_is_told_to_reset() {
     let (_project, id) = start_shell(&handle, dir.path()).await;
 
     // Enough output to push the 256 KiB ring past its start, several times over.
-    let mut live = events_socket(handle.addr, &format!("&terminal={id}")).await;
     call(
         &handle,
         "write_terminal",
@@ -1909,11 +1920,9 @@ async fn a_reconnect_from_before_the_ring_is_told_to_reset() {
         }),
     )
     .await;
-    let _ = frames_until(&mut live, |frames| {
-        terminal_text(frames).contains("end 400")
-    })
-    .await;
-    drop(live);
+    // The flood has to have reached the ring before the resume can be judged: the
+    // ring holding the tail is what makes `since=1` older than it.
+    let _ = wait_for_replay(&handle, &id, "end 400").await;
 
     // `since=1` is older than the ring holds: the client is told to reset, not
     // handed a stream that quietly starts in the middle.
