@@ -680,6 +680,7 @@ fn persisted_messages_and_checkpoint_survive_restart_without_auto_resuming() {
             agents: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             terminals: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             shutdown: std::sync::atomic::AtomicU8::new(0),
+            ui: Default::default(),
         };
         let (run, actor) = running_worker(&state, &parent, "a", "src");
         worker_session = run.config.session_id.clone();
@@ -1144,6 +1145,7 @@ fn state_fixture() -> (AppState, String) {
             agents: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             terminals: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             shutdown: std::sync::atomic::AtomicU8::new(0),
+            ui: Default::default(),
         },
         sid,
     )

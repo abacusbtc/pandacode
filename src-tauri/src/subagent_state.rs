@@ -499,6 +499,7 @@ mod tests {
             agents: Arc::new(Mutex::new(HashMap::new())),
             terminals: Arc::new(Mutex::new(HashMap::new())),
             shutdown: AtomicU8::new(0),
+            ui: Default::default(),
         };
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let agent = RunningAgent::new(tx, Arc::new(AtomicBool::new(false)));

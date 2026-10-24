@@ -63,6 +63,7 @@ fn state(store: Store) -> AppState {
         agents: Arc::new(Mutex::new(HashMap::new())),
         terminals: Arc::new(Mutex::new(HashMap::new())),
         shutdown: AtomicU8::new(0),
+        ui: Default::default(),
     }
 }
 fn task(store: &Store) -> Session {

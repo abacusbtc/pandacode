@@ -41,6 +41,13 @@ impl<R: tauri::Runtime> Emitter for tauri::AppHandle<R> {
 /// fires a few times a second at most.
 static SINK: RwLock<Option<Arc<dyn Emitter>>> = RwLock::new(None);
 
+/// Serializes tests that install or drop the process-wide sink.
+///
+/// The sink is global, so a test that installs one would otherwise be visible to
+/// an unrelated test running beside it — including the ones in `run_ctx`.
+#[cfg(test)]
+pub(crate) static TEST_SINK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Installs the process-wide sink. First call wins, because a second writer would
 /// split one event stream across two destinations; returns whether this call was
 /// the one that took effect.
@@ -70,6 +77,14 @@ fn installed() -> Option<Arc<dyn Emitter>> {
     SINK.read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone()
+}
+
+/// The installed sink, for a caller that has no app handle to fall back to.
+///
+/// A process that serves another surface (the gateway, a test) reads this to build
+/// its `RunContext`; `None` means this process has not installed one.
+pub(crate) fn sink() -> Option<Arc<dyn Emitter>> {
+    installed()
 }
 
 /// Emits to every listener on every surface this process serves.
@@ -120,7 +135,7 @@ pub fn emit_window<R: tauri::Runtime, W: tauri::Emitter<R>>(
 /// Serializes once, the way every emit path needs it. A payload that cannot
 /// serialize is sent as null rather than dropped, which matches what the previous
 /// `let _ = app.emit(…)` sites did with the error.
-fn payload_value<T: Serialize>(payload: T) -> serde_json::Value {
+pub(crate) fn payload_value<T: Serialize>(payload: T) -> serde_json::Value {
     serde_json::to_value(payload).unwrap_or(serde_json::Value::Null)
 }
 
@@ -213,6 +228,7 @@ mod tests {
 
     #[test]
     fn a_sink_error_reaches_the_caller_instead_of_being_swallowed() {
+        let _serial = TEST_SINK_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         // The regression this guards: with the app handle as the sink, an emit
         // failure used to be discarded in the trait impl, so `emit_to(...)?` could
         // never fire and request_ui waited out its 12-second timeout for a reply no

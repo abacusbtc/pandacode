@@ -23,6 +23,7 @@ mod secret_store;
 mod cloud;
 mod data_lock;
 mod events;
+mod run_ctx;
 mod vsix_themes;
 mod token_saver;
 mod goal_state;
@@ -68,12 +69,13 @@ use std::{
         Arc, Mutex,
     },
 };
+use run_ctx::RunContext;
 use storage::{ContextUsage, MessagePage, Project, Session, Store};
 use tauri::{Manager, State};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
 type Result<T> = std::result::Result<T, String>;
-struct RunningAgent {
+pub(crate) struct RunningAgent {
     input: UnboundedSender<RunInput>,
     stopped: Arc<AtomicBool>,
     run_id: String,
@@ -427,6 +429,9 @@ struct AppState {
     agents: Agents,
     terminals: terminal::Terminals,
     shutdown: AtomicU8,
+    /// App actions the agent asked for, waiting for a client. Shared with the run
+    /// context rather than a separate Tauri-managed state (PAN-102).
+    ui: Arc<run_ctx::UiRequests>,
 }
 impl AppState {
     fn root(&self, project_id: &str, session_id: Option<&str>) -> Result<PathBuf> {
@@ -825,7 +830,7 @@ fn blocking_snapshot<T>(work: impl FnOnce() -> T) -> T {
     }
 }
 fn persist_turn_changes(
-    app: &tauri::AppHandle,
+    ctx: &RunContext,
     store: &Mutex<Store>,
     sid: &str,
     capture: turn_changes::Captured,
@@ -842,10 +847,10 @@ fn persist_turn_changes(
         Ok((message_id, summary)) => {
             let mut e = event(sid, "turn_changes", "");
             e.data = Some(serde_json::json!({"messageId":message_id,"turnChanges":summary}));
-            let _ = crate::events::emit(app, "agent-event", e);
+            let _ = ctx.emit("agent-event", e);
         }
         Err(error) => {
-            let _ = crate::events::emit(app, 
+            let _ = ctx.emit(
                 "agent-event",
                 event(
                     sid,
@@ -1128,9 +1133,10 @@ async fn send_message(
         )
         .await;
     }
+    let ctx = desktop_context(&app, &state)?;
     launch_task_in_project(
-        app,
-        state,
+        ctx,
+        &state,
         session_id,
         Some(text),
         image_ids,
@@ -1161,7 +1167,8 @@ async fn start_task(
     if let Some(prompt) = team_prompt {
         return architect::architect_start(app, state, session_id, prompt, None).await;
     }
-    launch_task(app, state, session_id, None, None).await
+    let ctx = desktop_context(&app, &state)?;
+    launch_task(ctx, &state, session_id, None, None).await
 }
 
 #[derive(Default)]
@@ -1375,26 +1382,111 @@ fn prepare_task_run_in_project(
     })
 }
 
-async fn launch_task(
+/// The desktop's run surface: everything a turn needs that only a window can give.
+///
+/// This is the one place the run path's needs meet `tauri::AppHandle`, and it is
+/// out of the run path on purpose: the gateway will build its own surface (PAN-102).
+struct DesktopSurface {
     app: tauri::AppHandle,
-    state: State<'_, AppState>,
+}
+
+impl run_ctx::TurnSurface for DesktopSurface {
+    fn base_host(
+        &self,
+        provider: &str,
+        session_id: &str,
+        stopped: Arc<AtomicBool>,
+        team: Option<&architect::Admission>,
+    ) -> Option<providers::ToolHost> {
+        if let Some(admission) = team {
+            architect::host(self.app.clone(), session_id.to_owned(), stopped, admission)
+        } else {
+            (provider == "codex")
+                .then(|| agent_tools::host(self.app.clone(), session_id.to_owned(), stopped))
+        }
+    }
+
+    fn wrap_hosts(
+        &self,
+        base: Option<providers::ToolHost>,
+        session_id: &str,
+        stopped: Arc<AtomicBool>,
+    ) -> Option<providers::ToolHost> {
+        let app = &self.app;
+        let session_id = session_id.to_owned();
+        let host = agent_tools::with_jev(base, app.clone(), session_id.clone(), stopped.clone());
+        let host = bots::tools::with_bot(host, app.clone(), session_id.clone(), stopped.clone());
+        let host = simulator::tools::with_simulator(host, app.clone(), stopped.clone());
+        let host = vm::tools::with_vm(host, app.clone(), session_id.clone(), stopped.clone());
+        let host = cloud::deploy::with_deploy(host, app.clone(), session_id.clone(), stopped.clone());
+        Some(agent_tools::with_preview(host, app.clone(), session_id, stopped))
+    }
+
+    fn approval(&self, event: &providers::AgentEvent, team: Option<&architect::Admission>) {
+        architect::activity(&self.app, &event.session_id, team);
+    }
+
+    fn bot_approval(&self, session_id: &str, request_id: &str, text: &str) {
+        bots::approval_requested(&self.app, session_id, request_id, text);
+    }
+
+    fn run_finished(&self, session_id: &str, successful: bool, stopped: bool) {
+        if !stopped {
+            bots::run_finished(&self.app, session_id, successful);
+        }
+    }
+
+    fn turn_completed(
+        &self,
+        session_id: &str,
+        outcome: run_ctx::TurnOutcome,
+        team: Option<&architect::Admission>,
+        agents: &HashMap<String, RunningAgent>,
+    ) {
+        architect::completed(
+            &self.app,
+            session_id,
+            team,
+            outcome.successful,
+            outcome.stopped,
+            agents,
+        );
+    }
+}
+
+/// The desktop's context for one turn: its sink, its directories, its surface.
+pub(crate) fn desktop_context(app: &tauri::AppHandle, state: &AppState) -> Result<RunContext> {
+    let cache_dir = app.path().app_cache_dir().map_err(|e| e.to_string())?;
+    let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    Ok(RunContext::for_app(
+        app,
+        cache_dir,
+        data_dir,
+        state.ui.clone(),
+        Arc::new(DesktopSurface { app: app.clone() }),
+    ))
+}
+
+async fn launch_task(
+    ctx: RunContext,
+    state: &AppState,
     session_id: String,
     text: Option<String>,
     image_ids: Option<Vec<String>>,
 ) -> Result<()> {
-    launch_task_in_project(app, state, session_id, text, image_ids, None).await
+    launch_task_in_project(ctx, state, session_id, text, image_ids, None).await
 }
 
 async fn launch_task_in_project(
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
+    ctx: RunContext,
+    state: &AppState,
     session_id: String,
     text: Option<String>,
     image_ids: Option<Vec<String>>,
     expected_project: Option<String>,
 ) -> Result<()> {
     launch_operation(
-        app,
+        ctx,
         state,
         session_id,
         text,
@@ -1406,8 +1498,8 @@ async fn launch_task_in_project(
 }
 
 async fn launch_operation(
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
+    ctx: RunContext,
+    state: &AppState,
     session_id: String,
     text: Option<String>,
     image_ids: Option<Vec<String>>,
@@ -1415,7 +1507,7 @@ async fn launch_operation(
     goal: Option<task_controls::GoalLaunch>,
 ) -> Result<()> {
     launch_operation_admitted(
-        app,
+        ctx,
         state,
         session_id,
         text,
@@ -1430,15 +1522,15 @@ async fn launch_operation(
 }
 
 pub(crate) fn launch_team_task<'a>(
-    app: tauri::AppHandle,
-    state: State<'a, AppState>,
+    ctx: RunContext,
+    state: &'a AppState,
     session_id: String,
     text: String,
     image_ids: Option<Vec<String>>,
     admission: architect::Admission,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
     Box::pin(launch_operation_admitted(
-        app,
+        ctx,
         state,
         session_id,
         Some(text),
@@ -1458,8 +1550,8 @@ struct OperationAdmission {
 }
 
 async fn launch_operation_admitted(
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
+    ctx: RunContext,
+    state: &AppState,
     session_id: String,
     text: Option<String>,
     image_ids: Option<Vec<String>>,
@@ -1474,7 +1566,7 @@ async fn launch_operation_admitted(
         return Err("PandaCode is shutting down.".into());
     }
     let command = if goal.is_none() && team_admission.is_none() {
-        prepare_command(&state, &session_id, text.as_deref()).await?
+        prepare_command(state, &session_id, text.as_deref()).await?
     } else {
         None
     };
@@ -1484,11 +1576,7 @@ async fn launch_operation_admitted(
     if image_ids.len() > 4 {
         return Err("Attach up to four screenshots per message.".into());
     }
-    let capture_dir = app
-        .path()
-        .app_cache_dir()
-        .map_err(|e| e.to_string())?
-        .join("browser-captures");
+    let capture_dir = ctx.cache_dir().join("browser-captures");
     let images = image_ids
         .into_iter()
         .map(|id| {
@@ -1521,7 +1609,7 @@ async fn launch_operation_admitted(
         last_event,
         team,
     } = prepare_task_run_in_project(
-        &state,
+        state,
         session_id.clone(),
         text,
         images,
@@ -1534,7 +1622,7 @@ async fn launch_operation_admitted(
             team: team_admission,
         },
     )?;
-    let _ = crate::events::emit(&app, "agent-event", event(&session_id, "status", "running"));
+    let _ = ctx.emit("agent-event", event(&session_id, "status", "running"));
     let store = state.store.clone();
     let agents = state.agents.clone();
     // Optional metadata must never block a conversation when its storage cannot
@@ -1566,11 +1654,7 @@ async fn launch_operation_admitted(
     }
     tauri::async_runtime::spawn(async move {
         let changes_root = config.cwd.clone();
-        let changes_cache = app
-            .path()
-            .app_cache_dir()
-            .unwrap_or_else(|_| std::env::temp_dir().join("pandacode"))
-            .join("turn-captures");
+        let changes_cache = ctx.cache_dir().join("turn-captures");
         // Goal inspection/pause/clear are control operations, not model turns.
         let tracker = if matches!(
             config.goal.as_ref(),
@@ -1594,7 +1678,7 @@ async fn launch_operation_admitted(
         let errors_sink = persistence_error.clone();
         let assistant_sink = assistant.clone();
         let store_sink = store.clone();
-        let app_sink = app.clone();
+        let ctx_sink = ctx.clone();
         let subagents_sink = subagents.clone();
         let goal_reply_sink = goal_reply.clone();
         let goal_agents_sink = agents.clone();
@@ -1661,7 +1745,7 @@ async fn launch_operation_admitted(
                     let saved = save_approval(&store_sink, &pending_approvals, &run_id, &mut e);
                     if saved.is_ok() && e.kind == "approval" {
                         if let Some(request_id) = &e.request_id {
-                            bots::approval_requested(&app_sink, &e.session_id, request_id, &e.text);
+                            ctx_sink.surface().bot_approval(&e.session_id, request_id, &e.text);
                         }
                     }
                     saved
@@ -1712,11 +1796,11 @@ async fn launch_operation_admitted(
                 e.kind.as_str(),
                 "approval" | "approval_cancelled" | "input_request" | "input_cancelled"
             ) {
-                architect::activity(&app_sink, &e.session_id, team_sink.as_ref());
+                ctx_sink.surface().approval(&e, team_sink.as_ref());
             }
             let completed = e.kind == "turn_complete";
             let changes_sid = e.session_id.clone();
-            let _ = crate::events::emit(&app_sink, "agent-event", e);
+            let _ = ctx_sink.emit("agent-event", e);
             if completed {
                 if let Some(tracker) = &tracker_sink {
                     let capture = blocking_snapshot(|| {
@@ -1726,24 +1810,16 @@ async fn launch_operation_admitted(
                             .and_then(|mut tracker| tracker.boundary())
                     });
                     if let Some(capture) = capture {
-                        persist_turn_changes(&app_sink, &store_sink, &changes_sid, capture);
+                        persist_turn_changes(&ctx_sink, &store_sink, &changes_sid, capture);
                     }
                 }
             }
         });
-        let host = if let Some(admission) = team.as_ref() {
-            architect::host(app.clone(), session_id.clone(), stopped.clone(), admission)
-        } else {
-            (config.provider == "codex")
-                .then(|| agent_tools::host(app.clone(), session_id.clone(), stopped.clone()))
-        };
-        let team_tools_missing = team.is_some() && host.is_none();
-        let host = agent_tools::with_jev(host, app.clone(), session_id.clone(), stopped.clone());
-        let host = bots::tools::with_bot(host, app.clone(), session_id.clone(), stopped.clone());
-        let host = simulator::tools::with_simulator(host, app.clone(), stopped.clone());
-        let host = vm::tools::with_vm(host, app.clone(), session_id.clone(), stopped.clone());
-        let host = cloud::deploy::with_deploy(host, app.clone(), session_id.clone(), stopped.clone());
-        let host = Some(agent_tools::with_preview(host, app.clone(), session_id.clone(), stopped.clone()));
+        // The window-scoped tool stack comes from the surface: the desktop builds
+        // it from its app handle, a headless process from whatever it has (PAN-102).
+        let base = ctx.tool_host(&config.provider, &session_id, stopped.clone(), team.as_ref());
+        let team_tools_missing = team.is_some() && base.is_none();
+        let host = ctx.wrap_tool_hosts(base, &session_id, stopped.clone());
         let host = Some(turn_changes::with_host(host, tracker.clone(), stopped.clone()));
         let host = Some(session_titles::with_host(title_run.as_ref(), host, stopped.clone()));
         // What the next turn's warm agent needs: this launch and the tools it listed.
@@ -1790,7 +1866,7 @@ async fn launch_operation_admitted(
             })
             .await
             {
-                persist_turn_changes(&app, &store, &session_id, capture);
+                persist_turn_changes(&ctx, &store, &session_id, capture);
             }
         }
         // Match the registry -> store lock order used for Start and Stop. Stop
@@ -1820,7 +1896,7 @@ async fn launch_operation_admitted(
             for child in changed {
                 let mut activity = event(&session_id, "subagent", "");
                 activity.data = serde_json::to_value(child).ok();
-                let _ = crate::events::emit(&app, "agent-event", activity);
+                let _ = ctx.emit("agent-event", activity);
             }
             if let Err(error) = saved {
                 if let Ok(mut slot) = persistence_error.lock() {
@@ -1858,7 +1934,7 @@ async fn launch_operation_admitted(
                     if db.record_goal(&session_id, Some(&goal)).is_ok() {
                         let mut e = event(&session_id, "goal", "");
                         e.data = serde_json::to_value(goal).ok();
-                        let _ = crate::events::emit(&app, "agent-event", e);
+                        let _ = ctx.emit("agent-event", e);
                     }
                 }
             }
@@ -1891,7 +1967,7 @@ async fn launch_operation_admitted(
             }
             if let Some(title) = &title_run {
                 if title.finish(&db, successful).unwrap_or(false) {
-                    let _ = crate::events::emit(&app, "sessions-changed", ());
+                    let _ = ctx.emit("sessions-changed", ());
                 }
             }
         } else {
@@ -1899,7 +1975,7 @@ async fn launch_operation_admitted(
         }
         if let Ok(error) = persistence_error.lock() {
             if let Some(error) = error.as_ref() {
-                let _ = crate::events::emit(&app, 
+                let _ = ctx.emit(
                     "agent-event",
                     event(
                         &session_id,
@@ -1912,7 +1988,7 @@ async fn launch_operation_admitted(
         if let Some(registry) = registry.as_mut() {
             registry.remove(&session_id);
         }
-        let _ = crate::events::emit(&app, 
+        let _ = ctx.emit(
             "agent-event",
             event(
                 &session_id,
@@ -1928,7 +2004,7 @@ async fn launch_operation_admitted(
         );
         // Bot conversations reply on their channel and send their next queued message.
         if !was_stopped {
-            bots::run_finished(&app, &session_id, successful);
+            ctx.surface().run_finished(&session_id, successful, was_stopped);
         }
         // Keep Start blocked until the old run's final event has been queued.
         // Otherwise its delayed `done` can finish a newly started UI stream.
@@ -1936,7 +2012,15 @@ async fn launch_operation_admitted(
         // Read before the team scheduler can start this task's next turn.
         let launch = providers::warm_epoch(&session_id);
         if let Some(registry) = registry.as_ref() {
-            architect::completed(&app, &session_id, team.as_ref(), successful, was_stopped, registry);
+            ctx.surface().turn_completed(
+                &session_id,
+                run_ctx::TurnOutcome {
+                    successful,
+                    stopped: was_stopped,
+                },
+                team.as_ref(),
+                registry,
+            );
         }
         drop(registry);
         // Start the next turn's agent now, so a follow-up skips the CLI's own startup.
@@ -2904,6 +2988,7 @@ pub(crate) fn gateway_state(data_dir: &std::path::Path) -> Result<AppState> {
         agents: Arc::new(Mutex::new(HashMap::new())),
         terminals: Arc::new(Mutex::new(HashMap::new())),
         shutdown: AtomicU8::new(0),
+        ui: Arc::new(run_ctx::UiRequests::default()),
     })
 }
 
@@ -2962,6 +3047,7 @@ pub fn run() {
                 agents: Arc::new(Mutex::new(HashMap::new())),
                 terminals: Arc::new(Mutex::new(HashMap::new())),
                 shutdown: AtomicU8::new(0),
+                ui: Arc::new(run_ctx::UiRequests::default()),
             });
             overlay::setup(app.handle(), &dir).map_err(std::io::Error::other)?;
             app.manage(browser::BrowserState::default());
@@ -2969,7 +3055,6 @@ pub fn run() {
             app.manage(vm::Vms::default());
             vm::watch_idle(app.handle().clone());
             app.manage(file_preview::FilePreviews::default());
-            app.manage(agent_tools::UiRequests::default());
             app.manage(architect::Runtime::default());
             architect::watchdog::watch(app.handle().clone());
             bots::start(app.handle());
