@@ -3,6 +3,7 @@
 //! Compiled only under `--features gateway`, so the desktop build keeps its
 //! dependency set and never starts a second server.
 
+pub mod audit;
 pub mod config;
 
 mod commands;
@@ -182,6 +183,7 @@ pub async fn spawn(config: GatewayConfig) -> std::io::Result<GatewayHandle> {
         uploads: uploads_root,
         upload_max: config.upload_max,
         watch: watch.clone(),
+        auth_failures: Arc::new(server::AuthFailures::default()),
     });
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
     let addr = listener.local_addr()?;
@@ -250,11 +252,16 @@ pub async fn spawn(config: GatewayConfig) -> std::io::Result<GatewayHandle> {
     let join = tokio::spawn(async move {
         // The lock lives as long as the server does, and no longer.
         let _lock = lock;
-        let served = axum::serve(listener, router)
-            .with_graceful_shutdown(async {
-                let _ = shutdown_rx.await;
-            })
-            .await;
+        // Connect info is what makes `client=` in the audit lines an address rather
+        // than a guess, and what the auth-failure limit counts per source (§2.3).
+        let served = axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(async {
+            let _ = shutdown_rx.await;
+        })
+        .await;
         if let Err(error) = served {
             eprintln!("gateway stopped: {error}");
         }

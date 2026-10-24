@@ -2327,3 +2327,248 @@ async fn opening_and_closing_terminals_returns_the_descriptor_count_to_baseline(
     );
     handle.stop().await;
 }
+
+// ---- PAN-112: the audit trail, the auth limit, and the unit as the owner ----------
+
+/// The directives systemd would read from the shipped unit: `key=value` pairs, with
+/// comments and blank lines dropped. A test that asserted on the raw text would pass
+/// on a comment that merely mentions a directive.
+fn unit_directives() -> Vec<(String, String)> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../scripts/gateway/pandacode-gateway.service");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#') && !line.starts_with('['))
+        .filter_map(|line| line.split_once('='))
+        .map(|(key, value)| (key.trim().to_string(), value.trim().to_string()))
+        .collect()
+}
+
+fn unit_value(key: &str) -> Option<String> {
+    unit_directives()
+        .into_iter()
+        .find(|(name, _)| name == key)
+        .map(|(_, value)| value)
+}
+
+#[test]
+fn the_unit_runs_as_the_owner_and_says_why_isolation_is_gone() {
+    // The M2 decision (spec §2.2): the gateway IS the person. An ephemeral user has
+    // no credentials, no git config, no provider CLIs and cannot read a project.
+    assert_eq!(
+        unit_value("User").as_deref(),
+        Some("abacus"),
+        "the unit must run as the owner"
+    );
+    assert!(
+        unit_value("Group").is_some(),
+        "and name the group rather than inheriting an unpredictable one"
+    );
+    // The ephemeral-user machinery is what removed the identity; both go together.
+    for gone in [
+        "DynamicUser",
+        "StateDirectory",
+        "StateDirectoryMode",
+        "ReadWritePaths",
+        "ProtectSystem",
+        "PrivateTmp",
+        "ProtectHome",
+    ] {
+        assert_eq!(
+            unit_value(gone),
+            None,
+            "{gone}= must not be in the unit: it is either the M1 ephemeral-user shape \
+             or a sandbox this decision removed"
+        );
+    }
+    // Kept on purpose.
+    assert_eq!(unit_value("NoNewPrivileges").as_deref(), Some("yes"));
+    assert_eq!(unit_value("UMask").as_deref(), Some("0077"));
+    // The audit's destination: without this the lines the gateway prints are lost.
+    assert_eq!(unit_value("StandardOutput").as_deref(), Some("journal"));
+
+    let exec = unit_value("ExecStart").expect("ExecStart is required");
+    assert!(
+        !exec.contains("--data-dir"),
+        "the data directory must be the owner's default, not a system one: {exec}"
+    );
+    assert!(
+        exec.contains("pandacode-gateway") && exec.contains("--port"),
+        "the unit starts the gateway on its loopback port: {exec}"
+    );
+
+    // The reason has to be written down where the next person edits the unit, or
+    // somebody re-tightens ProtectSystem "for safety" and breaks every build.
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../scripts/gateway/pandacode-gateway.service");
+    let text = std::fs::read_to_string(path).unwrap();
+    assert!(
+        text.contains("GONE BY DECISION"),
+        "a comment must say the isolation was removed deliberately"
+    );
+    assert!(
+        text.contains("~/.local/share/ai.pandacode.desktop/gateway-token"),
+        "and where the token is, since it is no longer under /var/lib"
+    );
+}
+
+#[tokio::test]
+async fn every_command_leaves_one_audit_line_and_no_line_carries_the_work() {
+    install_crypto_provider();
+    // Unique strings, so the assertions can pick their own lines out of a process
+    // that other tests are writing to at the same time.
+    let canary = "AUDIT-CANARY-message-text-must-not-be-logged-7f31";
+    let file_name = "AUDIT-NAME-canary-8c2a.txt";
+    let file_body = "AUDIT-CONTENT-canary-9d4b";
+    let recording = pandacode_lib::gateway::audit::record();
+
+    let dir = tempfile::tempdir().unwrap();
+    let handle = start(dir.path()).await;
+    let project = call(&handle, "add_project", json!({ "path": dir.path() })).await;
+    let session = call(
+        &handle,
+        "create_session",
+        json!({ "projectId": project["id"], "provider": "claude", "model": "sonnet" }),
+    )
+    .await;
+    let session_id = session["id"].as_str().unwrap().to_owned();
+
+    // 1. A command that carries text: queued, so the text really is stored.
+    call(
+        &handle,
+        "queue_add",
+        json!({ "sessionId": session_id, "text": canary }),
+    )
+    .await;
+
+    // 2. An approval decision. Nothing is running, so the answer is refused — and
+    //    the decision the client made is still what the journal has to show.
+    let request_id = "audit-request-4e1f";
+    let refused = rpc(
+        &handle,
+        "respond_approval",
+        json!({ "sessionId": session_id, "requestId": request_id, "approved": true }),
+    )
+    .await;
+    assert_eq!(refused["ok"], false, "no run is waiting for this answer");
+
+    // 3. An upload, which is an event with its own fields.
+    let (status, receipt) = upload(&handle, file_name, "document", file_body.as_bytes().to_vec()).await;
+    assert_eq!(status, 200, "the upload was accepted: {receipt}");
+    let upload_id = receipt["id"].as_str().unwrap().to_owned();
+
+    let lines = recording.lines();
+
+    // One line per command, naming what was asked and whether it answered.
+    let command = lines
+        .iter()
+        .find(|line| line.contains("event=command") && line.contains("command=queue_add") && line.contains(&format!("session={session_id}")))
+        .unwrap_or_else(|| panic!("no command line for queue_add in {lines:#?}"));
+    assert!(command.contains("outcome=ok"), "{command}");
+    assert!(command.contains("client="), "the source is on the line: {command}");
+    assert!(command.contains("duration_ms="), "{command}");
+
+    let approval = lines
+        .iter()
+        .find(|line| line.contains("event=approval") && line.contains(&format!("request={request_id}")))
+        .unwrap_or_else(|| panic!("no approval line in {lines:#?}"));
+    assert!(approval.contains("decision=approved"), "{approval}");
+    assert!(approval.contains(&format!("session={session_id}")), "{approval}");
+
+    let uploaded = lines
+        .iter()
+        .find(|line| line.contains("event=upload") && line.contains(&format!("upload={upload_id}")))
+        .unwrap_or_else(|| panic!("no upload line in {lines:#?}"));
+    assert!(uploaded.contains("kind=document"), "{uploaded}");
+    assert!(
+        uploaded.contains(&format!("bytes={}", file_body.len())),
+        "{uploaded}"
+    );
+    // The digest on the line is the one the client was given, so the journal can be
+    // matched to the file later.
+    assert!(
+        uploaded.contains(&format!("sha256={}", receipt["sha256"].as_str().unwrap())),
+        "{uploaded}"
+    );
+
+    // The rule the whole module exists for: nothing the person was working on is in
+    // the journal. Not the queued text, not the filename, not the file's bytes.
+    for line in &lines {
+        assert!(!line.contains(canary), "message text reached the journal: {line}");
+        assert!(!line.contains(file_name), "a filename reached the journal: {line}");
+        assert!(!line.contains(file_body), "file content reached the journal: {line}");
+    }
+
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn eleven_bad_tokens_from_one_address_are_limited_while_the_owner_is_not() {
+    install_crypto_provider();
+    let recording = pandacode_lib::gateway::audit::record();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = start(dir.path()).await;
+    let base = format!("http://{}", handle.addr);
+    let request = json!({ "id": "1", "command": "list_projects", "args": {} });
+    let client = reqwest::Client::new();
+
+    // Ten wrong tokens are answered "unauthorized"; the eleventh is over the limit.
+    let mut statuses = Vec::new();
+    for _ in 0..11 {
+        statuses.push(
+            client
+                .post(format!("{base}/rpc"))
+                .header("Authorization", "Bearer wrong-token")
+                .json(&request)
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16(),
+        );
+    }
+    assert_eq!(
+        &statuses[..10],
+        &[401u16; 10],
+        "the first ten are ordinary auth failures: {statuses:?}"
+    );
+    assert_eq!(statuses[10], 429, "eleventh: {statuses:?}");
+
+    // The limit is in the audit, or it is not a limit anybody can see.
+    let limited = recording
+        .lines()
+        .into_iter()
+        .find(|line| line.contains("event=auth") && line.contains("status=429"))
+        .unwrap_or_else(|| panic!("no 429 audit line: {:#?}", recording.lines()));
+    assert!(limited.contains("failures=11"), "{limited}");
+    assert!(limited.contains("window_s=60"), "{limited}");
+    assert!(limited.contains("path=/rpc"), "{limited}");
+
+    // The brake must never catch the owner: the right token still works from the
+    // address that is over the limit.
+    let allowed = call(&handle, "list_projects", json!({})).await;
+    assert_eq!(allowed, json!([]), "a valid token is never limited");
+
+    // And one address's failures are not another's. 127.0.0.2 is a real source on
+    // this host's loopback, so this is a second client, not a second header.
+    let other = reqwest::Client::builder()
+        .local_address("127.0.0.2".parse::<std::net::IpAddr>().unwrap())
+        .build()
+        .unwrap();
+    let unaffected = other
+        .post(format!("{base}/rpc"))
+        .header("Authorization", "Bearer wrong-token")
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        unaffected.status(),
+        401,
+        "a different source has its own window and is not limited by this one"
+    );
+
+    handle.stop().await;
+}

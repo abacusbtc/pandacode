@@ -5,10 +5,11 @@ use std::time::Duration;
 use axum::{
     body::Body,
     extract::{
+        connect_info::ConnectInfo,
         ws::{Message, WebSocket, WebSocketUpgrade},
         DefaultBodyLimit, Request, State,
     },
-    http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri},
+    http::{header, request::Parts, HeaderMap, HeaderValue, Method, StatusCode, Uri},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     Router,
@@ -16,22 +17,34 @@ use axum::{
 use futures_util::StreamExt;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
-use super::{dispatch, events::BroadcastSink, rpc, static_files};
+use super::{audit, dispatch, events::BroadcastSink, rpc, static_files};
 use serde_json::json;
+use std::collections::HashMap;
+use std::net::IpAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 /// The only paths a token protects. The SPA's own files must load before a
 /// client can present one.
 const GUARDED: &[&str] = &["/rpc", "/capabilities", "/events", "/upload"];
 
-/// 64 MB, the same number docs/gateway.md tells the reverse proxy to use for
-/// `client_max_body_size`, so the proxy and the gateway refuse the same body
-/// instead of disagreeing. Base64 attachments are the largest thing this surface
-/// will carry; the limit is ours, not a framework default nobody chose.
+/// Failed authorisations one source may make in the window before it is answered
+/// `429` (spec §2.3). Ten is small enough to make guessing a 32-byte token pointless
+/// and large enough that a person pasting the wrong token twice is not punished.
+const AUTH_FAILURES: u32 = 10;
+/// The window those failures are counted in. It rolls: a source that goes quiet
+/// starts again from zero.
+const AUTH_WINDOW: Duration = Duration::from_secs(60);
+
+/// 64 MB for `/rpc`: base64 attachments are the largest thing that surface carries,
+/// and the limit is chosen here rather than inherited as a framework default nobody
+/// picked.
 ///
 /// `/upload` is the exception, and carries its own per-route limit: a file is
-/// streamed, so a 200 MiB file costs a chunk of memory, not a body.
+/// streamed, so a 200 MiB file costs a chunk of memory, not a body. The reverse
+/// proxy's `client_max_body_size` therefore follows the upload cap (docs/gateway.md),
+/// not this number.
 const MAX_BODY: usize = 64 * 1024 * 1024;
 
 /// What a request needs to be authorised and answered.
@@ -48,6 +61,66 @@ pub(crate) struct RouterState {
     pub(crate) upload_max: usize,
     /// Who is watching which terminal, so an idle shell can be closed (PAN-110).
     pub(crate) watch: Arc<super::terminals::Watch>,
+    /// Failed authorisations per source, for the limit that answers `429`.
+    pub(crate) auth_failures: Arc<AuthFailures>,
+}
+
+/// Failed authorisations per source, counted over a rolling window.
+///
+/// The unit of the limit is a *failure*, never a request: a client holding the right
+/// token is never limited, so a brute force from an address cannot lock the owner out
+/// of the gateway they reach from the same address (spec §2.3, review focus 7).
+#[derive(Default)]
+pub(crate) struct AuthFailures(RwLock<HashMap<IpAddr, (Instant, u32)>>);
+
+impl AuthFailures {
+    /// Records one failed authorisation from `source` and answers how many it has made
+    /// in the current window.
+    fn record(&self, source: IpAddr, now: Instant) -> u32 {
+        let mut failures = self.0.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Sources whose window has passed are dropped, so the map tracks a current
+        // brute force rather than every client that ever mistyped a token.
+        failures.retain(|_, (started, _)| now.saturating_duration_since(*started) < AUTH_WINDOW);
+        let entry = failures.entry(source).or_insert((now, 0));
+        entry.1 = entry.1.saturating_add(1);
+        entry.1
+    }
+}
+
+/// The connection a request came from, for the audit line and the auth limit.
+///
+/// Inserted into the request by `authorize`, and read by handlers through the
+/// extractor below, so a handler does not have to know how the server was built. A
+/// caller without connect info (a unit test driving the router directly) reads
+/// `local`, which is honest rather than inventing an address.
+#[derive(Clone, Debug)]
+pub(crate) struct Peer(pub String);
+
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for Peer {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        Ok(parts
+            .extensions
+            .get::<Peer>()
+            .cloned()
+            .unwrap_or_else(|| Peer("local".to_string())))
+    }
+}
+
+/// The address a request came from, or `None` when this server was not built with
+/// connect info.
+fn peer_of(request: &Request) -> Option<String> {
+    request
+        .extensions()
+        .get::<ConnectInfo<std::net::SocketAddr>>()
+        .map(|connect| connect.0.to_string())
+}
+
+/// The source an address belongs to: failures are counted per host, not per
+/// connection, because a client opens a new port for every request.
+fn source_of(peer: &str) -> Option<IpAddr> {
+    peer.parse::<std::net::SocketAddr>().ok().map(|address| address.ip())
 }
 
 pub(crate) fn router(state: RouterState) -> Router {
@@ -198,10 +271,12 @@ fn percent_decode(value: &str) -> String {
 /// same chunks rather than by reading the file back.
 async fn upload(
     State(state): State<RouterState>,
+    Peer(client): Peer,
     headers: HeaderMap,
     uri: Uri,
     body: Body,
 ) -> Response {
+    let started = Instant::now();
     let query = upload_query(&uri);
     let kind = match query.kind.as_deref().and_then(crate::uploads::Kind::parse) {
         Some(kind) => kind,
@@ -246,7 +321,26 @@ async fn upload(
     match staged.finish(name, kind, crate::storage::now()).await {
         // `{id, name, kind, bytes, sha256, createdAt}` — the id is the only thing a
         // later message needs, and the digest is the one computed while streaming.
-        Ok(upload) => axum::Json(upload.meta).into_response(),
+        Ok(upload) => {
+            // The upload is what the operator needs to find later: which file, how
+            // big, and the digest to prove it is the one they think. The name the
+            // client sent is display metadata and stays out of the journal.
+            audit::Line::new("upload")
+                .field("client", &client)
+                .field("upload", &upload.meta.id)
+                .field(
+                    "kind",
+                    match upload.meta.kind {
+                        crate::uploads::Kind::Image => "image",
+                        crate::uploads::Kind::Document => "document",
+                    },
+                )
+                .field("bytes", upload.meta.bytes)
+                .field("sha256", &upload.meta.sha256)
+                .field("duration_ms", started.elapsed().as_millis())
+                .emit();
+            axum::Json(upload.meta).into_response()
+        }
         Err(error) => failure(StatusCode::INTERNAL_SERVER_ERROR, &error),
     }
 }
@@ -398,11 +492,16 @@ async fn send_lagged(socket: &mut WebSocket, from: u64, to: u64) -> Result<(), (
 }
 
 async fn authorize(State(state): State<RouterState>, request: Request, next: Next) -> Response {
+    // The connection this request arrived on: the audit line's `client` and the key
+    // the auth-failure limit counts against. Read before anything can consume it.
+    let peer = peer_of(&request).unwrap_or_else(|| "local".to_string());
     // CORS is outermost, so a real preflight never reaches this point: what this
     // middleware sees are the app's own requests. Guard by the canonical path,
     // because /rpc/ and //rpc are not what axum routes to the handler, and an
     // auth decision must not hang on how a client spelled the path.
     let path = canonical_path(request.uri().path());
+    let mut request = request;
+    request.extensions_mut().insert(Peer(peer.clone()));
     if !GUARDED.contains(&path.as_str()) {
         return next.run(request).await;
     }
@@ -415,7 +514,35 @@ async fn authorize(State(state): State<RouterState>, request: Request, next: Nex
             .flatten()
     });
     if presented.as_deref() != Some(state.token.as_str()) {
-        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+        // A wrong token is the only thing this limit counts, so the token's owner is
+        // never locked out of their own gateway, and the window rolls.
+        let failures = match source_of(&peer) {
+            Some(source) => state.auth_failures.record(source, Instant::now()),
+            // Without connect info there is no source to count, and refusing on a
+            // guess would be worse than allowing the attempt to be refused as wrong.
+            None => 1,
+        };
+        let status = if failures > AUTH_FAILURES {
+            StatusCode::TOO_MANY_REQUESTS
+        } else {
+            StatusCode::UNAUTHORIZED
+        };
+        audit::Line::new("auth")
+            .field("client", &peer)
+            .field("path", &path)
+            .field("failures", failures)
+            .field("window_s", AUTH_WINDOW.as_secs())
+            .field("status", status.as_u16())
+            .emit();
+        return (
+            status,
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                "too many failed attempts; wait a minute and try the token again"
+            } else {
+                "unauthorized"
+            },
+        )
+            .into_response();
     }
     next.run(request).await
 }

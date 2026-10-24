@@ -142,12 +142,15 @@ fn deny(
     let mut event = crate::event(session_id, "approval_denied", &sentence);
     event.request_id = Some(request_id.to_owned());
     let _ = emitter.emit("agent-event", payload_value(event));
-    // One audit-shaped line, where the gateway already writes its own (stderr).
-    eprintln!(
-        "approval auto-denied: session={session_id} request={request_id} ttl={}ms action={:?}",
-        ttl.as_millis(),
-        question.text
-    );
+    // One audit line: the gateway answered a question with nobody there, and the
+    // journal is where that decision has to survive. The question itself is logged
+    // because it *is* the decision — nothing else here is prose.
+    super::audit::Line::new("approval_denied")
+        .field("session", session_id)
+        .field("request", request_id)
+        .field("ttl_ms", ttl.as_millis())
+        .field("action", &question.text)
+        .emit();
     Ok(delivered.is_ok())
 }
 
@@ -420,6 +423,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_watchdog_denies_on_its_own_when_no_client_is_attached() {
+        let recording = crate::gateway::audit::record();
         let mut fixture = Fixture::unwatched();
         assert_eq!(fixture.sink.clients(), 0, "no socket is attached, as the spec says");
         fixture.ask("req-1", 0);
@@ -443,6 +447,23 @@ mod tests {
         watchdog.abort();
         assert!(heard, "an unanswered question was denied without a client");
         assert_eq!(fixture.pending(), 0);
+
+        // The denial is a decision, so it has to survive in the journal, with the
+        // question it answered. A turn that reads the transcript can see the row; an
+        // operator asking who denied what reads this.
+        let line = recording
+            .lines()
+            .into_iter()
+            .find(|line| {
+                line.contains("event=approval_denied") && line.contains(&format!("session={}", fixture.session))
+            })
+            .unwrap_or_else(|| panic!("no auto-deny audit line: {:#?}", recording.lines()));
+        assert!(line.contains("request="), "{line}");
+        assert!(line.contains("ttl_ms=1"), "{line}");
+        assert!(
+            line.contains("action=\""),
+            "the question it answered is the decision, and it is quoted: {line}"
+        );
     }
 
     #[test]
