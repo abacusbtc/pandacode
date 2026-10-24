@@ -9,6 +9,7 @@ use std::path::Path;
 use futures_util::StreamExt;
 use pandacode_lib::gateway::{config, spawn, GatewayHandle, GatewayConfig};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 /// The crate builds rustls without a default provider (`rustls-no-provider`), so
 /// any process that builds a reqwest client installs one first — the same call
@@ -28,6 +29,7 @@ fn test_config(data_dir: &Path, bind: &str) -> GatewayConfig {
         token: "test-token".into(),
         static_dir: None,
         allowed_origins: config::default_origins(),
+        upload_max: config::DEFAULT_UPLOAD_MAX,
         force_owner: false,
         approval_ttl: Some(config::DEFAULT_APPROVAL_TTL),
     }
@@ -1289,4 +1291,557 @@ async fn unknown_routes_are_404_without_a_built_frontend() {
     assert_eq!(response.status(), 404);
     assert_eq!(response.text().await.unwrap(), "not found");
     handle.stop().await;
+}
+
+// ---- uploads (M2 task 7, PAN-108) ------------------------------------------
+
+/// The same gateway with a cap small enough for a test to cross it.
+async fn start_with_cap(data_dir: &Path, upload_max: usize) -> GatewayHandle {
+    let mut config = test_config(data_dir, "127.0.0.1:0");
+    config.upload_max = upload_max;
+    spawn(config).await.unwrap()
+}
+
+/// `encodeURIComponent`, so a test can name a file anything at all.
+fn encode(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'!' | b'~' | b'*'
+            | b'\'' | b'(' | b')' => encoded.push(*byte as char),
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+
+/// Posts one file and answers the status with the parsed reply.
+async fn upload(handle: &GatewayHandle, name: &str, kind: &str, body: Vec<u8>) -> (u16, Value) {
+    let response = reqwest::Client::new()
+        .post(format!(
+            "http://{}/upload?name={}&kind={kind}",
+            handle.addr,
+            encode(name)
+        ))
+        .header("Authorization", "Bearer test-token")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    let body = response.json().await.unwrap_or(Value::Null);
+    (status, body)
+}
+
+fn upload_dir(data_dir: &Path, id: &str) -> std::path::PathBuf {
+    data_dir.join("uploads").join(id)
+}
+
+/// How many upload directories exist, so a test can say nothing was left behind.
+fn stored_uploads(data_dir: &Path) -> usize {
+    std::fs::read_dir(data_dir.join("uploads"))
+        .map(|entries| entries.filter_map(Result::ok).count())
+        .unwrap_or(0)
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
+/// The status line of a hand-written request. Reading it is how a raw test knows
+/// the gateway answered without the body it did not send.
+async fn status_of(stream: &mut tokio::net::TcpStream) -> u16 {
+    use tokio::io::AsyncReadExt;
+    let mut head = Vec::new();
+    let mut buffer = [0u8; 1024];
+    loop {
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            stream.read(&mut buffer),
+        )
+        .await
+        .expect("the gateway answered")
+        .expect("the response head arrived");
+        if read == 0 {
+            break;
+        }
+        head.extend_from_slice(&buffer[..read]);
+        if head.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+    }
+    let head = String::from_utf8_lossy(&head);
+    head.split_whitespace()
+        .nth(1)
+        .unwrap_or_else(|| panic!("no status line in {head:?}"))
+        .parse()
+        .unwrap()
+}
+
+/// A valid one-pixel PNG: what the image pipeline accepts without re-encoding.
+fn one_pixel_png() -> Vec<u8> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    STANDARD
+        .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC")
+        .unwrap()
+}
+
+/// A project and a task on the gateway, for the commands that need one.
+async fn a_task(handle: &GatewayHandle, data_dir: &Path) -> (String, String) {
+    let project = call(handle, "add_project", json!({ "path": data_dir })).await;
+    let project_id = project["id"].as_str().unwrap().to_owned();
+    let session = call(
+        handle,
+        "create_session",
+        json!({ "projectId": project_id, "provider": "claude", "model": "sonnet" }),
+    )
+    .await;
+    (project_id, session["id"].as_str().unwrap().to_owned())
+}
+
+#[tokio::test]
+async fn upload_is_guarded_by_the_same_token_as_everything_else() {
+    install_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = start(dir.path()).await;
+    let url = format!("http://{}/upload?name=notes.txt&kind=document", handle.addr);
+    for authorization in [None, Some("Bearer wrong-token")] {
+        let mut request = reqwest::Client::new().post(&url).body("hello");
+        if let Some(value) = authorization {
+            request = request.header("Authorization", value);
+        }
+        let response = request.send().await.unwrap();
+        assert_eq!(response.status(), 401);
+        assert_eq!(response.text().await.unwrap(), "unauthorized");
+    }
+    assert_eq!(
+        stored_uploads(dir.path()),
+        0,
+        "a refused request must not reach the handler and store anything"
+    );
+
+    let (status, body) = upload(&handle, "notes.txt", "document", b"hello".to_vec()).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["name"], "notes.txt");
+    assert_eq!(body["kind"], "document");
+    assert_eq!(body["bytes"], 5);
+    assert_eq!(
+        body["sha256"],
+        format!("{:x}", Sha256::digest(b"hello")),
+        "the digest is computed as the bytes arrive"
+    );
+    assert!(body["createdAt"].is_i64());
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn a_client_name_never_becomes_a_path() {
+    install_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = start(dir.path()).await;
+    let bytes = b"not a real file, just bytes".to_vec();
+    let long = "a".repeat(300);
+    for name in [
+        "../../etc/passwd",
+        "/etc/passwd",
+        "with\0nul",
+        "trailing/",
+        long.as_str(),
+        "photo (1) — café.png",
+    ] {
+        let (status, body) = upload(&handle, name, "image", bytes.clone()).await;
+        assert_eq!(status, 200, "{name}: {body}");
+        let id = body["id"].as_str().unwrap();
+        // The bytes are at <uuid>/data whatever the name said, and the name is only
+        // in the metadata.
+        assert_eq!(
+            std::fs::read(upload_dir(dir.path(), id).join("data")).unwrap(),
+            bytes
+        );
+        let meta: Value = serde_json::from_slice(
+            &std::fs::read(upload_dir(dir.path(), id).join("meta.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(meta["name"], name);
+        assert_eq!(meta["kind"], "image");
+        assert_eq!(body["name"], name);
+        // Nothing escaped the uploads directory.
+        assert!(!dir.path().join("etc").exists());
+        assert!(!dir.path().join("passwd").exists());
+    }
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn an_oversized_declared_length_is_refused_before_the_body() {
+    use tokio::io::AsyncWriteExt;
+    install_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = start(dir.path()).await;
+    let mut stream = tokio::net::TcpStream::connect(handle.addr).await.unwrap();
+    // A gigabyte declared, and not one byte of it sent: the answer has to come from
+    // the header alone.
+    let head = "POST /upload?name=huge.bin&kind=document HTTP/1.1\r\nHost: localhost\r\n\
+                Authorization: Bearer test-token\r\nContent-Length: 1000000000\r\n\r\n";
+    stream.write_all(head.as_bytes()).await.unwrap();
+    assert_eq!(status_of(&mut stream).await, 413);
+    assert_eq!(stored_uploads(dir.path()), 0);
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn a_chunked_body_that_crosses_the_cap_is_aborted_and_leaves_nothing() {
+    use tokio::io::AsyncWriteExt;
+    install_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = start_with_cap(dir.path(), 64 * 1024).await;
+    let mut stream = tokio::net::TcpStream::connect(handle.addr).await.unwrap();
+    // Chunked, so no declared length can be checked: only the running count can
+    // stop this, and it has to stop it mid-transfer.
+    let head = "POST /upload?name=stream.bin&kind=document HTTP/1.1\r\nHost: localhost\r\n\
+                Authorization: Bearer test-token\r\nTransfer-Encoding: chunked\r\n\r\n";
+    stream.write_all(head.as_bytes()).await.unwrap();
+    let chunk = vec![b'x'; 8 * 1024];
+    let frame = format!("{:x}\r\n", chunk.len());
+    // Ten chunks is 80 KiB against a 64 KiB cap: the ninth crosses it. Nothing is
+    // read between writes on purpose — the answer only comes once the count is
+    // passed, so waiting for it earlier would wait forever.
+    for _ in 0..10 {
+        if stream.write_all(frame.as_bytes()).await.is_err()
+            || stream.write_all(&chunk).await.is_err()
+            || stream.write_all(b"\r\n").await.is_err()
+        {
+            // The gateway may already have answered and stopped reading.
+            break;
+        }
+    }
+    assert_eq!(status_of(&mut stream).await, 413);
+    assert_eq!(
+        stored_uploads(dir.path()),
+        0,
+        "an aborted transfer leaves no partial upload behind"
+    );
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn the_reply_is_the_metadata_and_a_second_file_is_a_second_upload() {
+    install_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = start(dir.path()).await;
+    let (first_status, first) = upload(&handle, "one.txt", "document", b"one".to_vec()).await;
+    let (second_status, second) = upload(&handle, "one.txt", "document", b"two".to_vec()).await;
+    assert_eq!((first_status, second_status), (200, 200));
+    assert_ne!(
+        first["id"], second["id"],
+        "the same filename twice is two uploads, not one overwritten"
+    );
+    assert_eq!(stored_uploads(dir.path()), 2);
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn an_unknown_upload_id_fails_the_send_before_a_turn_starts() {
+    install_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = start(dir.path()).await;
+    let (_project, session) = a_task(&handle, dir.path()).await;
+    let missing = "3f2f4c0e-0f2f-4c40-9f2f-2a1f3b4c5d6e";
+    let body = rpc(
+        &handle,
+        "send_message",
+        json!({ "sessionId": session, "text": "here it is", "uploadIds": [missing] }),
+    )
+    .await;
+    assert_eq!(body["ok"], false, "{body}");
+    assert_eq!(body["error"], format!("unknown_upload: {missing}"));
+    assert_eq!(
+        call(&handle, "gateway_live_tasks", json!({})).await,
+        json!([]),
+        "a refused send is not a turn that started"
+    );
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn the_sweep_keeps_what_a_queued_message_still_needs() {
+    install_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = start(dir.path()).await;
+    let (_project, session) = a_task(&handle, dir.path()).await;
+    let png = one_pixel_png();
+    let (_, loose) = upload(&handle, "loose.png", "image", png.clone()).await;
+    let (_, kept) = upload(&handle, "kept.png", "image", png).await;
+    call(
+        &handle,
+        "queue_add",
+        json!({
+            "sessionId": session,
+            "text": "after this run",
+            "attachments": [{ "kind": "image", "id": kept["id"] }],
+        }),
+    )
+    .await;
+
+    // A day later: the queued message still needs its upload, the other one is
+    // scratch space that nothing refers to.
+    let (removed, retained) = handle.sweep_uploads(now_ms() + 25 * 60 * 60 * 1000).unwrap();
+    assert_eq!((removed, retained), (1, 1), "one of each, decided by reference");
+    assert!(!upload_dir(dir.path(), loose["id"].as_str().unwrap()).exists());
+    assert!(upload_dir(dir.path(), kept["id"].as_str().unwrap()).exists());
+
+    // Seven days is the hard cap: being referenced does not make it permanent.
+    let (removed, retained) = handle.sweep_uploads(now_ms() + 8 * 24 * 60 * 60 * 1000).unwrap();
+    assert_eq!((removed, retained), (1, 0));
+    assert!(!upload_dir(dir.path(), kept["id"].as_str().unwrap()).exists());
+
+    // And an id whose file is gone is refused before a turn, like any unknown one.
+    let body = rpc(
+        &handle,
+        "send_message",
+        json!({ "sessionId": session, "text": "too late", "uploadIds": [kept["id"]] }),
+    )
+    .await;
+    assert_eq!(body["ok"], false, "{body}");
+    assert_eq!(
+        body["error"],
+        format!("unknown_upload: {}", kept["id"].as_str().unwrap())
+    );
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn a_gateway_sweeps_aged_uploads_before_it_serves() {
+    install_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = start(dir.path()).await;
+    let (_, body) = upload(&handle, "forgotten.bin", "document", b"bytes".to_vec()).await;
+    let id = body["id"].as_str().unwrap().to_owned();
+    // Age it past the unreferenced day, then let a fresh gateway boot sweep it:
+    // nothing refers to this upload and nothing ever did.
+    let meta_path = upload_dir(dir.path(), &id).join("meta.json");
+    let mut meta: Value = serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
+    meta["createdAt"] = json!(now_ms() - 25 * 60 * 60 * 1000);
+    std::fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
+    handle.stop().await;
+    assert!(upload_dir(dir.path(), &id).exists(), "still there before the reboot");
+
+    let restarted = start(dir.path()).await;
+    assert!(
+        !upload_dir(dir.path(), &id).exists(),
+        "the boot sweep removes what a day of nothing left behind"
+    );
+    assert_eq!(stored_uploads(dir.path()), 0);
+    restarted.stop().await;
+}
+
+#[tokio::test]
+async fn an_uploaded_pdf_is_read_on_the_send_path_instead_of_refused() {
+    install_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = start(dir.path()).await;
+    let (_project, session) = a_task(&handle, dir.path()).await;
+
+    // A one-page PDF with a correct xref table, so poppler reads it as a real file.
+    let content = "0 0 0 rg 72 700 200 100 re f";
+    let objects = [
+        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>".to_string(),
+        format!("<< /Length {} >>\nstream\n{content}\nendstream", content.len()),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+    ];
+    let mut pdf = String::from("%PDF-1.4\n");
+    let mut offsets = Vec::new();
+    for (index, object) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.push_str(&format!("{} 0 obj\n{}\nendobj\n", index + 1, object));
+    }
+    let xref = pdf.len();
+    pdf.push_str(&format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1));
+    for offset in &offsets {
+        pdf.push_str(&format!("{offset:010} 00000 n \n"));
+    }
+    pdf.push_str(&format!(
+        "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+        objects.len() + 1
+    ));
+
+    let (status, scanned) = upload(&handle, "scan.pdf", "document", pdf.into_bytes()).await;
+    assert_eq!(status, 200, "{scanned}");
+
+    // The page draws no glyph, so the extractor has to answer for that: this proves
+    // the send path now runs the reader (task 8) rather than the old blanket refusal,
+    // and that an empty result never looks like an empty document.
+    let body = rpc(
+        &handle,
+        "send_message",
+        json!({ "sessionId": session, "text": "read this", "uploadIds": [scanned["id"]] }),
+    )
+    .await;
+    assert_eq!(body["ok"], false, "{body}");
+    let error = body["error"].as_str().unwrap();
+    assert!(
+        error.contains("No readable text"),
+        "the extractor ran and reported honestly: {error}"
+    );
+
+    // And a PDF that *has* text is read all the way through: the send gets past the
+    // document and is refused by the image cap instead, which is the order the
+    // admission path runs in. A document failure would have answered first.
+    let text = "BT /F1 18 Tf 72 700 Td (Lighthouse keeper duty) Tj ET";
+    let mut pdf = String::from("%PDF-1.4\n");
+    let mut offsets = Vec::new();
+    let objects = [
+        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>".to_string(),
+        format!("<< /Length {} >>\nstream\n{text}\nendstream", text.len()),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+    ];
+    for (index, object) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.push_str(&format!("{} 0 obj\n{}\nendobj\n", index + 1, object));
+    }
+    let xref = pdf.len();
+    pdf.push_str(&format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1));
+    for offset in &offsets {
+        pdf.push_str(&format!("{offset:010} 00000 n \n"));
+    }
+    pdf.push_str(&format!(
+        "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+        objects.len() + 1
+    ));
+    let (_, read) = upload(&handle, "brief.pdf", "document", pdf.into_bytes()).await;
+    let screenshots: Vec<String> = (0..5).map(|_| uuid_like()).collect();
+    let body = rpc(
+        &handle,
+        "send_message",
+        json!({
+            "sessionId": session,
+            "text": "read this",
+            "imageIds": screenshots,
+            "uploadIds": [read["id"]],
+        }),
+    )
+    .await;
+    assert_eq!(body["ok"], false, "{body}");
+    assert_eq!(
+        body["error"],
+        "Attach up to four screenshots per message.",
+        "the PDF resolved and the image cap answered, in that order"
+    );
+    assert_eq!(
+        call(&handle, "gateway_live_tasks", json!({})).await,
+        json!([]),
+        "no turn started"
+    );
+    handle.stop().await;
+}
+
+/// A well-formed uuid the gateway has never stored, for a capture id that only has
+/// to count.
+fn uuid_like() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let value = NEXT.fetch_add(1, Ordering::Relaxed);
+    format!("00000000-0000-4000-8000-{value:012}")
+}
+
+/// The proof that a cap-sized upload is streamed rather than buffered: the real
+/// `pandacode-gateway` binary takes 200 MiB in one request while its own resident
+/// memory is sampled from `/proc`.
+///
+/// A separate process on purpose: an in-process server would make the number a
+/// statement about this test binary. The client streams 1 MiB chunks and never
+/// holds the file either, so growth in the gateway can only be its own doing.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_two_hundred_mebibyte_upload_does_not_become_two_hundred_mebibytes_of_memory() {
+    use std::io::BufRead;
+    use tokio::io::AsyncWriteExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_pandacode-gateway"))
+        .arg("--data-dir")
+        .arg(dir.path())
+        .arg("--host")
+        .arg("127.0.0.1")
+        .arg("--port")
+        .arg("0")
+        .arg("--token")
+        .arg("test-token")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    let addr: std::net::SocketAddr = line
+        .trim()
+        .rsplit("http://")
+        .next()
+        .expect("the gateway printed its address")
+        .parse()
+        .expect("the printed address parsed");
+
+    fn resident_kb(pid: u32) -> u64 {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix("VmRSS:"))
+            .and_then(|value| value.split_whitespace().next())
+            .and_then(|value| value.parse().ok())
+            .expect("VmRSS is in /proc/<pid>/status")
+    }
+
+    let pid = child.id();
+    let baseline = resident_kb(pid);
+    let total = 200 * 1024 * 1024;
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let head = format!(
+        "POST /upload?name=big.bin&kind=document HTTP/1.1\r\nHost: localhost\r\n\
+         Authorization: Bearer test-token\r\nContent-Length: {total}\r\n\r\n"
+    );
+    stream.write_all(head.as_bytes()).await.unwrap();
+    let chunk = vec![b'x'; 1024 * 1024];
+    let mut peak = baseline;
+    for _ in 0..200 {
+        stream.write_all(&chunk).await.unwrap();
+        peak = peak.max(resident_kb(pid));
+    }
+    assert_eq!(status_of(&mut stream).await, 200);
+    let data = std::fs::read_dir(dir.path().join("uploads"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join("data"))
+        .find(|path| path.exists())
+        .expect("the upload is on disk");
+    assert_eq!(
+        std::fs::metadata(data).unwrap().len(),
+        total as u64,
+        "all 200 MiB arrived"
+    );
+
+    // What the mechanism costs: the peak of the gateway's own RSS against its
+    // baseline. Buffering the body would be ~200 MiB of growth; a stream is a lot
+    // less than the file.
+    let growth_mb = (peak.saturating_sub(baseline)) as f64 / 1024.0;
+    eprintln!(
+        "gateway RSS: baseline {:.1} MB, peak {:.1} MB, growth {:.1} MB for a {} MB upload",
+        baseline as f64 / 1024.0,
+        peak as f64 / 1024.0,
+        growth_mb,
+        total / (1024 * 1024)
+    );
+    assert!(
+        growth_mb < 32.0,
+        "a {total} byte upload grew the gateway by {growth_mb:.1} MB"
+    );
+    let _ = child.kill();
+    let _ = child.wait();
 }
