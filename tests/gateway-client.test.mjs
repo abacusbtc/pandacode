@@ -107,6 +107,91 @@ test('an https url becomes wss for the events socket', async () => {
   client.close();
 });
 
+test('a resumed socket asks for what follows the last frame it saw, not "now"', async () => {
+  const WebSocketImpl = sockets();
+  const client = createGatewayClient({ url: 'http://gw.test', token: 't', fetchImpl: async () => ok(null), WebSocketImpl, reconnectDelayMs: 1 });
+  await client.subscribe('agent-event', () => {});
+  assert.equal(WebSocketImpl.instances[0].url, 'ws://gw.test/events?token=t', 'a first connection has nothing to resume');
+
+  const first = WebSocketImpl.instances[0];
+  first.message({ seq: 1, event: 'agent-event', payload: { kind: 'text' } });
+  first.message({ seq: 4, event: 'agent-event', payload: { kind: 'text' } });
+  assert.equal(client.lastSeq(), 4);
+
+  first.closed();
+  await new Promise(resolve => setTimeout(resolve, 25));
+  assert.equal(WebSocketImpl.instances[1].url, 'ws://gw.test/events?token=t&since=4');
+  client.close();
+});
+
+test('an announced hole moves the resume point to its far side', async () => {
+  // The gateway drops 3..9 and says so. Whatever the client refetches, the stream it
+  // asks for next starts after 9 — resuming at 2 would replay the hole forever.
+  const WebSocketImpl = sockets();
+  const client = createGatewayClient({ url: 'http://gw.test', token: 't', fetchImpl: async () => ok(null), WebSocketImpl, reconnectDelayMs: 1 });
+  const holes = [];
+  await client.subscribe('lagged', missed => holes.push(missed));
+  await client.subscribe('agent-event', () => {});
+  const socket = WebSocketImpl.instances[0];
+  socket.message({ seq: 2, event: 'agent-event', payload: { kind: 'text' } });
+  socket.message({ event: 'lagged', payload: { fromSeq: 3, toSeq: 9 } });
+  assert.deepEqual(holes, [{ fromSeq: 3, toSeq: 9 }]);
+  assert.equal(client.lastSeq(), 9);
+  socket.closed();
+  await new Promise(resolve => setTimeout(resolve, 25));
+  assert.equal(WebSocketImpl.instances[1].url, 'ws://gw.test/events?token=t&since=9');
+  client.close();
+});
+
+test('a console socket asks for its whole ring and keeps its own resume point', async () => {
+  // The filter is the subscription: `?terminal=` is how the gateway knows somebody is
+  // watching, and `since=0` is the scrollback a console that has just opened has never
+  // seen. Its numbers must not move the turn socket's resume point — a main socket that
+  // was behind would then ask to resume past frames it never received.
+  const WebSocketImpl = sockets();
+  const client = createGatewayClient({ url: 'http://gw.test', token: 't', fetchImpl: async () => ok(null), WebSocketImpl, reconnectDelayMs: 1 });
+  await client.subscribe('agent-event', () => {});
+  const turns = WebSocketImpl.instances[0];
+  turns.message({ seq: 3, event: 'agent-event', payload: { kind: 'text' } });
+
+  const frames = [];
+  const resets = [];
+  const stop = client.watchTerminal('term 1', frame => frames.push(frame), missed => resets.push(missed));
+  const console_ = WebSocketImpl.instances[1];
+  assert.equal(console_.url, 'ws://gw.test/events?token=t&terminal=term%201&since=0');
+
+  console_.message({ seq: 50, event: 'terminal-event', payload: { terminalId: 'term 1', data: 'hi' } });
+  assert.deepEqual(frames, [{ terminalId: 'term 1', data: 'hi' }]);
+  assert.equal(client.lastSeq(), 3, 'a console frame does not advance the turn socket');
+  console_.message({ event: 'terminal-reset', payload: { fromSeq: 1, toSeq: 4 } });
+  assert.deepEqual(resets, [{ fromSeq: 1, toSeq: 4 }]);
+
+  turns.closed();
+  await new Promise(resolve => setTimeout(resolve, 25));
+  assert.equal(WebSocketImpl.instances[2].url, 'ws://gw.test/events?token=t&since=3');
+
+  // Stopping the console closes its own socket and leaves the turn socket alone.
+  const opened = WebSocketImpl.instances.length;
+  stop();
+  assert.equal(console_.closedByClient, true);
+  assert.equal(WebSocketImpl.instances.length, opened);
+  client.close();
+});
+
+test('close() stops a console socket instead of leaving it reconnecting', async () => {
+  const WebSocketImpl = sockets();
+  const client = createGatewayClient({ url: 'http://gw.test', token: 't', fetchImpl: async () => ok(null), WebSocketImpl, reconnectDelayMs: 1 });
+  await client.subscribe('agent-event', () => {});
+  client.watchTerminal('term-1', () => {}, () => {});
+  const console_ = WebSocketImpl.instances[1];
+  client.close();
+  assert.equal(console_.closedByClient, true);
+  // The console socket's own close handler must not schedule anything after this.
+  console_.onclose?.({});
+  await new Promise(resolve => setTimeout(resolve, 25));
+  assert.equal(WebSocketImpl.instances.length, 2, 'nothing reopened a gateway the person left');
+});
+
 test('a dropped socket reconnects, and close() stops it', async () => {
   const WebSocketImpl = sockets();
   const client = createGatewayClient({ url: 'http://gw.test', token: 't', fetchImpl: async () => ok(null), WebSocketImpl, reconnectDelayMs: 1 });

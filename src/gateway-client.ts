@@ -5,6 +5,11 @@
 // stub, and so the app can pass the platform's own implementations unchanged.
 // Constructing a client performs no I/O: nothing is fetched or opened until the
 // first `call` or `subscribe`.
+//
+// Frames are numbered (PAN-105): every one is `{seq, event, payload}`, and the number
+// is the whole guarantee that nothing was missed. This client therefore remembers the
+// last number it saw, asks a reopened socket to resume after it (`since`), and passes
+// an announced hole (`lagged`) on to whoever can refetch what it lost.
 
 /** The smallest socket surface this needs, so a stub can stand in for WebSocket. */
 export type GatewaySocket = {
@@ -48,13 +53,27 @@ export type UploadRequest = {
 };
 export type UploadRequestImpl = new () => UploadRequest;
 
+/** The range a socket missed: frames `fromSeq`..`toSeq` are not coming. */
+export type MissedFrames = { fromSeq: number; toSeq: number };
+
 export type GatewayClient = {
   call<T>(command: string, args?: Record<string, unknown>): Promise<T>;
   subscribe(name: string, callback: (payload: any) => void): Promise<() => void>;
+  /**
+   * One terminal's frames from a socket filtered to it (`?terminal=`), replayed from
+   * the start of its ring so a console that opens late still gets its scrollback.
+   * `onReset` is the server saying it could not replay that far back.
+   */
+  watchTerminal(terminalId: string, onFrame: (event: any) => void, onReset: (missed: MissedFrames) => void): () => void;
+  /** The highest frame number seen; the value a reconnect resumes after. */
+  lastSeq(): number;
   /** Streams one file to the gateway; `onProgress` gets bytes sent of the total. */
   upload(file: Blob, name: string, kind: 'image' | 'document', onProgress?: (sent: number, total: number) => void): Promise<UploadReceipt>;
   close(): void;
 };
+
+/** One frame as it arrives, or `null` for something that is not a frame at all. */
+type Frame = { seq?: number; event: string; payload: any };
 
 export function createGatewayClient(options: GatewayOptions): GatewayClient {
   // A saved URL may carry a trailing slash; every path below is joined onto it.
@@ -67,6 +86,45 @@ export function createGatewayClient(options: GatewayOptions): GatewayClient {
   let reconnect: ReturnType<typeof setTimeout> | null = null;
   let closed = false;
   let seq = 0;
+  /** The highest frame number this client has seen, across every socket it opened. */
+  let lastSeq = 0;
+  /** Console sockets, so close() stops their reconnect timers too. */
+  const consoleSockets = new Set<() => void>();
+
+  const socketUrl = (query: string): string =>
+    `${base.replace(/^http/, 'ws')}/events?token=${encodeURIComponent(token)}${query}`;
+  const socketImpl = (): GatewaySocketImpl => options.WebSocketImpl ?? (WebSocket as unknown as GatewaySocketImpl);
+
+  /**
+   * Reads one frame and reports its number to `seen`, which owns that socket's resume
+   * point. A frame that is not JSON, or that names no event, is not a reason to tear
+   * the socket down.
+   *
+   * The two sockets keep separate counters on purpose. Numbers come from one gateway
+   * counter, but if a console socket advanced the main socket's resume point, a main
+   * socket that was behind would ask to resume past frames it never saw — a silent
+   * hole, which is the one thing numbering exists to prevent.
+   */
+  const readFrame = (data: unknown, seen: (seq: number) => void): Frame | null => {
+    let frame: { seq?: unknown; event?: unknown; payload?: unknown };
+    try {
+      frame = JSON.parse(String(data));
+    } catch {
+      return null;
+    }
+    if (typeof frame.event !== 'string') return null;
+    const payload = frame.payload ?? null;
+    // A hole and a terminal reset carry the range instead of a number of their own;
+    // the stream continues after `toSeq`, so that is where the next resume starts. Only
+    // these two: any other payload's fields are the server's business, not numbering.
+    if (typeof frame.seq === 'number') seen(frame.seq);
+    else if ((frame.event === 'lagged' || frame.event === 'terminal-reset') && payload && typeof payload === 'object') {
+      const to = Number((payload as MissedFrames).toSeq);
+      if (Number.isFinite(to)) seen(to);
+    }
+    return { seq: typeof frame.seq === 'number' ? frame.seq : undefined, event: frame.event, payload };
+  };
+  const advance = (to: number) => { if (to > lastSeq) lastSeq = to; };
 
   const connect = () => {
     // A subscribe during the backoff window connects right away; the pending
@@ -75,17 +133,12 @@ export function createGatewayClient(options: GatewayOptions): GatewayClient {
       clearTimeout(reconnect);
       reconnect = null;
     }
-    const Impl = options.WebSocketImpl ?? (WebSocket as unknown as GatewaySocketImpl);
-    socket = new Impl(`${base.replace(/^http/, 'ws')}/events?token=${encodeURIComponent(token)}`);
+    // Resume after the last frame this client saw. Without a `since` the socket is a
+    // live feed only, and a reconnect would silently start at "now" (PAN-105).
+    socket = new (socketImpl())(socketUrl(lastSeq ? `&since=${lastSeq}` : ''));
     socket.onmessage = event => {
-      let frame: { event?: string; payload?: unknown };
-      try {
-        frame = JSON.parse(String(event.data));
-      } catch {
-        // A frame that is not JSON is not a reason to tear the socket down.
-        return;
-      }
-      if (typeof frame.event !== 'string') return;
+      const frame = readFrame(event.data, advance);
+      if (!frame) return;
       for (const listener of listeners.get(frame.event) ?? []) listener(frame.payload);
     };
     socket.onclose = () => {
@@ -137,6 +190,46 @@ export function createGatewayClient(options: GatewayOptions): GatewayClient {
         if (set.size === 0) listeners.delete(name);
       };
     },
+    watchTerminal(terminalId: string, onFrame: (event: any) => void, onReset: (missed: MissedFrames) => void) {
+      // Its own socket, because the filter *is* the subscription: `?terminal=` is how
+      // the gateway knows someone is watching, and `since=0` is how it replays the
+      // ring a console that has just opened has never seen. Its own frame number, so
+      // a dropped console socket resumes after what it already drew.
+      let own: GatewaySocket | null = null;
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      let stopped = false;
+      let resumedFrom = 0;
+      const advanceOwn = (to: number) => { if (to > resumedFrom) resumedFrom = to; };
+      const open = () => {
+        if (timer) { clearTimeout(timer); timer = null; }
+        own = new (socketImpl())(socketUrl(`&terminal=${encodeURIComponent(terminalId)}&since=${resumedFrom}`));
+        own.onmessage = event => {
+          const frame = readFrame(event.data, advanceOwn);
+          if (!frame) return;
+          if (frame.event === 'terminal-event') onFrame(frame.payload);
+          else if (frame.event === 'terminal-reset') onReset({ fromSeq: Number(frame.payload?.fromSeq ?? 0), toSeq: Number(frame.payload?.toSeq ?? 0) });
+        };
+        own.onclose = () => {
+          own = null;
+          if (stopped) return;
+          timer = setTimeout(() => { timer = null; if (!stopped) open(); }, delay);
+        };
+      };
+      open();
+      const stop = () => {
+        consoleSockets.delete(stop);
+        stopped = true;
+        if (timer) clearTimeout(timer);
+        timer = null;
+        own?.close();
+        own = null;
+      };
+      consoleSockets.add(stop);
+      return stop;
+    },
+    lastSeq() {
+      return lastSeq;
+    },
     upload(file: Blob, name: string, kind: 'image' | 'document', onProgress?: (sent: number, total: number) => void): Promise<UploadReceipt> {
       // The request body is the file itself, so the server streams it rather than
       // parsing anything; the name is display metadata in the query, and `call`
@@ -167,6 +260,9 @@ export function createGatewayClient(options: GatewayOptions): GatewayClient {
       if (reconnect) clearTimeout(reconnect);
       reconnect = null;
       listeners.clear();
+      // A console socket is this client's too: leaving one reconnecting after a
+      // disconnect would knock on a gateway the person just left.
+      for (const stop of [...consoleSockets]) stop();
       socket?.close();
       socket = null;
     },

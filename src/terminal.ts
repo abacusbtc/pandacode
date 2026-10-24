@@ -1,5 +1,5 @@
 import { paletteTerminal } from './palette';
-import { call, subscribe } from './bridge';
+import { call, currentMode, onTransportChange, subscribe, watchTerminal } from './bridge';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { currentTheme } from './theme';
@@ -72,30 +72,98 @@ export async function mountTerminal(container: HTMLElement, context: TerminalCon
   if (surface.clientWidth && surface.clientHeight) fit.fit();
   let terminalId = '', exited = false, hasOutput = false, disposed = false, inserted = false;
   // Each pending PTY owns its startup output. A busy existing tab must not
-  // consume another tab's queue before start_terminal returns that tab's ID.
-  const early = new Map<string, { terminalId: string; data: string; exit: boolean }>();
-  const handle = (event: { terminalId: string; data: string; exit?: boolean }) => {
+  // consume another tab's queue before start_terminal returns that tab's ID. Only the
+  // local transports need it: their event stream has no ring, so output emitted
+  // before the id is known is only catchable live. A gateway replays instead.
+  const early = new Map<string, { terminalId: string; data: string; reason?: string; exit: boolean }>();
+  /** Writes the line that explains an end, instead of leaving a pane that looks dead. */
+  const closeNote = (reason?: string): string => reason === 'idle'
+    ? 'The gateway closed this terminal after it sat idle with nobody watching.'
+    : 'Process exited. Close and reopen the terminal to start again.';
+  const handle = (event: { terminalId: string; data: string; exit?: boolean; reason?: string }) => {
     if (!terminalId) {
       const previous = early.get(event.terminalId);
-      early.set(event.terminalId, { terminalId: event.terminalId, data: ((previous?.data ?? '') + event.data).slice(-65536), exit: Boolean(previous?.exit || event.exit) });
+      early.set(event.terminalId, { terminalId: event.terminalId, data: ((previous?.data ?? '') + event.data).slice(-65536), exit: Boolean(previous?.exit || event.exit), reason: previous?.reason ?? event.reason });
       // Bound each native PTY's output independently and retain its exit marker
       // when its buffer rolls. Other PTYs never evict this terminal's startup.
       return;
     }
     if (event.terminalId !== terminalId || disposed) return;
     terminal.write(event.data); hasOutput ||= event.data.length > 0;
-    if (event.exit) { exited = true; terminal.write('\r\n\x1b[90mProcess exited. Close and reopen the terminal to start again.\x1b[0m\r\n'); }
+    if (event.exit) { exited = true; terminal.write(`\r\n\x1b[90m${closeNote(event.reason)}\x1b[0m\r\n`); }
     if (insertButton) insertButton.disabled = !hasOutput || exited || inserted;
   };
-  let unlisten: () => void;
-  try {
+  /**
+   * The server could not replay this console that far back. A shell cannot be
+   * refetched the way a turn's transcript can (that is why a gateway sends this
+   * instead of `lagged`), so the pane is cleared and the reason is written before
+   * the frames it did keep are redrawn over it.
+   */
+  const onReset = () => {
+    if (disposed) return;
+    terminal.clear();
+    terminal.write('\x1b[90mThe console lost its earlier scrollback and was reset. Showing what the gateway kept.\x1b[0m\r\n');
+    hasOutput = true;
+  };
+  let unlisten: () => void = () => {};
+  let localSubscribed = false;
+  /** The shared event stream, for a backend that has no ring to replay from. */
+  const bindLocal = async (): Promise<void> => {
+    if (localSubscribed) return;
     unlisten = await subscribe('terminal-event', handle);
-  } catch (error) { terminal.dispose(); frame.remove(); throw error; }
+    localSubscribed = true;
+  };
   try {
+    // Local transports subscribe before the PTY exists so no startup output is missed.
+    // Remote opens its own filtered socket once the id is known (see begin()).
+    if (currentMode() !== 'remote') await bindLocal();
+  } catch (error) { terminal.dispose(); frame.remove(); throw error; }
+  let stopWatch: (() => void) | undefined;
+  const watch = async (id: string): Promise<void> => {
+    stopWatch?.(); stopWatch = undefined;
+    try {
+      const off = await watchTerminal(id, handle, onReset);
+      // A restart may have moved on while the socket opened: drop this one instead.
+      if (disposed || terminalId !== id) { off(); return; }
+      stopWatch = off;
+    } catch (error) { if (!disposed) reportError(error); }
+  };
+  /** Starts a PTY on the transport that is active now, then watches it. */
+  const begin = async (): Promise<void> => {
     const { harness, runScript, runRequestId, ...workspace } = context;
-    terminalId = await call<string>(runScript ? 'start_run_script_terminal' : harness ? 'start_harness_terminal' : 'start_terminal', { ...workspace, ...(runRequestId ? { requestId: runRequestId } : {}), cols: terminal.cols, rows: terminal.rows });
-  } catch (error) { unlisten(); terminal.dispose(); frame.remove(); throw error; }
-  const pending = early.get(terminalId); early.clear(); if (pending) handle(pending);
+    const id = await call<string>(runScript ? 'start_run_script_terminal' : harness ? 'start_harness_terminal' : 'start_terminal', { ...workspace, ...(runRequestId ? { requestId: runRequestId } : {}), cols: terminal.cols, rows: terminal.rows });
+    if (disposed) { await call('close_terminal', { terminalId: id }).catch(() => undefined); return; }
+    terminalId = id;
+    const pending = early.get(id); early.clear(); if (pending) handle(pending);
+    // Remote: the filtered socket (since=0) is both the scrollback this console has
+    // never seen and the gateway's record that somebody is watching it. Local: the
+    // shared stream, which a console that arrived here from the gateway has not
+    // subscribed to yet.
+    if (currentMode() === 'remote') { unlisten(); localSubscribed = false; await watch(id); }
+    else await bindLocal();
+    // The pane may have been resized while start_terminal was in flight; the shell
+    // was told the size it had then.
+    resize();
+  };
+  /**
+   * The transport changed under this console. Its PTY belongs to the backend that
+   * started it — the id is meaningless on the other side — so the shell is closed
+   * there and a new one is started here, saying so rather than leaving a pane that
+   * accepts keystrokes into nothing.
+   */
+  const restart = async (): Promise<void> => {
+    if (disposed) return;
+    const previous = terminalId;
+    stopWatch?.(); stopWatch = undefined;
+    unlisten(); localSubscribed = false;
+    terminalId = ''; exited = false; hasOutput = false; inserted = false;
+    terminal.reset();
+    terminal.write(`\x1b[90m${currentMode() === 'remote' ? 'Moved to the gateway.' : 'Back on this computer.'} The console restarted; this shell is new.\x1b[0m\r\n`);
+    if (insertButton) insertButton.disabled = true;
+    const closing = previous ? call('close_terminal', { terminalId: previous }).catch(() => undefined) : Promise.resolve();
+    try { await closing; await begin(); } catch (error) { if (!disposed) reportError(error); }
+  };
+  const unwatchTransport = onTransportChange(() => { void restart(); });
   if (insertButton) insertButton.addEventListener('click', () => {
     if (exited || disposed || !hasOutput || !command) return;
     const revision = commandRevision, text = command;
@@ -113,14 +181,23 @@ export async function mountTerminal(container: HTMLElement, context: TerminalCon
   refreshTheme();
   window.addEventListener('pandacode-theme-change', refreshTheme);
   window.addEventListener('pandacode-palette-change', refreshTheme);
-  const input = terminal.onData(data => { if (!exited && !disposed) void call('write_terminal', { terminalId, data }).catch(reportError); });
+  const input = terminal.onData(data => { if (!exited && !disposed && terminalId) void call('write_terminal', { terminalId, data }).catch(reportError); });
   let resizeFrame = 0;
-  const resize = () => { cancelAnimationFrame(resizeFrame); resizeFrame = requestAnimationFrame(() => { if (disposed || !surface.clientWidth || !surface.clientHeight) return; fit.fit(); if (!exited) void call('resize_terminal', { terminalId, cols: terminal.cols, rows: terminal.rows }).catch(reportError); }); };
+  // Before the PTY exists there is nobody to resize: `fit` still measures the pane,
+  // and begin() sends the size it settled on as soon as the shell is there.
+  const resize = () => { cancelAnimationFrame(resizeFrame); resizeFrame = requestAnimationFrame(() => { if (disposed || !surface.clientWidth || !surface.clientHeight) return; fit.fit(); if (!terminalId || exited) return; void call('resize_terminal', { terminalId, cols: terminal.cols, rows: terminal.rows }).catch(reportError); }); };
   const refreshSize = () => { terminal.options.fontSize = 12 * textScale(); resize(); };
   refreshSize();
   window.addEventListener('pandacode-ui-scale-change', refreshSize);
   const observer = new ResizeObserver(resize);
   observer.observe(surface);
+  try {
+    await begin();
+  } catch (error) {
+    unlisten(); stopWatch?.(); unwatchTransport(); observer.disconnect();
+    window.removeEventListener('pandacode-theme-change', refreshTheme); window.removeEventListener('pandacode-palette-change', refreshTheme); window.removeEventListener('pandacode-ui-scale-change', refreshSize);
+    cancelAnimationFrame(resizeFrame); input.dispose(); terminal.dispose(); frame.remove(); throw error;
+  }
   const focus = () => { if (!disposed && surface.clientWidth && surface.clientHeight) { resize(); terminal.focus(); } };
   focus();
   return { get exited() { return exited; }, focus, offerCommand: value => {
@@ -130,9 +207,11 @@ export async function mountTerminal(container: HTMLElement, context: TerminalCon
     insertButton.textContent = `Insert ${value.split(/\s/, 1)[0]}`;
     insertButton.setAttribute('aria-label', `Insert ${value} in the harness console`);
     insertButton.disabled = exited || disposed || !hasOutput;
-  }, activity: () => exited || disposed ? Promise.resolve({ running: false, processNames: [], uncertain: false }) : call<TerminalActivity>('get_terminal_activity', { terminalId }), dispose: async () => {
+  }, activity: () => exited || disposed || !terminalId ? Promise.resolve({ running: false, processNames: [], uncertain: false }) : call<TerminalActivity>('get_terminal_activity', { terminalId }), dispose: async () => {
     if (disposed) return; disposed = true;
-    window.removeEventListener('pandacode-theme-change', refreshTheme); window.removeEventListener('pandacode-palette-change', refreshTheme); window.removeEventListener('pandacode-ui-scale-change', refreshSize); observer.disconnect(); cancelAnimationFrame(resizeFrame); input.dispose(); unlisten(); terminal.dispose(); frame.remove(); await call('close_terminal', { terminalId });
+    window.removeEventListener('pandacode-theme-change', refreshTheme); window.removeEventListener('pandacode-palette-change', refreshTheme); window.removeEventListener('pandacode-ui-scale-change', refreshSize); observer.disconnect(); cancelAnimationFrame(resizeFrame); input.dispose(); unlisten(); stopWatch?.(); stopWatch = undefined; unwatchTransport(); terminal.dispose(); frame.remove();
+    // The console is gone, so a shell that the transport has already dropped is not an error.
+    if (terminalId) await call('close_terminal', { terminalId }).catch(() => undefined);
   } };
 }
 
