@@ -218,8 +218,8 @@ proxy; do not expose the HTTP port itself.
   `<data-dir>/uploads/<uuid>/`, are cleaned up after 24 hours if no message refers
   to them, and at most 7 days even when one does.
 - **Paths.** Serve everything under one host: the SPA, `/rpc`, `/capabilities`,
-  `/events` and `/healthz`. Client routes are answered by `index.html`, so do not
-  rewrite unknown paths to a 404.
+  `/events`, `/upload` and `/healthz`. Client routes are answered by `index.html`,
+  so do not rewrite unknown paths to a 404.
 - **Origin.** When the app is served *by* the gateway it is same-origin and needs
   no flag. A page on another origin calling the API must be named with
   `--allow-origin https://…`, once per origin; the default list is the app's own
