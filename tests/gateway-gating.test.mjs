@@ -4,7 +4,7 @@
 // tests/gateway-e2e.spec.ts; this pins the rule itself.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { GATED, featureServed, serves } from '../src/gateway-gating.ts';
+import { GATED, featureServed, serves, terminalServed, turnServed } from '../src/gateway-gating.ts';
 
 // The M1 table in src-tauri/src/gateway/dispatch.rs. A name added there is not gated
 // here until someone says which surface it makes real, which is the point of the list.
@@ -56,4 +56,29 @@ test('the surfaces this change gated are gated on the command that decides them'
   // A gateway has no `gh` of its own and no pandacode-run.sh to read.
   assert.equal(selector('github_status'), '[data-action="github-view"]');
   assert.equal(selector('get_run_script'), '[data-action="run-project"]');
+});
+
+test('the turn surface needs the capability and the command it would use', () => {
+  const M2 = [...M1, 'send_message', 'start_task', 'stop_session', 'respond_approval'];
+  // The local transports drive turns; a half-connected window does not yet.
+  assert.equal(turnServed(null, null), true);
+  assert.equal(turnServed([], []), false);
+  // The gateway that advertises `turns` and serves the send.
+  assert.equal(turnServed(M2, ['projects', 'sessions', 'turns']), true);
+  // M1: the commands are absent and so is the capability, and either alone is enough
+  // to refuse — a client needs both to be honest about the surface it offers.
+  assert.equal(turnServed(M1, ['projects', 'sessions']), false);
+  assert.equal(turnServed(M2, ['projects', 'sessions']), false, 'turns not advertised');
+  assert.equal(turnServed(M1, ['projects', 'sessions', 'turns']), false, 'send_message not served');
+});
+
+test('a terminal needs its capability and its PTY commands', () => {
+  const terminal = [...M1, 'start_terminal', 'write_terminal', 'resize_terminal', 'close_terminal'];
+  assert.equal(terminalServed(null, null), true);
+  assert.equal(terminalServed(terminal, ['projects', 'sessions', 'terminal']), true);
+  // PAN-110's gateway advertises the capability; a client that only sees the commands
+  // (or only the name) must not offer a drawer that opens nothing.
+  assert.equal(terminalServed(terminal, ['projects', 'sessions']), false);
+  assert.equal(terminalServed(M1, ['projects', 'sessions', 'terminal']), false);
+  assert.equal(terminalServed(terminal, ['projects', 'sessions', 'turns']), false);
 });

@@ -290,7 +290,7 @@ export function mountPromptAttachments(host: AttachmentsHost) {
         const image = item.thumbnail ? `<img src="${escape(item.thumbnail)}" alt="" width="36" height="36">` : `<span class="prompt-chip-placeholder" aria-hidden="true">${icon('attach')}</span>`;
         return `<span class="prompt-chip prompt-chip-image" data-attachment-id="${escape(item.id)}" data-source="${item.source}">${image}<span class="prompt-chip-text"><span class="prompt-chip-name">${escape(item.name)}</span><small>${detail}</small></span>${edit}${remove}</span>`;
       }
-      if (item.kind === 'document') return `<span class="prompt-chip prompt-chip-document" data-attachment-id="${escape(item.id)}" title="${escape(item.path ?? item.name)}">${icon('file')}<span class="prompt-chip-text"><span class="prompt-chip-name">${escape(item.name)}</span><small>${escape(documentLabel(item))}</small></span>${remove}</span>`;
+      if (item.kind === 'document') return `<span class="prompt-chip prompt-chip-document" data-attachment-id="${escape(item.id)}" title="${escape(item.path ?? item.name)}">${icon('file')}<span class="prompt-chip-text"><span class="prompt-chip-name">${escape(item.name)}</span><small>${escape(documentLabel(item))}${item.upload ? ' · on the gateway' : ''}</small></span>${remove}</span>`;
       return `<span class="prompt-chip prompt-chip-folder" data-attachment-id="${escape(item.id)}" title="${escape(item.path)}">${icon('folder')}<span class="prompt-chip-text"><span class="prompt-chip-name">${escape(item.name)}/</span><small>${item.files} ${item.files === 1 ? 'file' : 'files'} · ${item.folders} ${item.folders === 1 ? 'folder' : 'folders'}${item.truncated ? ' · partial' : ''}</small></span>${remove}</span>`;
     }).join('');
   }

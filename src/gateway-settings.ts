@@ -7,7 +7,7 @@
 // transport, because in remote mode that transport is the gateway itself.
 
 import { createGatewayClient, type GatewayClient } from './gateway-client';
-import { GATED, featureServed, serves } from './gateway-gating';
+import { GATED, featureServed, serves, terminalServed, turnServed } from './gateway-gating';
 import { callShell, currentMode, preview, setMode, type Mode } from './bridge';
 import { escape } from './dom';
 
@@ -37,6 +37,16 @@ export function featureEnabled(feature: string): boolean {
   return featureServed(connection ? connection.features : null, feature);
 }
 
+/** Whether this backend can drive an agent turn. The composer is what depends on it. */
+export function turnEnabled(): boolean {
+  return turnServed(connection ? connection.commands : null, connection ? connection.features : null);
+}
+
+/** Whether this backend can open a terminal. */
+export function terminalEnabled(): boolean {
+  return terminalServed(connection ? connection.commands : null, connection ? connection.features : null);
+}
+
 export function gatewayHost(url: string): string {
   try {
     return new URL(url).host || url;
@@ -46,11 +56,14 @@ export function gatewayHost(url: string): string {
 }
 
 /** Hides `selector` wherever `command` is not served, inside `root`. */
-function paint(root: ParentNode, commands: string[] | null): void {
+function paint(root: ParentNode, commands: string[] | null, features: string[] | null): void {
   for (const gated of GATED) {
     const allowed = serves(commands, gated.command);
     for (const element of root.querySelectorAll<HTMLElement>(gated.selector)) element.toggleAttribute('data-gateway-hidden', !allowed);
   }
+  // A capability can be narrower than its commands: a terminal needs both the
+  // `terminal` feature and the PTY commands behind it.
+  for (const element of root.querySelectorAll<HTMLElement>('#terminal-toggle')) element.toggleAttribute('data-gateway-hidden', !terminalServed(commands, features));
 }
 
 /**
@@ -59,8 +72,8 @@ function paint(root: ParentNode, commands: string[] | null): void {
  * platform's own decision (the VM tab is already hidden away from macOS) instead of
  * forcing a surface open. `null` means the local transports, so nothing is hidden.
  */
-export function applyCapabilities(commands: string[] | null): void {
-  paint(document, commands);
+export function applyCapabilities(commands: string[] | null, features: string[] | null = null): void {
+  paint(document, commands, features);
   document.body.classList.toggle('gateway-remote', commands !== null);
 }
 
@@ -70,7 +83,7 @@ export function applyCapabilities(commands: string[] | null): void {
  * reaches them; a surface that mounts later calls this for its own subtree.
  */
 export function syncCapabilities(root: ParentNode = document): void {
-  paint(root, connection ? connection.commands : null);
+  paint(root, connection ? connection.commands : null, connection ? connection.features : null);
 }
 
 /** The header badge: which backend this window talks to, and whether it answers. */
@@ -108,7 +121,7 @@ export async function attachGateway(url: string, token: string): Promise<boolean
     if (!commands) throw 'The gateway did not answer with a command list.';
     const features = Array.isArray(status?.features) ? status.features.filter((feature): feature is string => typeof feature === 'string') : [];
     connection = { url: base, commands, features, reachable: true };
-    applyCapabilities(commands);
+    applyCapabilities(commands, features);
   } catch {
     // Keep the client and the address: the next attempt or the next launch can retry,
     // and the person can still fix the address in Settings.

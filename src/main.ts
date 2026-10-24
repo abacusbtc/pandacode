@@ -65,14 +65,15 @@ import { teamActive, type TeamSnapshot, type TeamEvent, type TeamLibrary, type T
 import type { ArchitectView } from './architect';
 import { syncOverlayContext } from './overlay-client';
 import { initializeAgentUpdates } from './agent-updates';
-import { capabilityEnabled, connectGateway, gatewayStatus, mountGatewaySettings, startGatewaySession } from './gateway-settings';
+import { capabilityEnabled, connectGateway, gatewayStatus, mountGatewaySettings, startGatewaySession, terminalEnabled, turnEnabled } from './gateway-settings';
+import type { MissedFrames } from './gateway-client';
 import { pickRemoteFolder } from './remote-files';
 
 /* Visual thesis: calm surfaces, system typography, yellow selection, and bamboo details.
  * Content: project navigation → conversation → contextual source review.
  * Interaction: quick drawer reveals, calm dialog entrances, coalesced text updates. */
 type WorkspaceView = 'conversation' | 'board' | 'github';
-type LiveTool = { key: string; content: string | ToolActivity; statusOnly?: boolean; commentary?: boolean };
+type LiveTool = { key: string; content: string | ToolActivity; statusOnly?: boolean; commentary?: boolean; denial?: boolean };
 type Stream = { text: string; retainedMessageKey?: string; tools: LiveTool[]; status: string; approvals: Map<string, string>; inputs: Map<string, AgentInput>; revision: number; lastPromptAt?: number; lastResponseAt: number | null; startedAt: number; turnKey: string; omittedActivity: boolean; contextUsage?: ContextUsage };
 const state = {
   projects: [] as Project[], sessions: [] as Session[], providers: [] as Provider[],
@@ -1105,6 +1106,10 @@ function messageHtml(m: Message): string {
   }
   if (m.role === 'status') return renderToolStatus(m.content);
   if (m.role === 'error') return `<div class="message-error">${icon('alert')}<span>${escape(m.content)}</span></div>`;
+  // A prompt nobody answered (PAN-106). The gateway saves the reason as a row so a
+  // client that reconnects — or a person who comes back an hour later — reads a stated
+  // outcome instead of finding the question quietly absent.
+  if (m.role === 'approval_denied') return `<div class="message-denied">${icon('lock')}<span>${escape(m.content)}</span></div>`;
   const isUser = m.role === 'user';
   const author = historicalProvider(m, state.messages, session()?.provider ?? state.defaultProvider);
   return `<article class="message ${isUser ? 'user-message' : 'agent-message'}" data-message-id="${m.id}"><div class="message-meta"><span class="message-avatar ${isUser ? 'user-avatar' : ''}">${isUser ? 'Y' : providerLogo(author)}</span><strong>${isUser ? 'You' : escape(provider(author)?.name || 'Agent')}</strong><time>${formatTime(m.createdAt)}</time></div><div class="message-content ${isUser ? '' : 'markdown'}" ${isUser ? '' : `data-markdown="${m.id}"`}>${isUser ? userContent(m.content) : escape(m.content)}</div>${messageActionsHtml(m.sessionId, m.id, m.id > 0 && (isUser || m.role === 'assistant'))}</article>`;
@@ -1171,7 +1176,9 @@ function renderStream(): void {
   region.querySelector<HTMLElement>('.turn-activity-label')!.textContent = finishing ? `Worked for ${formatDuration(finishing.finishedAt - current.startedAt)}` : workingLabel(current);
   if (region.dataset.revision !== String(current.revision)) {
     paintLiveActivity(region, current, transcript);
-    region.querySelector('.live-errors')!.innerHTML = current.tools.filter(tool => tool.statusOnly).map(tool => `<div class="message-error">${icon('alert')}<span>${escape(tool.content as string)}</span></div>`).join('') + (finishing?.error ? `<div class="message-error" role="alert"><span>Couldn't load the saved response. ${escape(finishing.error)}</span><button class="secondary-button" data-action="retry-response">Retry loading response</button></div>` : '');
+    region.querySelector('.live-errors')!.innerHTML = current.tools.filter(tool => tool.statusOnly).map(tool => tool.denial
+      ? `<div class="message-denied">${icon('lock')}<span>${escape(tool.content as string)}</span></div>`
+      : `<div class="message-error">${icon('alert')}<span>${escape(tool.content as string)}</span></div>`).join('') + (finishing?.error ? `<div class="message-error" role="alert"><span>Couldn't load the saved response. ${escape(finishing.error)}</span><button class="secondary-button" data-action="retry-response">Retry loading response</button></div>` : '');
     // Approvals live in the bar above the prompt, not in the transcript.
     region.querySelector('.live-approvals')!.innerHTML = '';
     renderApprovalBar();
@@ -1305,7 +1312,21 @@ async function respondApproval(sessionId: string, id: string, approved: boolean)
     await call('respond_approval', { sessionId, requestId: id, approved });
     current.approvals.delete(id); approvalDetails.delete(approvalKey); current.revision++;
     if (!current.approvals.size && current.status === 'Waiting for approval') current.status = 'Continuing task';
+  } catch (error) {
+    // The answer did not land, so the prompt stays: reporting the failure and keeping
+    // it is the honest pair. An old gateway that does not serve this says so in words.
+    throw explainCommandError('respond_approval', error);
   } finally { pendingApprovals.delete(approvalKey); current.revision++; renderStream(); renderNavigation(); renderApprovalBar(); }
+}
+/**
+ * A command the backend does not serve, said in the person's terms rather than the
+ * wire's. Every path that can meet an M1-era gateway goes through this, so the failure
+ * names what is missing instead of leaving `unsupported_command: ...` as the message.
+ */
+function explainCommandError(command: string, error: unknown): unknown {
+  const text = errorText(error);
+  if (!text.includes('unsupported_command')) return error;
+  return new Error(`This gateway does not serve ${command}, so that action cannot run there. Update the gateway, or disconnect in Settings to use this computer.`);
 }
 function renderComposer(): void {
   refreshTeamProgress();
@@ -1322,6 +1343,13 @@ function renderComposer(): void {
   if (!s) { $('#composer-area').innerHTML = ''; browserPanel?.refresh(); return; }
   syncOverlayContext({ projectId: s.projectId, provider: s.provider, model: s.model || 'default', mode: s.mode, reasoningEffort: s.reasoningEffort ?? null });
   if (taskStage(s) === 'completed' || s.archived) { $('#composer-area').innerHTML = `<div class="board-completed-note">${s.archived ? 'This task is archived.' : 'This task is complete.'}${state.view === 'conversation' ? `<button type="button" class="secondary-button" data-action="${s.archived ? 'archive-task' : 'board-reopen'}">${s.archived ? 'Restore task' : 'Reopen task'}</button>` : s.archived ? '' : ' Reopen it above to continue.'}</div>`; browserPanel?.refresh(); return; }
+  if (!turnEnabled()) {
+    // A backend that cannot drive a turn must not offer a prompt that fails on Enter,
+    // and must not look like a prompt that was refused either: it says what is missing
+    // and where to change it. This is the M1 gateway talking to an M2 client.
+    $('#composer-area').innerHTML = '<div class="board-completed-note">This gateway cannot run agent turns. Update the gateway, or open Settings to disconnect and use this computer.<button type="button" class="secondary-button" data-action="settings">Open Settings</button></div>';
+    browserPanel?.refresh(); return;
+  }
   const previous = state.drafts.get(s.id) ?? '';
   const running = isRunning(), behavior = approvalMode(s.provider, s.mode);
   const team = teams.get(s.id), modelLocked = running && !team;
@@ -1631,6 +1659,23 @@ function setMessagePage(page: MessagePage): void {
   if (!earlier.length) state.hasOlder = page.hasOlder;
 }
 
+/**
+ * Replaces the open task's transcript with the backend's own copy: `get_messages` is
+ * the authority the live stream is only a faster view of.
+ *
+ * Used wherever the stream is known to have missed something — an announced hole, or a
+ * denial that happened while this window was not watching — so the screen cannot end up
+ * disagreeing with what a reload would show.
+ */
+async function reloadTranscript(sessionId: string): Promise<boolean> {
+  if (state.sessionId !== sessionId) return false;
+  const generation = state.generation;
+  const page = await latestMessagePage(sessionId);
+  if (state.sessionId !== sessionId || generation !== state.generation) return false;
+  setMessagePage(page);
+  renderTranscript();
+  return true;
+}
 async function latestMessagePage(sessionId: string): Promise<MessagePage> {
   const generation = state.generation;
   const knownId = sessionId === state.sessionId ? [...state.messages].reverse().find(message => message.id > 0)?.id : undefined;
@@ -2059,7 +2104,7 @@ async function deliverQueued(task: Session, entry: QueuedMessage): Promise<void>
       else notify('A queued message could not be put back; it was not sent.');
     }
     state.queueHolds.set(task.id, 'failed');
-    throw error;
+    throw explainCommandError('send_message', error);
   }
 }
 let limitTimer = 0;
@@ -2101,6 +2146,9 @@ async function limitAction(action: string, element: HTMLElement): Promise<void> 
 async function send(): Promise<void> {
   const draft = document.querySelector<HTMLTextAreaElement>('#prompt')?.value ?? ''; const text = draft.trim(); const s = session();
   if (!text || !s || s.archived || taskStage(s) === 'completed' || isRunning() || finishingStreams.has(s.id) || state.messagesLoading || state.messagesError || configuringSessions.has(s.id)) return;
+  // The composer is not even drawn without this, so reaching here means the connection
+  // changed under it. Refusing with the reason beats a send the gateway will not serve.
+  if (!turnEnabled()) throw new Error('This gateway cannot run agent turns. Update the gateway, or disconnect in Settings to use this computer.');
   // Preparing attachments or awaiting admission blocks only this task.
   configuringSessions.add(s.id);
   const filePaths = [...state.attachments], browserItems = state.browserAttachments.get(s.id) ?? [];
@@ -2195,7 +2243,7 @@ async function send(): Promise<void> {
       const saved = await latestMessagePage(s.id);
       if (isCurrent() && generation === state.generation) { setMessagePage(saved); state.messagesLoading = false; render(); }
     }
-    throw error;
+    throw explainCommandError('send_message', error);
   } finally { pendingPromptActivity.delete(s.id); configuringSessions.delete(s.id); }
 }
 async function finishResponse(sessionId: string, finishing: FinishingStream): Promise<void> {
@@ -2227,7 +2275,7 @@ function completeTurnChanges(event: AgentEvent): void {
     const messages = visibleMessages();
     // Materialize only at a turn boundary; tokens keep their existing incremental path.
     if (current) {
-      for (const entry of current.tools) messages.push({ id: transientId--, sessionId: event.sessionId, role: entry.commentary ? 'assistant' : entry.statusOnly ? 'error' : 'tool', content: entry.key === current.retainedMessageKey ? current.text : typeof entry.content === 'string' ? entry.content : JSON.stringify({ type: 'tool_activity', version: 1, ...entry.content }), createdAt: Date.now() });
+      for (const entry of current.tools) messages.push({ id: transientId--, sessionId: event.sessionId, role: entry.denial ? 'approval_denied' : entry.commentary ? 'assistant' : entry.statusOnly ? 'error' : 'tool', content: entry.key === current.retainedMessageKey ? current.text : typeof entry.content === 'string' ? entry.content : JSON.stringify({ type: 'tool_activity', version: 1, ...entry.content }), createdAt: Date.now() });
       if (current.text && !current.tools.some(entry => entry.key === current.retainedMessageKey)) messages.push({ id: transientId--, sessionId: event.sessionId, role: 'assistant', content: current.text, createdAt: Date.now() });
     }
     messages.push({ id: transientId--, sessionId: event.sessionId, role: 'changes', content: '', createdAt: Date.now(), turnChanges: data.turnChanges });
@@ -2245,7 +2293,80 @@ function completeTurnChanges(event: AgentEvent): void {
     }).catch(report);
   }
 }
+/**
+ * What to do when the gateway says the live stream lost a range of frames.
+ *
+ * The gateway's ring drops the oldest frames for a socket that fell behind and
+ * announces the hole rather than sending a silently discontinuous stream (PAN-105).
+ * A frontend that ignores it keeps a permanently wrong transcript: missing text, and a
+ * turn whose `done` frame was in the hole stays "Generating" forever. So the announced
+ * hole is repaired from the two authorities that exist — `get_messages` for what was
+ * saved, and `gateway_live_tasks` for whether the turn is still running at all.
+ */
+const GAP_NOTE = 'Part of this response arrived while the connection was behind and could not be delivered. The transcript reloads when the turn ends.';
+let lagNotes = 0;
+/** One recovery is the answer to any number of holes announced together. */
+let lagRecovery: Promise<void> | null = null;
+/** A malformed frame is said out loud once, not once per frame. */
+let driftWarned = false;
+
+function lostLabel(missed?: MissedFrames): string {
+  return missed && Number.isFinite(missed.fromSeq) && Number.isFinite(missed.toSeq)
+    ? `${missed.toSeq - missed.fromSeq + 1} frame${missed.toSeq === missed.fromSeq ? '' : 's'} (${missed.fromSeq}–${missed.toSeq})`
+    : 'part of the live stream';
+}
+
+function recoverFromLag(missed?: MissedFrames): Promise<void> {
+  if (lagRecovery) return lagRecovery;
+  lagRecovery = (async () => {
+    notify(`The connection fell behind and lost ${lostLabel(missed)}. Reloading from the saved transcript.`);
+    // Rows alone cannot prove a turn is over, and a turn that ended while this socket
+    // was behind will never send its `done`: the gateway's own registry can.
+    const live = await call<{ sessionId: string }[]>('gateway_live_tasks')
+      .then(tasks => new Set(tasks.map(task => task.sessionId)))
+      .catch(() => null);
+    let finishedOpen = false;
+    for (const [id, current] of [...state.streams]) {
+      if (live && !live.has(id)) {
+        // The turn is over. Finish it from what was saved instead of leaving a stream
+        // that says "Generating" until the tab is closed.
+        state.streams.delete(id);
+        const task = state.sessions.find(item => item.id === id); if (task) task.status = 'idle';
+        const finishing = { stream: current, finishedAt: Date.now() };
+        finishingStreams.set(id, finishing);
+        await finishResponse(id, finishing);
+        if (id === state.sessionId) finishedOpen = true;
+        continue;
+      }
+      // Still running: text that was in the hole is not in a transcript that has not
+      // been written yet, so it cannot be recovered here. Drop the fragment and say so
+      // rather than leaving a sentence that is quietly missing its middle. Tools and
+      // approvals are full snapshots, so the next one restores those intact.
+      current.text = '';
+      current.tools.push({ key: 'gap:' + (++lagNotes), content: GAP_NOTE, statusOnly: true });
+      current.revision++;
+      if (id === state.sessionId) renderStream();
+    }
+    await reloadSessions();
+    if (!finishedOpen && state.sessionId) await reloadTranscript(state.sessionId).catch(() => false);
+    if (state.sessionId && state.streams.has(state.sessionId)) renderStream();
+    renderNavigation(); renderComposer();
+  })().finally(() => { lagRecovery = null; });
+  return lagRecovery;
+}
+
 function onAgent(event: AgentEvent): void {
+  // A frame one field off from the desktop's used to stop the stream with no error at
+  // all — the whole class of "payload drift" failures looks like silence. Say it once
+  // and keep going; the next frame that does fit still renders.
+  if (!event || typeof event.kind !== 'string' || typeof event.sessionId !== 'string') {
+    if (!driftWarned) {
+      driftWarned = true;
+      notify('The gateway sent an event this version does not understand. Update PandaCode and the gateway so they match.');
+      console.warn('Ignoring a malformed agent event', event);
+    }
+    return;
+  }
   if (botsView) queueMicrotask(() => botsView?.agent(event.sessionId, event.kind));
   if ((event.kind === 'done' || event.kind === 'turn_start') && botForThread()) queueMicrotask(renderHeader);
   if (deletedSessions.has(event.sessionId)) return;
@@ -2283,6 +2404,28 @@ function onAgent(event: AgentEvent): void {
       const current = state.streams.get(s.id); if (current) current.contextUsage = usage;
       if (s.id === state.sessionId) renderContextUsage();
     }
+    return;
+  }
+  if (event.kind === 'approval_denied') {
+    // A question nobody answered was denied on the turn, and the gateway wrote down
+    // why (PAN-106). It must not vanish: a prompt that silently disappears is
+    // indistinguishable from one that was answered, and the person who stepped away
+    // comes back to an absence. So it becomes a stated outcome here, in the stream if
+    // one is open and in the transcript either way — the denial is a saved row too.
+    const current = state.streams.get(event.sessionId);
+    if (event.requestId) current?.approvals.delete(event.requestId);
+    const sentence = event.text?.trim() || 'It was denied because nobody answered in time.';
+    if (current) {
+      current.tools.push({ key: 'denied:' + (event.requestId ?? transientId--), content: `Approval denied. ${sentence}`, statusOnly: true, denial: true });
+      if (!current.approvals.size && current.status === 'Waiting for approval') updateStreamStatus(current, 'Continuing task');
+      current.revision++;
+      if (event.sessionId === state.sessionId) { renderStream(); renderApprovalBar(); }
+    }
+    // The live stream is not the only place it exists: reload so the saved denial row
+    // is what a reopened task shows.
+    if (event.sessionId === state.sessionId) void reloadTranscript(event.sessionId).catch(report);
+    notify(`${s?.title ?? 'Task'}: ${sentence}`);
+    scheduleNavigation();
     return;
   }
   if (event.kind === 'done') {
@@ -3311,6 +3454,10 @@ async function openBot(botId: string): Promise<void> {
   await selectSession(id, true);
 }
 async function showAgentUsage(): Promise<void> {
+  // Usage is read from this machine's own ledger and harness files; a gateway process
+  // has neither (agent_usage.rs:524-526, usage_ledger.rs:334-336), so it is not served
+  // there and saying so is better than an empty panel that looks like zero usage.
+  if (!capabilityEnabled('agent_usage')) { notify('This gateway does not report agent usage. Disconnect in Settings to read it from this computer.'); return; }
   const dialog = modal('Agent usage', '<div id="agent-usage-host"><p role="status">Loading usage panel…</p></div>', 'agent-usage-dialog');
   const host = dialog.querySelector<HTMLElement>('#agent-usage-host')!;
   try {
@@ -3328,13 +3475,16 @@ function showCommands(): void {
   modal('Go to anything', `<div class="command-search">${icon('search')}<input id="command-query" aria-label="Search tasks and commands" placeholder="Search tasks and commands…" autocomplete="off"></div><div id="command-results" class="command-results"></div><div class="command-footer"><span>↑ ↓ to navigate</span><span>↵ to open</span><span>esc to close</span></div>`, 'command-dialog'); renderCommands('');
 }
 function renderCommands(query: string): void {
-  const commands = [{ action: 'new-task', label: 'New task', icon: 'plus', shortcut: shortcut('N') }, { action: 'add-project', label: 'Open project', icon: 'folder', shortcut: '' }, { action: 'browser', label: 'Open browser', icon: 'globe', shortcut: '' }, { action: 'terminal', label: 'Toggle terminal', icon: 'terminal', shortcut: shortcut('J') }, { action: 'settings', label: 'Settings', icon: 'settings', shortcut: shortcut(',') }, { action: 'agent-usage', label: 'Agent usage', icon: 'activity', shortcut: '' }, { action: 'bots', label: 'Bots', icon: 'bot', shortcut: '' }, { action: 'import-conversations', label: 'Import conversations', icon: 'download', shortcut: '' }, { action: 'worktree', label: 'Create worktree', icon: 'branch', shortcut: '' }, ...(githubEnabled() ? [{ action: 'github-view', label: 'GitHub', icon: 'github', shortcut: '' }] : [])].filter(c => c.label.toLowerCase().includes(query.toLowerCase()));
+  const commands = [{ action: 'new-task', label: 'New task', icon: 'plus', shortcut: shortcut('N') }, { action: 'add-project', label: 'Open project', icon: 'folder', shortcut: '' }, { action: 'browser', label: 'Open browser', icon: 'globe', shortcut: '' }, ...(terminalEnabled() ? [{ action: 'terminal', label: 'Toggle terminal', icon: 'terminal', shortcut: shortcut('J') }] : []), { action: 'settings', label: 'Settings', icon: 'settings', shortcut: shortcut(',') }, ...(capabilityEnabled('agent_usage') ? [{ action: 'agent-usage', label: 'Agent usage', icon: 'activity', shortcut: '' }] : []), { action: 'bots', label: 'Bots', icon: 'bot', shortcut: '' }, { action: 'import-conversations', label: 'Import conversations', icon: 'download', shortcut: '' }, { action: 'worktree', label: 'Create worktree', icon: 'branch', shortcut: '' }, ...(githubEnabled() ? [{ action: 'github-view', label: 'GitHub', icon: 'github', shortcut: '' }] : [])].filter(c => c.label.toLowerCase().includes(query.toLowerCase()));
   const tasks = listedSessions().filter(s => s.title.toLowerCase().includes(query.toLowerCase())).slice(0, 12);
   $('#command-results').innerHTML = `${commands.length ? '<div class="command-section">Commands</div>' : ''}${commands.map(c => `<button data-action="${c.action}" data-command="true">${icon(c.icon)}<span>${c.label}</span><kbd>${c.shortcut}</kbd></button>`).join('')}${tasks.length ? '<div class="command-section">Tasks</div>' : ''}${tasks.map(s => `<button data-action="select-task" data-id="${escape(s.id)}" data-command="true">${providerLogo(s.provider)}<span>${escape(s.title)}<small>${escape(state.projects.find(p => p.id === s.projectId)?.name)} · ${shortProvider(s.provider)}</small></span></button>`).join('')}${!commands.length && !tasks.length ? '<div class="inspector-empty">No matching tasks or commands.</div>' : ''}`;
   $('#command-results').querySelector('button')?.classList.add('command-selected');
 }
 async function toggleTerminal(): Promise<void> {
   if (!project()) { notify('Open a project before starting a terminal.'); return; }
+  // A gateway that advertises no `terminal` capability has no PTY to give: say so
+  // rather than opening a drawer over a shell that will fail to start.
+  if (!terminalEnabled()) { notify('This gateway does not serve a terminal. Disconnect in Settings to use this computer’s terminal.'); return; }
   await terminalPanel.toggle();
 }
 
@@ -3578,6 +3728,9 @@ async function boot(): Promise<void> {
     return;
   }
   await subscribe('agent-event', onAgent);
+  // A hole in the numbered stream is announced, never silent: repair it from the
+  // transcript and from what the gateway says is still running.
+  await subscribe('lagged', missed => run(recoverFromLag(missed).catch(report)));
   await subscribe('provider-models-changed', event => invalidateModels(event.provider));
   await subscribe('architect-event', onArchitect);
   window.addEventListener(TEAM_MODE_EVENT, () => { if (session()) renderComposer(); });
