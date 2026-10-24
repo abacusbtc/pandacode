@@ -1,3 +1,4 @@
+use crate::events::{payload_value, Emitter};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use serde::Serialize;
 #[cfg(unix)]
@@ -12,7 +13,6 @@ use std::{
         Arc, Mutex,
     },
 };
-use tauri::AppHandle;
 
 // Linux can keep a blocking PTY write asleep after its child exits. The writer
 // must observe close independently, and its destructor must never send input.
@@ -101,6 +101,11 @@ pub struct Terminal {
     closed: Arc<AtomicBool>,
     harness_session: Option<String>,
     run_script: bool,
+    /// Why this process decided to end the shell, when it decided: the reader's
+    /// final frame is the only exit a client sees, so the reason rides with it.
+    /// Only the gateway's idle rule sets one today.
+    #[cfg_attr(not(feature = "gateway"), allow(dead_code))]
+    close_reason: Arc<Mutex<Option<&'static str>>>,
 }
 impl Drop for Terminal {
     fn drop(&mut self) {
@@ -118,14 +123,23 @@ impl Drop for Terminal {
             crate::providers::kill_group(pid);
         }
         #[cfg(unix)]
-        unsafe {
-            // Shells may ignore HUP, and foreground jobs have a separate process group.
-            if let Some(group) = self.master.process_group_leader().filter(|pid| *pid > 1) {
-                libc::kill(-group, libc::SIGKILL);
-            }
+        {
+            // Jobs in their own process group first, while the shell is still their
+            // parent: an interactive shell gives a background job its own group, so
+            // killing the shell's group alone leaves that job orphaned and holding the
+            // PTY (PAN-110, Review Focus 3).
             if let Some(pid) = self.shell_pid.filter(|pid| *pid > 1) {
-                libc::kill(-(pid as i32), libc::SIGKILL);
-                libc::kill(pid as i32, libc::SIGKILL);
+                kill_descendants(pid);
+            }
+            unsafe {
+                // Shells may ignore HUP, and foreground jobs have a separate process group.
+                if let Some(group) = self.master.process_group_leader().filter(|pid| *pid > 1) {
+                    libc::kill(-group, libc::SIGKILL);
+                }
+                if let Some(pid) = self.shell_pid.filter(|pid| *pid > 1) {
+                    libc::kill(-(pid as i32), libc::SIGKILL);
+                    libc::kill(pid as i32, libc::SIGKILL);
+                }
             }
         }
         #[cfg(not(unix))]
@@ -139,10 +153,14 @@ struct TerminalEvent {
     terminal_id: String,
     data: String,
     exit: bool,
+    /// Why it ended, when the end was this process's decision rather than the
+    /// shell's: `idle` is the gateway closing a shell nobody was watching.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
 }
 
 pub fn start(
-    app: AppHandle,
+    events: Arc<dyn Emitter>,
     terms: Terminals,
     root: &Path,
     cols: u16,
@@ -153,18 +171,18 @@ pub fn start(
         &|name| std::env::var_os(name),
         &crate::providers::executable,
     );
-    start_command(app, terms, root, size(cols, rows), cmd, None, false)
+    start_command(events, terms, root, size(cols, rows), cmd, None, false)
 }
 
 pub fn start_script(
-    app: AppHandle,
+    events: Arc<dyn Emitter>,
     terms: Terminals,
     root: &Path,
     cols: u16,
     rows: u16,
 ) -> Result<String, String> {
     let cmd = crate::run_script::command(root)?;
-    start_command(app, terms, root, size(cols, rows), cmd, None, true)
+    start_command(events, terms, root, size(cols, rows), cmd, None, true)
 }
 
 fn shell_command(
@@ -215,7 +233,7 @@ pub struct HarnessContext<'a> {
 }
 
 pub fn start_harness(
-    app: AppHandle,
+    events: Arc<dyn Emitter>,
     terms: Terminals,
     root: &Path,
     context: HarnessContext<'_>,
@@ -224,7 +242,7 @@ pub fn start_harness(
 ) -> Result<String, String> {
     let cmd = harness_command(&context)?;
     start_command(
-        app,
+        events,
         terms,
         root,
         size(cols, rows),
@@ -415,9 +433,23 @@ pub fn harness_running(terms: &Terminals, session_id: &str) -> Result<bool, Stri
 #[derive(Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalActivity {
+    /// Whether a *job* is running in the shell, not whether the shell exists: an
+    /// idle prompt with nothing running answers `false`, which is what the desktop's
+    /// "a command is still running" warning needs.
     pub running: bool,
     pub process_names: Vec<String>,
     pub uncertain: bool,
+    /// The shell's own process, so a caller can name or watch it — and so a test can
+    /// prove a closed terminal took its process group with it (PAN-110).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+}
+
+impl TerminalActivity {
+    fn with_pid(mut self, pid: Option<u32>) -> Self {
+        self.pid = pid;
+        self
+    }
 }
 
 #[derive(Debug)]
@@ -465,6 +497,7 @@ pub fn activity(terms: &Terminals, id: &str) -> Result<TerminalActivity, String>
             running: true,
             process_names: vec![shell_name],
             uncertain: false,
+            pid,
         });
     }
     let result = pid
@@ -476,7 +509,8 @@ pub fn activity(terms: &Terminals, id: &str) -> Result<TerminalActivity, String>
         .unwrap_or(TerminalActivity {
             uncertain: true,
             ..TerminalActivity::default()
-        });
+        })
+        .with_pid(pid);
     // The terminal may have exited or been closed while the snapshot was taken.
     Ok(if closed.load(Ordering::SeqCst) {
         TerminalActivity::default()
@@ -525,6 +559,7 @@ fn activity_from_processes(
         running: !names.is_empty(),
         process_names: names.into_iter().take(8).collect(),
         uncertain: false,
+        pid: Some(pid),
     }
 }
 
@@ -644,7 +679,7 @@ fn check_start<'a>(
 }
 
 fn start_command(
-    app: AppHandle,
+    events: Arc<dyn Emitter>,
     terms: Terminals,
     root: &Path,
     pty_size: PtySize,
@@ -683,6 +718,7 @@ fn start_command(
     #[cfg(not(unix))]
     let mut reader = pty.master.try_clone_reader().map_err(|e| e.to_string())?;
     let closed = Arc::new(AtomicBool::new(false));
+    let close_reason: Arc<Mutex<Option<&'static str>>> = Arc::new(Mutex::new(None));
     #[cfg(target_os = "linux")]
     let writer: Box<dyn Write + Send> =
         Box::new(LinuxPtyWriter::new(pty.master.as_ref(), closed.clone())?);
@@ -718,6 +754,7 @@ fn start_command(
             closed,
             harness_session,
             run_script,
+            close_reason: close_reason.clone(),
         },
     );
     drop(registry);
@@ -778,25 +815,27 @@ fn start_command(
                     if valid > 0 {
                         let data = String::from_utf8_lossy(&pending[..valid]).to_string();
                         pending.drain(..valid);
-                        let _ = crate::events::emit(&app, 
+                        let _ = events.emit(
                             "terminal-event",
-                            TerminalEvent {
+                            payload_value(TerminalEvent {
                                 terminal_id: tid.clone(),
                                 data,
                                 exit: false,
-                            },
+                                reason: None,
+                            }),
                         );
                     }
                     if pending.len() > 4 {
                         let data = String::from_utf8_lossy(&pending).to_string();
                         pending.clear();
-                        let _ = crate::events::emit(&app, 
+                        let _ = events.emit(
                             "terminal-event",
-                            TerminalEvent {
+                            payload_value(TerminalEvent {
                                 terminal_id: tid.clone(),
                                 data,
                                 exit: false,
-                            },
+                                reason: None,
+                            }),
                         );
                     }
                 }
@@ -808,13 +847,18 @@ fn start_command(
         reader_closed.store(true, Ordering::SeqCst);
         let terminal = registry.lock().ok().and_then(|mut m| m.remove(&tid));
         drop(terminal);
-        let _ = crate::events::emit(&app, 
+        let reason = close_reason
+            .lock()
+            .ok()
+            .and_then(|mut reason| reason.take());
+        let _ = events.emit(
             "terminal-event",
-            TerminalEvent {
+            payload_value(TerminalEvent {
                 terminal_id: tid,
                 data: String::new(),
                 exit: true,
-            },
+                reason,
+            }),
         );
     });
     Ok(id)
@@ -850,8 +894,54 @@ pub fn resize(terms: &Terminals, id: &str, cols: u16, rows: u16) -> Result<(), S
         .resize(size(cols, rows))
         .map_err(|e| e.to_string())
 }
+/// Every process below `root`, killed. One snapshot, deepest last, so a job that
+/// forked its own children cannot outlive the terminal that owned them.
+#[cfg(unix)]
+fn kill_descendants(root: u32) {
+    let Ok(processes) = process_snapshot() else {
+        return;
+    };
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    for process in &processes {
+        children.entry(process.parent).or_default().push(process.pid);
+    }
+    let mut pending = vec![root];
+    let mut seen = HashSet::new();
+    while let Some(parent) = pending.pop() {
+        for child in children.get(&parent).cloned().unwrap_or_default() {
+            if !seen.insert(child) {
+                continue;
+            }
+            pending.push(child);
+            // A negative pid would signal a group, and pid 0/1 are not ours to signal.
+            if child > 1 {
+                unsafe {
+                    libc::kill(child as i32, libc::SIGKILL);
+                }
+            }
+        }
+    }
+}
+
 pub fn close(terms: &Terminals, id: &str) -> Result<(), String> {
     let terminal = terms.lock().map_err(|e| e.to_string())?.remove(id);
+    drop(terminal);
+    Ok(())
+}
+
+/// Closes a shell this process decided to end, so the client is told why instead of
+/// watching a shell vanish. The reason rides out on the reader's own exit frame.
+#[cfg_attr(not(feature = "gateway"), allow(dead_code))]
+pub fn close_because(terms: &Terminals, id: &str, reason: &'static str) -> Result<(), String> {
+    let terminal = {
+        let mut terms = terms.lock().map_err(|e| e.to_string())?;
+        if let Some(terminal) = terms.get(id) {
+            if let Ok(mut slot) = terminal.close_reason.lock() {
+                *slot = Some(reason);
+            }
+        }
+        terms.remove(id)
+    };
     drop(terminal);
     Ok(())
 }
@@ -1084,6 +1174,7 @@ mod tests {
                 closed,
                 harness_session: None,
                 run_script: false,
+                close_reason: Arc::new(Mutex::new(None)),
             },
         )])));
         ready_rx

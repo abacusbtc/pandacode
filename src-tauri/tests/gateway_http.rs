@@ -30,6 +30,7 @@ fn test_config(data_dir: &Path, bind: &str) -> GatewayConfig {
         static_dir: None,
         allowed_origins: config::default_origins(),
         upload_max: config::DEFAULT_UPLOAD_MAX,
+        terminal_idle: config::DEFAULT_TERMINAL_IDLE,
         force_owner: false,
         approval_ttl: Some(config::DEFAULT_APPROVAL_TTL),
     }
@@ -1844,4 +1845,485 @@ async fn a_two_hundred_mebibyte_upload_does_not_become_two_hundred_mebibytes_of_
     );
     let _ = child.kill();
     let _ = child.wait();
+}
+
+// ---- terminals over the socket (M2 task 9, PAN-110) ------------------------
+//
+// A shell is a real PTY in this process, so these tests type into a real shell and
+// read what comes back off the socket. The shell's cwd is the temp data directory,
+// so nothing escapes into the owner's session.
+//
+// Two habits make these honest: a socket is subscribed **before** the command is
+// typed (a fresh socket without `since` sees only what happens after it connects),
+// and every expected string is a value the shell computes, never the text of the
+// command — the PTY echoes what was typed, so a marker written literally would
+// satisfy a naive check before the shell had run anything.
+
+/// One terminal test at a time. They spawn real shells and one of them measures this
+/// process's own descriptors, so running them beside each other would measure the
+/// neighbours as much as the test.
+async fn terminal_guard() -> tokio::sync::OwnedSemaphorePermit {
+    static SLOTS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    let slots = SLOTS.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(1)));
+    slots
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("the terminal slot is never closed")
+}
+
+/// A project and a shell in it, over the gateway.
+async fn start_shell(handle: &GatewayHandle, dir: &Path) -> (String, String) {
+    let (project, _session) = a_task(handle, dir).await;
+    let id = call(
+        handle,
+        "start_terminal",
+        json!({ "projectId": project, "cols": 100, "rows": 30 }),
+    )
+    .await;
+    (project, id.as_str().unwrap().to_owned())
+}
+
+/// Every frame on this socket until `done` says stop. A shell's own startup reads
+/// the machine's profile, so a loaded host can take a while before the first byte.
+async fn frames_until(socket: &mut Socket, mut done: impl FnMut(&[Value]) -> bool) -> Vec<Value> {
+    let mut frames = Vec::new();
+    loop {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(90), socket.next())
+            .await
+            .expect("a terminal frame arrived")
+            .expect("the terminal socket stayed open")
+            .expect("the frame was a message");
+        frames.push(serde_json::from_str(frame.to_text().unwrap()).unwrap());
+        if done(&frames) {
+            return frames;
+        }
+    }
+}
+
+/// The terminal output in these frames, concatenated.
+fn terminal_text(frames: &[Value]) -> String {
+    frames
+        .iter()
+        .filter(|frame| frame["event"] == "terminal-event")
+        .filter(|frame| frame["payload"]["exit"] == false)
+        .filter_map(|frame| frame["payload"]["data"].as_str())
+        .collect::<String>()
+}
+
+fn terminal_seqs(frames: &[Value]) -> Vec<u64> {
+    frames.iter().filter_map(|frame| frame["seq"].as_u64()).collect()
+}
+
+/// Waits until the terminal's scrollback contains `marker`, by asking for the replay
+/// again each time. A live socket can be outrun by a flood (the subscriber queue
+/// lags and the frame that carried the marker is dropped), while a fresh socket
+/// always gets what the ring still holds.
+async fn wait_for_replay(handle: &GatewayHandle, id: &str, marker: &str) -> Vec<Value> {
+    for _ in 0..60 {
+        let mut socket = events_socket(handle.addr, &format!("&terminal={id}&since=0")).await;
+        let mut frames = Vec::new();
+        // The ring is drained for now: the shell may still be printing.
+        while let Ok(Some(Ok(message))) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), socket.next()).await
+        {
+            frames.push(serde_json::from_str(message.to_text().unwrap()).unwrap());
+            if terminal_text(&frames).contains(marker) {
+                return frames;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+    panic!("the shell never printed {marker:?} into its ring");
+}
+
+/// Types one line into the shell and returns everything printed until `expect`
+/// shows up. `expect` must be a value the shell computes.
+async fn run_command(
+    handle: &GatewayHandle,
+    socket: &mut Socket,
+    id: &str,
+    command: &str,
+    expect: &str,
+) -> String {
+    call(
+        handle,
+        "write_terminal",
+        json!({ "terminalId": id, "data": format!("{command}\n") }),
+    )
+    .await;
+    let frames = frames_until(socket, |frames| terminal_text(frames).contains(expect)).await;
+    terminal_text(&frames)
+}
+
+#[cfg(target_os = "linux")]
+fn running(pid: u32) -> bool {
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// A child of `parent`, retried for a moment because a fork is not instantaneous.
+#[cfg(target_os = "linux")]
+fn child_of(parent: u32) -> u32 {
+    for _ in 0..40 {
+        if let Ok(output) = std::process::Command::new("ps")
+            .args(["-o", "pid=", "--ppid", &parent.to_string()])
+            .output()
+        {
+            if let Some(pid) = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .find_map(|line| line.trim().parse::<u32>().ok())
+            {
+                return pid;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    panic!("no child process for {parent}");
+}
+
+#[tokio::test]
+async fn a_reconnect_replays_the_tail_of_the_scrollback_in_order() {
+    let _serial = terminal_guard().await;
+    install_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = start(dir.path()).await;
+    let (_project, id) = start_shell(&handle, dir.path()).await;
+
+    // A non-repeating sequence, long enough to be many PTY reads. The last number
+    // is multiplied so the echo of the command cannot satisfy the wait.
+    call(
+        &handle,
+        "write_terminal",
+        json!({
+            "terminalId": id,
+            "data": "i=1; while [ $i -le 400 ]; do echo \"line $i\"; i=$((i+1)); done; echo \"tail $((200*2))\"\n"
+        }),
+    )
+    .await;
+
+    // Reconnect from the beginning: the ring's tail, in order, no duplicates.
+    let frames = wait_for_replay(&handle, &id, "tail 400").await;
+    let text = terminal_text(&frames);
+    let mut last = 0u32;
+    let mut seen = 0;
+    for line in text.lines() {
+        let Some(number) = line
+            .trim()
+            .strip_prefix("line ")
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        assert!(
+            last == 0 || number == last + 1,
+            "the replay reordered or skipped: {number} after {last}"
+        );
+        last = number;
+        seen += 1;
+    }
+    assert!(seen > 1, "the replay carried the scrollback: {text:?}");
+    assert_eq!(last, 400, "the tail ends where the shell stopped");
+    let seqs = terminal_seqs(&frames);
+    assert!(
+        seqs.windows(2).all(|pair| pair[0] < pair[1]),
+        "frames arrive in one increasing order: {seqs:?}"
+    );
+
+    // And a resume from a number inside the ring gives exactly what follows it.
+    let middle = seqs[seqs.len() / 2];
+    let mut resumed = events_socket(handle.addr, &format!("&terminal={id}&since={middle}")).await;
+    let resumed_frames = frames_until(&mut resumed, |frames| {
+        terminal_text(frames).contains("tail 400")
+    })
+    .await;
+    let resumed_seqs = terminal_seqs(&resumed_frames);
+    assert_eq!(
+        resumed_seqs.first().copied(),
+        Some(middle + 1),
+        "a resume starts at the frame after the one it named: {resumed_seqs:?}"
+    );
+    assert!(
+        resumed_seqs.len() < seqs.len(),
+        "a resume is shorter than a full replay"
+    );
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn a_reconnect_from_before_the_ring_is_told_to_reset() {
+    let _serial = terminal_guard().await;
+    install_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = start(dir.path()).await;
+    let (_project, id) = start_shell(&handle, dir.path()).await;
+
+    // Enough output to push the 256 KiB ring past its start, several times over.
+    call(
+        &handle,
+        "write_terminal",
+        json!({
+            "terminalId": id,
+            "data": "i=1; while [ $i -le 5000 ]; do echo \"chatter $i aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"; i=$((i+1)); done; echo \"end $((200*2))\"\n"
+        }),
+    )
+    .await;
+    // The flood has to have reached the ring before the resume can be judged: the
+    // ring holding the tail is what makes `since=1` older than it.
+    let _ = wait_for_replay(&handle, &id, "end 400").await;
+
+    // `since=1` is older than the ring holds: the client is told to reset, not
+    // handed a stream that quietly starts in the middle.
+    let mut late = events_socket(handle.addr, &format!("&terminal={id}&since=1")).await;
+    let first = next_frame(&mut late).await;
+    assert_eq!(
+        first["event"], "terminal-reset",
+        "a terminal resume past the ring is announced, not silently skipped: {first}"
+    );
+    assert_eq!(first["payload"]["fromSeq"], 1);
+    let lost_through = first["payload"]["toSeq"].as_u64().unwrap();
+    assert!(lost_through > 1, "the frame names what was lost: {first}");
+
+    // What follows is the ring's own content, in order, from after the loss.
+    let after = frames_until(&mut late, |frames| frames.len() > 5).await;
+    let seqs = terminal_seqs(&after);
+    assert!(
+        seqs.iter().all(|seq| *seq > lost_through),
+        "the redraw starts after the announced loss: {seqs:?} vs {lost_through}"
+    );
+    assert!(
+        seqs.windows(2).all(|pair| pair[0] < pair[1]),
+        "the redraw is ordered: {seqs:?}"
+    );
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn every_frame_is_valid_utf8_and_the_stream_equals_what_was_written() {
+    let _serial = terminal_guard().await;
+    install_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = start(dir.path()).await;
+    let (_project, id) = start_shell(&handle, dir.path()).await;
+
+    // A 3-byte character, thousands of times over: PTY reads land mid-character
+    // unless the split is carried between reads.
+    let mut socket = events_socket(handle.addr, &format!("&terminal={id}")).await;
+    call(
+        &handle,
+        "write_terminal",
+        json!({
+            "terminalId": id,
+            "data": "printf '\\342\\202\\254%.0s' $(seq 1 3000); echo; echo \"euros $((20*2)) done\"\n"
+        }),
+    )
+    .await;
+    let frames = frames_until(&mut socket, |frames| {
+        terminal_text(frames).contains("euros 40 done")
+    })
+    .await;
+    let text = terminal_text(&frames);
+    assert!(
+        !text.contains('\u{FFFD}'),
+        "a split codepoint became a replacement character"
+    );
+    assert_eq!(
+        text.matches('€').count(),
+        3000,
+        "every euro sign survived exactly once: {}",
+        text.matches('€').count()
+    );
+    for frame in &frames {
+        let data = frame["payload"]["data"].as_str().unwrap_or_default();
+        assert!(!data.contains('\u{FFFD}'), "no frame carries a replacement character");
+    }
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn two_terminals_never_cross_on_their_sockets() {
+    let _serial = terminal_guard().await;
+    install_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = start(dir.path()).await;
+    let (project, first) = start_shell(&handle, dir.path()).await;
+    let second = call(
+        &handle,
+        "start_terminal",
+        json!({ "projectId": project, "cols": 100, "rows": 30 }),
+    )
+    .await;
+    let second = second.as_str().unwrap().to_owned();
+
+    let mut one = events_socket(handle.addr, &format!("&terminal={first}")).await;
+    let mut two = events_socket(handle.addr, &format!("&terminal={second}")).await;
+    // Each shell answers on its own before the cross-check, so a slow start cannot
+    // be mistaken for a crossed filter.
+    let warmed = run_command(&handle, &mut one, &first, "echo \"warm $((20*2))\"", "warm 40").await;
+    assert!(warmed.contains("warm 40"), "the first shell answers: {warmed:?}");
+    let warmed = run_command(&handle, &mut two, &second, "echo \"warm $((20*2))\"", "warm 40").await;
+    assert!(warmed.contains("warm 40"), "the second shell answers: {warmed:?}");
+    let first_text = run_command(&handle, &mut one, &first, "echo \"first $((20*2))\"", "first 40").await;
+    let second_text =
+        run_command(&handle, &mut two, &second, "echo \"second $((20*2))\"", "second 40").await;
+    assert!(first_text.contains("first 40"), "{first_text:?}");
+    assert!(second_text.contains("second 40"), "{second_text:?}");
+    assert!(!first_text.contains("second 40"), "the first shell saw the second's output");
+    assert!(!second_text.contains("first 40"), "the second shell saw the first's output");
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn a_resize_survives_a_reconnect_and_still_clamps() {
+    let _serial = terminal_guard().await;
+    install_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = start(dir.path()).await;
+    let (_project, id) = start_shell(&handle, dir.path()).await;
+
+    call(&handle, "resize_terminal", json!({ "terminalId": id, "cols": 120, "rows": 40 })).await;
+    // A reconnect is a new socket on the same terminal, which is what a client does
+    // after a transport change.
+    drop(events_socket(handle.addr, &format!("&terminal={id}")).await);
+    let mut socket = events_socket(handle.addr, &format!("&terminal={id}")).await;
+    let text = run_command(&handle, &mut socket, &id, "stty size", "40 120").await;
+    assert!(text.contains("40 120"), "the PTY kept its size across the reconnect: {text:?}");
+
+    // The clamp still applies at the extremes.
+    call(&handle, "resize_terminal", json!({ "terminalId": id, "cols": 1, "rows": 1 })).await;
+    let text = run_command(&handle, &mut socket, &id, "stty size", "2 10").await;
+    assert!(text.contains("2 10"), "the clamp is still the shell's real size: {text:?}");
+    handle.stop().await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn an_idle_terminal_is_closed_with_its_process_group_and_told_why() {
+    let _serial = terminal_guard().await;
+    install_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    // A one-second window keeps the test short; the tick is a quarter of it.
+    let mut config = test_config(dir.path(), "127.0.0.1:0");
+    config.terminal_idle = std::time::Duration::from_secs(1);
+    let handle = spawn(config).await.unwrap();
+    let (_project, id) = start_shell(&handle, dir.path()).await;
+
+    // The shell's own pid, and one job inside it, so "the group is gone" is not just
+    // "the first process exited".
+    let activity = call(&handle, "get_terminal_activity", json!({ "terminalId": id })).await;
+    let shell = activity["pid"].as_u64().expect("the shell has a pid") as u32;
+    call(&handle, "write_terminal", json!({ "terminalId": id, "data": "sleep 300&\n" })).await;
+    let child = child_of(shell);
+    assert!(running(shell), "the shell is alive before the close");
+    assert!(running(child), "the job is alive before the close");
+
+    // Nobody attached and nothing printed since: the rule closes it after the
+    // window, and a client that comes back is told why rather than finding a shell
+    // that silently vanished.
+    tokio::time::sleep(std::time::Duration::from_millis(2_500)).await;
+    let mut after = events_socket(handle.addr, &format!("&terminal={id}&since=0")).await;
+    let frames = frames_until(&mut after, |frames| {
+        frames.iter().any(|frame| frame["payload"]["exit"] == true)
+    })
+    .await;
+    let exit = frames
+        .iter()
+        .find(|frame| frame["payload"]["exit"] == true)
+        .expect("an exit frame");
+    assert_eq!(exit["payload"]["reason"], "idle", "the close says why: {exit}");
+    assert!(
+        !running(shell) && !running(child),
+        "the whole process group is gone, not just the first process: shell {shell}, child {child}"
+    );
+    handle.stop().await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn output_or_a_watching_client_keeps_an_idle_terminal_alive() {
+    let _serial = terminal_guard().await;
+    install_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path(), "127.0.0.1:0");
+    config.terminal_idle = std::time::Duration::from_secs(1);
+    let handle = spawn(config).await.unwrap();
+    let (_project, id) = start_shell(&handle, dir.path()).await;
+
+    // A client attached and silent: past the window, the shell still runs.
+    let mut watching = events_socket(handle.addr, &format!("&terminal={id}")).await;
+    tokio::time::sleep(std::time::Duration::from_millis(2_000)).await;
+    let text = run_command(&handle, &mut watching, &id, "echo \"alive $((20*2))\"", "alive 40").await;
+    assert!(
+        text.contains("alive 40"),
+        "a watched shell was closed while a client was attached: {text:?}"
+    );
+
+    // Detached but printing: also alive, past the window.
+    drop(watching);
+    let mut detached = events_socket(handle.addr, &format!("&terminal={id}")).await;
+    for step in 0..3 {
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        let text = run_command(
+            &handle,
+            &mut detached,
+            &id,
+            "echo \"tick $((20*2))\"",
+            "tick 40",
+        )
+        .await;
+        assert!(
+            text.contains("tick 40"),
+            "output alone keeps a shell alive (step {step}): {text:?}"
+        );
+    }
+    handle.stop().await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn opening_and_closing_terminals_returns_the_descriptor_count_to_baseline() {
+    let _serial = terminal_guard().await;
+    install_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = start(dir.path()).await;
+    let (project, _session) = a_task(&handle, dir.path()).await;
+
+    let open_fds = || {
+        std::fs::read_dir("/proc/self/fd")
+            .map(|entries| entries.count())
+            .unwrap_or(0)
+    };
+    // One warm start, so the baseline includes whatever the first terminal allocates.
+    let (_project, warm) = start_shell(&handle, dir.path()).await;
+    call(&handle, "close_terminal", json!({ "terminalId": warm })).await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let baseline = open_fds();
+
+    for _ in 0..8 {
+        let id = call(
+            &handle,
+            "start_terminal",
+            json!({ "projectId": project, "cols": 80, "rows": 24 }),
+        )
+        .await;
+        let id = id.as_str().unwrap().to_owned();
+        // A resize storm on each, the classic way this type leaks.
+        for cols in [80u16, 100, 60, 120] {
+            call(
+                &handle,
+                "resize_terminal",
+                json!({ "terminalId": id, "cols": cols, "rows": 24 }),
+            )
+            .await;
+        }
+        call(&handle, "close_terminal", json!({ "terminalId": id })).await;
+    }
+    // Give the reader threads their moment to see the close and drop the PTY.
+    tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+    let after = open_fds();
+    assert!(
+        after <= baseline + 2,
+        "terminals leaked descriptors: {baseline} before, {after} after (8 opened and closed)"
+    );
+    handle.stop().await;
 }

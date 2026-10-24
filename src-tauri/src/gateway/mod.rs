@@ -13,6 +13,7 @@ mod live;
 mod rpc;
 mod server;
 mod static_files;
+mod terminals;
 
 #[cfg(test)]
 mod recovery_tests;
@@ -35,6 +36,9 @@ pub struct GatewayConfig {
     pub allowed_origins: Vec<String>,
     /// The largest single file `/upload` accepts.
     pub upload_max: usize,
+    /// How long a terminal with no client and no output is kept (`--terminal-idle`);
+    /// zero means never close one.
+    pub terminal_idle: std::time::Duration,
     /// Take a lock held by another process, for a gateway that died uncleanly.
     pub force_owner: bool,
     /// How long an approval nobody answers stays pending. `None` disables
@@ -55,6 +59,8 @@ pub struct GatewayHandle {
     watchdog: Option<tokio::task::JoinHandle<()>>,
     /// The hourly upload sweeper, stopped with the server.
     sweeper: tokio::task::JoinHandle<()>,
+    /// The idle-terminal sweeper, when the rule is on.
+    terminal_sweeper: Option<tokio::task::JoinHandle<()>>,
     /// What a sweep needs, kept here so the pass can also be asked for by a test.
     data_dir: PathBuf,
     state: Arc<crate::AppState>,
@@ -67,6 +73,14 @@ impl GatewayHandle {
             watchdog.abort();
         }
         self.sweeper.abort();
+        // A gateway going away does not leave the owner's shells running: the map
+        // dropping each Terminal kills its process group (PAN-110).
+        if let Ok(mut terminals) = self.state.terminals.lock() {
+            terminals.clear();
+        }
+        if let Some(sweeper) = self.terminal_sweeper {
+            sweeper.abort();
+        }
         let _ = self.shutdown.send(());
         let _ = self.join.await;
     }
@@ -115,13 +129,17 @@ pub async fn spawn(config: GatewayConfig) -> std::io::Result<GatewayHandle> {
     let cache_dir = config.data_dir.join("cache");
     std::fs::create_dir_all(&cache_dir).map_err(std::io::Error::other)?;
     let live = Arc::new(live::Live::default());
-    let run = crate::run_ctx::RunContext::headless(
+    // This gateway's own sink, not the process-wide one: `set_sink` gives the first
+    // install its way for the life of the process, so a second gateway in one process
+    // (`cargo test`, an embedder) would otherwise emit its turns and terminals into
+    // the first one's sockets and no client would ever see them (PAN-110).
+    let run = crate::run_ctx::RunContext::new(
+        sink.clone(),
         cache_dir,
         config.data_dir.clone(),
         state.ui.clone(),
         Arc::new(live::GatewaySurface::new(live.clone(), sink.clone())),
-    )
-    .map_err(std::io::Error::other)?;
+    );
     let state = Arc::new(state);
     // Auto-deny: a question with no client attached is denied at its deadline. The
     // desktop never starts this — a window is an attached client — so its behaviour
@@ -135,6 +153,9 @@ pub async fn spawn(config: GatewayConfig) -> std::io::Result<GatewayHandle> {
             None
         }
     };
+    // A shell nobody is watching is closed after `--terminal-idle`, so a tab that was
+    // dropped without a close does not leak a PTY for the life of the gateway.
+    let watch = terminals::Watch::new(config.terminal_idle);
     // Whatever was uploaded before this gateway last stopped is swept before it
     // serves, so an unreferenced file never outlives one boot cycle. A sweep that
     // cannot read its own directory is a warning, not a reason to refuse to start.
@@ -156,9 +177,11 @@ pub async fn spawn(config: GatewayConfig) -> std::io::Result<GatewayHandle> {
             state: state.clone(),
             run,
             live,
+            watch: watch.clone(),
         },
         uploads: uploads_root,
         upload_max: config.upload_max,
+        watch: watch.clone(),
     });
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
     let addr = listener.local_addr()?;
@@ -190,6 +213,40 @@ pub async fn spawn(config: GatewayConfig) -> std::io::Result<GatewayHandle> {
             }
         })
     };
+    // A shell nobody is watching is a process, a PTY and a descriptor per tab. The
+    // tick is a quarter of the window (capped at a minute), so a close lands close
+    // to the deadline rather than up to a window late (PAN-110).
+    let terminal_sweeper = (!config.terminal_idle.is_zero()).then(|| {
+        let state = state.clone();
+        let sink = sink.clone();
+        let idle = watch.window();
+        let watch = watch.clone();
+        let period = (idle / 4).clamp(std::time::Duration::from_secs(1), std::time::Duration::from_secs(60));
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(period);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                for (id, opened_at) in watch.unattached() {
+                    let last_output = sink.last_terminal_output(&id);
+                    if !terminals::is_idle(idle, opened_at, last_output, crate::storage::now()) {
+                        continue;
+                    }
+                    // Closing kills the shell's process group; the reader's own exit
+                    // frame carries the reason, so the client is told why. Said out
+                    // loud too: killing a person's shell deserves a line in the log.
+                    eprintln!(
+                        "closing terminal {id}: no client attached and no output for {}s",
+                        idle.as_secs()
+                    );
+                    watch.unwatch(&id);
+                    if let Err(error) = crate::terminal::close_because(&state.terminals, &id, "idle") {
+                        eprintln!("closing idle terminal {id}: {error}");
+                    }
+                }
+            }
+        })
+    });
     let join = tokio::spawn(async move {
         // The lock lives as long as the server does, and no longer.
         let _lock = lock;
@@ -209,6 +266,7 @@ pub async fn spawn(config: GatewayConfig) -> std::io::Result<GatewayHandle> {
         sink,
         watchdog,
         sweeper,
+        terminal_sweeper,
         data_dir: config.data_dir,
         state,
     })
