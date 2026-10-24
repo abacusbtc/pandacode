@@ -13,11 +13,14 @@ pub const DEFAULT_PORT: u16 = 47399;
 /// tauri.conf.json and fails if the two ever disagree.
 pub const APP_DIR: &str = "ai.pandacode.desktop";
 const TOKEN_FILE: &str = "gateway-token";
+/// The largest single file `/upload` accepts, as the owner decided (spec section
+/// 6.1): an accident guard for a phone photo of a document, not a security control.
+pub const DEFAULT_UPLOAD_MAX: usize = 200 * 1024 * 1024;
 
 pub use crate::data_lock::{claim, Claim};
 
 pub fn usage() -> &'static str {
-    "usage: pandacode-gateway [--data-dir <dir>] [--host <host>] [--port <port>] [--token <token>] [--token-file <file>] [--static-dir <dir>] [--allow-origin <origin>]… [--force-owner]"
+    "usage: pandacode-gateway [--data-dir <dir>] [--host <host>] [--port <port>] [--token <token>] [--token-file <file>] [--static-dir <dir>] [--allow-origin <origin>]… [--upload-max <size>] [--force-owner]"
 }
 
 /// The app's own webview origins; a browser on another origin must be named
@@ -56,6 +59,7 @@ where
     let mut static_dir: Option<PathBuf> = None;
     let mut allowed_origins: Vec<String> = Vec::new();
     let mut force_owner = false;
+    let mut upload_max = DEFAULT_UPLOAD_MAX;
 
     let mut index = 0;
     while index < args.len() {
@@ -77,6 +81,7 @@ where
             "--token-file" => token_file = Some(PathBuf::from(value(&args, index, &flag)?)),
             "--static-dir" => static_dir = Some(PathBuf::from(value(&args, index, &flag)?)),
             "--allow-origin" => allowed_origins.push(value(&args, index, &flag)?),
+            "--upload-max" => upload_max = parse_size(&value(&args, index, &flag)?)?,
             other => return Err(format!("unknown argument {other}\n{}", usage())),
         }
         index += 2;
@@ -99,7 +104,42 @@ where
         static_dir,
         allowed_origins,
         force_owner,
+        upload_max,
     })
+}
+
+/// A byte count: plain bytes, or a number with a unit (`200MiB`, `512KB`, `1G`).
+/// Binary units are the default reading because the cap it replaces (24 MiB, 5 MiB)
+/// is binary; a decimal unit is taken at its word.
+fn parse_size(value: &str) -> Result<usize, String> {
+    let compact = value.trim();
+    let split = compact
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(compact.len());
+    let (digits, unit) = compact.split_at(split);
+    let number: u64 = digits
+        .parse()
+        .map_err(|_| format!("--upload-max needs a size, not {value:?}\n{}", usage()))?;
+    let multiplier: u64 = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "k" | "kib" => 1024,
+        "kb" => 1000,
+        "m" | "mib" => 1024 * 1024,
+        "mb" => 1_000_000,
+        "g" | "gib" => 1024 * 1024 * 1024,
+        "gb" => 1_000_000_000,
+        other => {
+            return Err(format!(
+                "--upload-max does not know the unit {other:?}; use bytes, KiB, MiB or GiB\n{}",
+                usage()
+            ))
+        }
+    };
+    let bytes = number
+        .checked_mul(multiplier)
+        .filter(|bytes| *bytes > 0)
+        .ok_or_else(|| format!("--upload-max needs a positive size\n{}", usage()))?;
+    usize::try_from(bytes).map_err(|_| format!("--upload-max is too large\n{}", usage()))
 }
 
 /// Opens the app's database, refusing a file newer than this build understands
@@ -223,5 +263,43 @@ fn default_data_dir() -> PathBuf {
 /// Tauri's join: the bundle identifier under the platform's data base.
 pub fn data_dir_under(base: PathBuf) -> PathBuf {
     base.join(APP_DIR)
+}
+
+#[cfg(test)]
+mod size_tests {
+    use super::*;
+
+    #[test]
+    fn an_upload_cap_is_bytes_or_a_size_with_a_unit() {
+        assert_eq!(parse_size("2048").unwrap(), 2048);
+        assert_eq!(parse_size("200MiB").unwrap(), 200 * 1024 * 1024);
+        assert_eq!(parse_size("200mib").unwrap(), 200 * 1024 * 1024);
+        assert_eq!(parse_size("200MB").unwrap(), 200_000_000);
+        assert_eq!(parse_size("512K").unwrap(), 512 * 1024);
+        assert_eq!(parse_size("1G").unwrap(), 1024 * 1024 * 1024);
+        // A flag is a value, so the default is only what an absent flag gives.
+        assert_eq!(DEFAULT_UPLOAD_MAX, parse_size("200MiB").unwrap());
+        for bad in ["", "0", "0MiB", "-1", "MB", "12 parsecs", "12x"] {
+            assert!(parse_size(bad).is_err(), "{bad:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn the_upload_flag_reaches_the_config_and_a_bad_one_does_not() {
+        let dir = std::env::temp_dir().join(format!("pandacode-upload-{}", uuid::Uuid::new_v4()));
+        let args = |extra: &[&str]| {
+            let mut args: Vec<String> = vec!["--data-dir".into(), dir.to_string_lossy().into_owned(), "--token".into(), "t".into()];
+            args.extend(extra.iter().map(|value| value.to_string()));
+            args
+        };
+        let config = from_args(args(&["--upload-max", "3MiB"])).unwrap();
+        assert_eq!(config.upload_max, 3 * 1024 * 1024);
+        assert_eq!(from_args(args(&[])).unwrap().upload_max, DEFAULT_UPLOAD_MAX);
+        let error = match from_args(args(&["--upload-max", "lots"])) {
+            Ok(_) => panic!("a bad size must be refused"),
+            Err(error) => error,
+        };
+        assert!(error.contains("--upload-max"), "{error}");
+    }
 }
 

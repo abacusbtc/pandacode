@@ -86,7 +86,7 @@ async fn start_or_queue(app: &tauri::AppHandle, bot: &Bot, session_id: &str, tex
         return Ok(());
     }
     let ctx = crate::desktop_context(app, &state)?;
-    crate::launch_task_in_project(ctx, &state, session_id.to_owned(), Some(text), None, Some(bot.project_id.clone())).await
+    crate::launch_task_in_project(ctx, &state, session_id.to_owned(), Some(text), None, None, Some(bot.project_id.clone())).await
 }
 
 pub(crate) async fn deliver(app: &tauri::AppHandle, inbound: Inbound) -> Result<String> {
@@ -215,7 +215,7 @@ pub(crate) async fn run_finished(app: &tauri::AppHandle, session_id: &str, succe
         let (context, image_ids) = queued_prompt(&entry.attachments);
         let launch_state = app.state::<AppState>();
         let launched = match crate::desktop_context(app, &launch_state) {
-            Ok(ctx) => crate::launch_task_in_project(ctx, &launch_state, session_id.to_owned(), Some(format!("{}{context}", entry.text)), Some(image_ids), Some(bot.project_id.clone())).await,
+            Ok(ctx) => crate::launch_task_in_project(ctx, &launch_state, session_id.to_owned(), Some(format!("{}{context}", entry.text)), Some(image_ids), None, Some(bot.project_id.clone())).await,
             Err(error) => Err(error),
         };
         // A failed launch puts the entry back first; no run ends, so the queue holds until the next turn.

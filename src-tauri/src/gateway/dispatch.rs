@@ -202,12 +202,16 @@ pub fn handle(command: &str, args: Value, ctx: &Ctx) -> Answer {
                     text: String,
                     image_ids: Option<Vec<String>>,
                     moodboard_ids: Option<Vec<String>>,
+                    /// Files a remote client uploaded first (PAN-108). Unknown or
+                    /// expired ids fail this send before a turn starts.
+                    upload_ids: Option<Vec<String>>,
                 }
                 let Args {
                     session_id,
                     mut text,
                     image_ids,
                     moodboard_ids,
+                    upload_ids,
                 } = from_value(args)?;
                 let target =
                     crate::resolve_send(&ctx.state, &session_id, &mut text, moodboard_ids.as_deref())?;
@@ -226,6 +230,7 @@ pub fn handle(command: &str, args: Value, ctx: &Ctx) -> Answer {
                     session_id.clone(),
                     text,
                     image_ids,
+                    upload_ids,
                     target.project_id,
                 )
                 .await
@@ -245,6 +250,7 @@ pub fn handle(command: &str, args: Value, ctx: &Ctx) -> Answer {
                 #[serde(rename_all = "camelCase")]
                 struct Args {
                     session_id: String,
+                    upload_ids: Option<Vec<String>>,
                 }
                 let args: Args = from_value(args)?;
                 if crate::resolve_start(&ctx.state, &args.session_id)?.is_some() {
@@ -252,8 +258,13 @@ pub fn handle(command: &str, args: Value, ctx: &Ctx) -> Answer {
                 }
                 let provider = provider_of(&ctx.state, &args.session_id)?;
                 let recorded = ctx.live.start(&args.session_id, &provider)?;
-                if let Err(error) =
-                    crate::start_task_inner(&ctx.state, ctx.run.clone(), args.session_id.clone()).await
+                if let Err(error) = crate::start_task_inner(
+                    &ctx.state,
+                    ctx.run.clone(),
+                    args.session_id.clone(),
+                    args.upload_ids,
+                )
+                .await
                 {
                     if recorded {
                         ctx.live.finish(&args.session_id);
@@ -668,6 +679,107 @@ mod tests {
         assert_eq!(
             listed[0]["sessionId"], session.id,
             "the refusal must not clear the turn that is still running"
+        );
+    }
+
+    #[test]
+    fn four_images_is_the_cap_and_an_upload_counts_with_a_screenshot() {
+        // A valid one-pixel PNG: the normalizer keeps it as it is, so this test is
+        // about the count, not about encoding.
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let png = STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC")
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx(dir.path());
+        let project = ctx.state.store.lock().unwrap().add_project(dir.path()).unwrap();
+        let session = ctx
+            .state
+            .store
+            .lock()
+            .unwrap()
+            .create_session(&project.id, "claude", "sonnet", "full")
+            .unwrap();
+        let root = crate::uploads::root(dir.path());
+        let runtime = runtime();
+        let mut ids = Vec::new();
+        for index in 0..5 {
+            let mut staged = crate::uploads::Staged::begin(&root).unwrap();
+            runtime.block_on(staged.write(&png)).unwrap();
+            let upload = runtime
+                .block_on(staged.finish(
+                    format!("shot-{index}.png"),
+                    crate::uploads::Kind::Image,
+                    0,
+                ))
+                .unwrap();
+            ids.push(upload.meta.id);
+        }
+        let send = |image_ids: Value, upload_ids: Vec<String>| match handle(
+            "send_message",
+            json!({
+                "sessionId": session.id,
+                "text": "look",
+                "imageIds": image_ids,
+                "uploadIds": upload_ids,
+            }),
+            &ctx,
+        ) {
+            Answer::Pending(future) => runtime.block_on(future),
+            Answer::Ready(_) => panic!("send_message answers later"),
+        };
+
+        assert_eq!(
+            send(json!([]), ids.clone()).unwrap_err(),
+            "Attach up to four images per message.",
+            "five uploads is one too many"
+        );
+        assert_eq!(
+            send(json!([uuid::Uuid::new_v4().to_string()]), ids[..4].to_vec()).unwrap_err(),
+            "Attach up to four images per message.",
+            "an upload and a browser screenshot draw on the same four"
+        );
+
+        // A turn is running, so a send that passes the cap is refused by the guard
+        // rather than spawning a harness: that the guard is reached is the proof the
+        // cap let four through.
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        ctx.state.agents.lock().unwrap().insert(
+            session.id.clone(),
+            crate::RunningAgent::new(tx, Arc::new(std::sync::atomic::AtomicBool::new(false))),
+        );
+        assert_eq!(
+            send(json!([]), ids[..4].to_vec()).unwrap_err(),
+            "This task is already running in an agent or harness console."
+        );
+    }
+
+    #[test]
+    fn an_unknown_upload_id_fails_the_send_before_a_turn_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx(dir.path());
+        let project = ctx.state.store.lock().unwrap().add_project(dir.path()).unwrap();
+        let session = ctx
+            .state
+            .store
+            .lock()
+            .unwrap()
+            .create_session(&project.id, "claude", "sonnet", "full")
+            .unwrap();
+        let missing = uuid::Uuid::new_v4().to_string();
+        let error = match handle(
+            "send_message",
+            json!({"sessionId": session.id, "text": "here", "uploadIds": [missing]}),
+            &ctx,
+        ) {
+            Answer::Pending(future) => runtime().block_on(future).unwrap_err(),
+            Answer::Ready(_) => panic!("send_message answers later"),
+        };
+        assert_eq!(error, format!("unknown_upload: {missing}"));
+        assert!(
+            ctx.live.tasks().is_empty(),
+            "a refused send is not a live task: {:?}",
+            ctx.live.tasks()
         );
     }
 

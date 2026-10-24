@@ -57,6 +57,20 @@ fn delete_owned(store: &Store, sid: &str, expected: &[String]) -> Result<()> {
 }
 
 pub(crate) fn delete_state(state: &AppState, sid: &str) -> Result<DeletedSessions> {
+    delete_state_at(state, sid, None)
+}
+
+/// Deleting a task also removes the uploads it owned.
+///
+/// An upload exists for the turns of one task: sent, or queued for the next one.
+/// Both references are read here, before the rows go (the queue cascades with the
+/// session), so the files are gone when the command returns instead of waiting for
+/// the gateway's next sweep.
+pub(crate) fn delete_state_at(
+    state: &AppState,
+    sid: &str,
+    uploads_root: Option<&std::path::Path>,
+) -> Result<DeletedSessions> {
     // Agent, harness, team and Jev admissions share this lock. No process or
     // filesystem operations happen here; running work must be stopped first.
     let agents = state.agents.lock().map_err(|e| e.to_string())?;
@@ -83,8 +97,32 @@ pub(crate) fn delete_state(state: &AppState, sid: &str) -> Result<DeletedSession
                 .into(),
         );
     }
+    let owned_uploads = match uploads_root {
+        Some(root) => {
+            let store = state.store.lock().map_err(|e| e.to_string())?;
+            let mut owned = crate::uploads::session_ids(root, &ids)?;
+            for id in &ids {
+                owned.extend(crate::uploads::queued_ids_for(&store, id)?);
+            }
+            owned.sort();
+            owned.dedup();
+            Some((root.to_path_buf(), owned))
+        }
+        None => None,
+    };
     let store = state.store.lock().map_err(|e| e.to_string())?;
     delete_owned(&store, sid, &ids)?;
+    drop(store);
+    if let Some((root, owned)) = owned_uploads {
+        for id in owned {
+            crate::uploads::remove(&root, &id);
+        }
+        // Anything else this task had bound is an orphan now, and a sweep is what
+        // decides that for every upload, not just the ones read above.
+        if let Ok(store) = state.store.lock() {
+            let _ = crate::uploads::sweep(&root, &store, crate::storage::now());
+        }
+    }
     Ok(DeletedSessions {
         deleted_session_ids: ids,
     })
@@ -101,8 +139,14 @@ pub async fn delete_session(
     }
     // A deleted task never sends a follow-up; free its waiting agent.
     crate::providers::discard_warm_agent(&session_id);
+    // The gateway keeps uploads under the data directory the two processes share.
+    let uploads = app
+        .path()
+        .app_data_dir()
+        .ok()
+        .map(|dir| crate::uploads::root(&dir));
     crate::blocking(move || {
-        let deleted = delete_state(&app.state::<AppState>(), &session_id)?;
+        let deleted = delete_state_at(&app.state::<AppState>(), &session_id, uploads.as_deref())?;
         let _ = crate::events::emit(&app, 
             "sessions-deleted",
             serde_json::json!({
@@ -390,5 +434,69 @@ mod tests {
         assert!(delete_state(&state, &sid).is_err());
         state.shutdown.store(0, Ordering::SeqCst);
         assert!(state.store.lock().unwrap().session(&sid).is_ok());
+    }
+
+    #[test]
+    fn deleting_a_task_removes_the_uploads_it_owned_and_leaves_the_rest() {
+        let (state, project) = test_state();
+        let dir = std::env::temp_dir().join(format!(
+            "pandacode-delete-uploads-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let root = crate::uploads::root(&dir);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let stage = |name: &str, session: Option<&str>| {
+            let mut staged = crate::uploads::Staged::begin(&root).unwrap();
+            runtime.block_on(staged.write(b"bytes")).unwrap();
+            let upload = runtime
+                .block_on(staged.finish(
+                    name.to_string(),
+                    crate::uploads::Kind::Document,
+                    crate::storage::now(),
+                ))
+                .unwrap();
+            if let Some(session) = session {
+                crate::uploads::bind(&root, &upload.meta.id, session).unwrap();
+            }
+            upload.meta.id
+        };
+        let sid = task(&state.store.lock().unwrap(), &project);
+        let other = task(&state.store.lock().unwrap(), &project);
+        // A turn that used it, a queued message that still will, another task's
+        // upload, and one nothing refers to yet.
+        let sent = stage("sent.txt", Some(&sid));
+        let queued = stage("queued.txt", None);
+        let theirs = stage("theirs.txt", Some(&other));
+        let loose = stage("loose.txt", None);
+        state
+            .store
+            .lock()
+            .unwrap()
+            .db
+            .execute(
+                "INSERT INTO queued_messages(id,session_id,position,text,attachments,created_at,updated_at) VALUES('q1',?1,0,'later',?2,0,0)",
+                params![
+                    sid,
+                    serde_json::json!([{"kind": "document", "id": queued}]).to_string()
+                ],
+            )
+            .unwrap();
+
+        delete_state_at(&state, &sid, Some(&root)).unwrap();
+
+        assert!(!root.join(&sent).exists(), "the deleted task's upload goes now");
+        assert!(
+            !root.join(&queued).exists(),
+            "so does one only its queue named, before the queue cascades away"
+        );
+        assert!(root.join(&theirs).exists(), "another task keeps its own");
+        assert!(
+            root.join(&loose).exists(),
+            "an upload nothing refers to yet is not deleted for that reason alone"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
