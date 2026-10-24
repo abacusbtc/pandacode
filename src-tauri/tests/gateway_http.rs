@@ -63,6 +63,39 @@ async fn call(handle: &GatewayHandle, command: &str, args: Value) -> Value {
     body["result"].clone()
 }
 
+type Socket = tokio_tungstenite::WebSocketStream<
+    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+>;
+
+/// Connects to `/events`, asserting the handshake succeeded.
+async fn events_socket(addr: std::net::SocketAddr, query: &str) -> Socket {
+    let url = format!("ws://{addr}/events?token=test-token{query}");
+    let (socket, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    socket
+}
+
+/// The next frame, failing the test rather than hanging the suite.
+async fn next_frame(socket: &mut Socket) -> Value {
+    let message = tokio::time::timeout(std::time::Duration::from_secs(10), socket.next())
+        .await
+        .expect("a frame arrived")
+        .expect("the socket stayed open")
+        .expect("the frame was a message");
+    serde_json::from_str(message.to_text().unwrap()).unwrap()
+}
+
+/// Asserts that nothing else arrives: the socket is quiet, not merely slow.
+async fn no_more_frames(socket: &mut Socket) {
+    if let Ok(Some(frame)) = tokio::time::timeout(
+        std::time::Duration::from_millis(300),
+        socket.next(),
+    )
+    .await
+    {
+        panic!("an unexpected frame arrived: {frame:?}");
+    }
+}
+
 #[tokio::test]
 async fn healthz_returns_ok() {
     install_crypto_provider();
@@ -474,6 +507,158 @@ async fn websocket_clients_receive_emitted_events() {
     let frame: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
     assert_eq!(frame["event"], "agent-event");
     assert_eq!(frame["payload"], delta, "payload was rewritten in transit");
+    // The envelope adds a number and nothing else, and never reaches inside the
+    // payload: a client reads these fields by name.
+    assert!(frame["seq"].as_u64().unwrap() >= 1, "every frame is numbered");
+    let mut keys: Vec<&String> = frame.as_object().unwrap().keys().collect();
+    keys.sort();
+    assert_eq!(keys, ["event", "payload", "seq"]);
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn a_slow_reader_is_told_what_it_missed_and_can_ask_for_it() {
+    install_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = start(dir.path()).await;
+    let mut socket = events_socket(handle.addr, "").await;
+
+    // A burst the socket cannot keep up with. The emit loop never yields, so the
+    // socket's queue fills and everything after it is a hole — and the emitter
+    // neither awaits nor waits for the socket to drain.
+    let text = "x".repeat(4096);
+    let total = 1500u64;
+    for index in 0..total {
+        handle.emit(
+            "agent-event",
+            json!({ "sessionId": "s1", "kind": "text", "text": text, "index": index }),
+        );
+    }
+
+    // The first thing the client learns is the range it missed, not a quiet jump.
+    let lagged = next_frame(&mut socket).await;
+    assert_eq!(lagged["event"], "lagged", "a hole must be announced: {lagged}");
+    let from = lagged["payload"]["fromSeq"].as_u64().unwrap();
+    let to = lagged["payload"]["toSeq"].as_u64().unwrap();
+    assert!(from > 1 && to > from, "a named range: {lagged}");
+
+    // What did arrive is the frames before the hole, in order and once each.
+    let mut live = Vec::new();
+    while live.len() < (from - 1) as usize {
+        let frame = next_frame(&mut socket).await;
+        assert_eq!(frame["event"], "agent-event");
+        live.push(frame["seq"].as_u64().unwrap());
+    }
+    assert_eq!(
+        live,
+        (1..from).collect::<Vec<_>>(),
+        "no gap and no duplicate before the announced hole"
+    );
+
+    // The hole itself is still in the ring, so resuming from just before it returns
+    // exactly the missed frames — no hole, no duplicate, in order.
+    let mut replay = events_socket(handle.addr, &format!("&since={}", from - 1)).await;
+    let mut recovered = Vec::new();
+    while recovered.len() < (to - from + 1) as usize {
+        let frame = next_frame(&mut replay).await;
+        assert_ne!(frame["event"], "lagged", "the ring still had this range");
+        recovered.push(frame["seq"].as_u64().unwrap());
+    }
+    assert_eq!(
+        recovered,
+        (from..=to).collect::<Vec<_>>(),
+        "the missed frames, in order, once each"
+    );
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn two_sessions_never_leak_into_each_other() {
+    install_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = start(dir.path()).await;
+    let mut a = events_socket(handle.addr, "&session=a").await;
+    let mut b = events_socket(handle.addr, "&session=b").await;
+
+    for index in 0..10 {
+        handle.emit(
+            "agent-event",
+            json!({ "sessionId": "a", "kind": "text", "text": format!("a{index}") }),
+        );
+        handle.emit(
+            "agent-event",
+            json!({ "sessionId": "b", "kind": "text", "text": format!("b{index}") }),
+        );
+    }
+
+    for index in 0..10 {
+        let frame = next_frame(&mut a).await;
+        assert_eq!(frame["payload"]["sessionId"], "a");
+        assert_eq!(frame["payload"]["text"], format!("a{index}"));
+    }
+    for index in 0..10 {
+        let frame = next_frame(&mut b).await;
+        assert_eq!(frame["payload"]["sessionId"], "b");
+        assert_eq!(frame["payload"]["text"], format!("b{index}"));
+    }
+    // Neither socket saw the other's frames, and no frame arrived twice.
+    no_more_frames(&mut a).await;
+    no_more_frames(&mut b).await;
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn a_terminal_filter_isolates_one_shell() {
+    install_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = start(dir.path()).await;
+    let mut socket = events_socket(handle.addr, "&terminal=t1").await;
+
+    handle.emit("terminal-event", json!({ "terminalId": "t1", "data": "one" }));
+    handle.emit("terminal-event", json!({ "terminalId": "t2", "data": "two" }));
+    handle.emit("agent-event", json!({ "sessionId": "s1", "kind": "text", "text": "x" }));
+
+    let frame = next_frame(&mut socket).await;
+    assert_eq!(frame["event"], "terminal-event");
+    assert_eq!(frame["payload"]["terminalId"], "t1");
+    assert_eq!(frame["payload"]["data"], "one");
+    // The other shell's output, and another session's agent event, are not this
+    // socket's business.
+    no_more_frames(&mut socket).await;
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn a_bad_since_is_a_client_error_and_new_parameters_are_still_guarded() {
+    install_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = start(dir.path()).await;
+
+    // A since that is not a frame number is refused, rather than silently replayed
+    // from the start as if the client had asked for everything.
+    let error = tokio_tungstenite::connect_async(format!(
+        "ws://{}/events?token=test-token&since=yesterday",
+        handle.addr
+    ))
+    .await
+    .unwrap_err();
+    match error {
+        tokio_tungstenite::tungstenite::Error::Http(response) => {
+            assert_eq!(response.status(), 400, "a bad since is the client's error")
+        }
+        other => panic!("expected an HTTP refusal, got {other}"),
+    }
+
+    // The new parameters do not create a way around the token.
+    let denied = reqwest::Client::new()
+        .get(format!(
+            "http://{}/events?session=a&terminal=t1",
+            handle.addr
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), 401);
     handle.stop().await;
 }
 

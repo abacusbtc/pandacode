@@ -12,7 +12,6 @@ use axum::{
     response::{IntoResponse, Response},
     Router,
 };
-use tokio::sync::broadcast;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use super::{dispatch, events::BroadcastSink, rpc, static_files};
@@ -92,32 +91,121 @@ fn not_found() -> Response {
     (StatusCode::NOT_FOUND, "not found").into_response()
 }
 
-/// One socket per client, each receiving every event the sink emits.
-async fn events_socket(State(state): State<RouterState>, upgrade: WebSocketUpgrade) -> Response {
-    let receiver = state.events.subscribe();
-    upgrade.on_upgrade(move |socket| forward(socket, receiver))
+/// One socket per client, receiving the frames it asked for.
+///
+/// `?session=<id>` and `?terminal=<id>` choose what reaches this socket, and
+/// `?since=<seq>` asks for what it missed. The token is read by `authorize`, so a
+/// missing or wrong one is a 401 before this runs.
+async fn events_socket(
+    State(state): State<RouterState>,
+    upgrade: WebSocketUpgrade,
+    uri: Uri,
+) -> Response {
+    let (filter, since) = match events_query(&uri) {
+        Ok(query) => query,
+        Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+    };
+    let subscription = state.events.subscribe(filter, since);
+    upgrade.on_upgrade(move |socket| forward(socket, subscription))
 }
 
-async fn forward(mut socket: WebSocket, mut receiver: broadcast::Receiver<String>) {
+/// The `/events` query. Unknown parameters are ignored so an older client keeps
+/// working; a `since` that is not a number is a client error, not a silent
+/// full replay.
+fn events_query(uri: &Uri) -> Result<(super::events::Filter, Option<u64>), String> {
+    let mut filter = super::events::Filter::default();
+    let mut since = None;
+    for pair in uri.query().unwrap_or_default().split('&') {
+        let Some((key, value)) = pair.split_once('=') else {
+            continue;
+        };
+        match key {
+            // Already checked by `authorize`, which needs it before this point.
+            "token" => {}
+            "session" if !value.is_empty() => filter.session = Some(value.to_owned()),
+            "terminal" if !value.is_empty() => filter.terminal = Some(value.to_owned()),
+            "since" => {
+                since = Some(
+                    value
+                        .parse::<u64>()
+                        .map_err(|_| format!("since must be a frame number, not {value:?}"))?,
+                )
+            }
+            _ => {}
+        }
+    }
+    Ok((filter, since))
+}
+
+async fn forward(mut socket: WebSocket, mut subscription: super::events::Subscription) {
+    // A resume the ring could not serve is announced before anything else, so the
+    // client knows to refetch instead of trusting a stream with a hole in it.
+    if let Some((from, to)) = subscription.hole {
+        if send_lagged(&mut socket, from, to).await.is_err() {
+            return;
+        }
+    }
+    for frame in std::mem::take(&mut subscription.replay) {
+        if socket
+            .send(Message::Text(frame.to_json().into()))
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+
+    // A hole is flushed before the frame after it, so the client never sees a frame
+    // from beyond a gap without being told about the gap first. The tick covers the
+    // case where nothing further arrives.
+    let mut ticker = tokio::time::interval(Duration::from_millis(250));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             incoming = socket.recv() => match incoming {
                 None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
                 _ => {}
             },
-            event = receiver.recv() => match event {
-                Ok(frame) => {
-                    if socket.send(Message::Text(frame.into())).await.is_err() {
+            frame = subscription.frames.recv() => match frame {
+                Some(frame) => {
+                    if announce_hole(&mut socket, &subscription.dropped).await.is_err() {
+                        break;
+                    }
+                    if socket.send(Message::Text(frame.to_json().into())).await.is_err() {
                         break;
                     }
                 }
-                // A client that fell behind skips ahead rather than stalling the
-                // emitter; the UI reloads state on reconnect anyway.
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => break,
+                None => break,
             },
+            _ = ticker.tick() => {
+                if announce_hole(&mut socket, &subscription.dropped).await.is_err() {
+                    break;
+                }
+            }
         }
     }
+}
+
+/// Sends the `lagged` frame for whatever this socket missed, if anything.
+async fn announce_hole(
+    socket: &mut WebSocket,
+    dropped: &std::sync::Mutex<Option<(u64, u64)>>,
+) -> Result<(), ()> {
+    let hole = dropped
+        .lock()
+        .ok()
+        .and_then(|mut hole| hole.take());
+    match hole {
+        Some((from, to)) => send_lagged(socket, from, to).await,
+        None => Ok(()),
+    }
+}
+
+async fn send_lagged(socket: &mut WebSocket, from: u64, to: u64) -> Result<(), ()> {
+    socket
+        .send(Message::Text(super::events::lagged_frame(from, to).into()))
+        .await
+        .map_err(|_| ())
 }
 
 async fn authorize(State(state): State<RouterState>, request: Request, next: Next) -> Response {
