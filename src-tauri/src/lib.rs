@@ -3053,6 +3053,13 @@ pub fn prepare_environment() {
 /// terminals or shutdown flag. The gateway holds the only writer lock on the data
 /// directory, so an empty registry is the truth here rather than a placeholder.
 #[cfg(feature = "gateway")]
+/// The state a gateway serves from.
+///
+/// `open_store` goes through `Store::open`, which settles every row that claims to
+/// be running — with its subagents, unfinished tools, teams and paused goals —
+/// exactly as the desktop's own boot does. A process killed mid-turn therefore
+/// leaves nothing claiming to run, and the gateway needs no second recovery rule
+/// (PAN-104).
 pub(crate) fn gateway_state(data_dir: &std::path::Path) -> Result<AppState> {
     let store = gateway::config::open_store(data_dir)?;
     Ok(AppState {
