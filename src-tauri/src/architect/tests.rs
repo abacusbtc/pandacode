@@ -2284,7 +2284,7 @@ fn a_silent_worker_is_stopped_and_settles_as_failed() {
     let now = storage::now();
     assert_eq!(watchdog::stop_silent(&state, now, &mut |_| {}).unwrap(), 0);
     // A worker waiting on the user's approval is not stuck.
-    state.agents.lock().unwrap()[&run.config.session_id].approvals.lock().unwrap().insert("ask".into());
+    state.agents.lock().unwrap()[&run.config.session_id].approvals.lock().unwrap().insert("ask".into(), crate::PendingApproval::raised("a question"));
     assert_eq!(watchdog::stop_silent(&state, now + SILENT, &mut |_| {}).unwrap(), 0);
     state.agents.lock().unwrap()[&run.config.session_id].approvals.lock().unwrap().clear();
     assert_eq!(watchdog::stop_silent(&state, now + SILENT, &mut |_| {}).unwrap(), 1);

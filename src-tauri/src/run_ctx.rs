@@ -52,6 +52,17 @@ pub struct TurnOutcome {
 /// implements it with [`NoSurface`] until it has hosts of its own — which is why
 /// the run path can be shared before every tool exists remotely.
 pub trait TurnSurface: Send + Sync {
+    /// Whether anything that can answer a question is attached right now.
+    ///
+    /// A desktop window is always a client. A headless process is only a client
+    /// while something is listening, which decides whether an app action fails
+    /// fast instead of waiting for a picker nobody can open (PAN-106).
+    ///
+    /// The first caller is a remote app action (tasks 7 and 10); until then only
+    /// the tests exercise it, which is why it is allowed to be unused.
+    #[allow(dead_code)]
+    fn client_attached(&self) -> bool;
+
     /// The host tools that need a window: the team or agent tool stack, before
     /// per-turn wrappers are added.
     fn base_host(
@@ -98,6 +109,10 @@ pub trait TurnSurface: Send + Sync {
 pub struct NoSurface;
 
 impl TurnSurface for NoSurface {
+    fn client_attached(&self) -> bool {
+        false
+    }
+
     fn base_host(
         &self,
         _provider: &str,

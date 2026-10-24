@@ -2,12 +2,16 @@
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use super::GatewayConfig;
 
 /// Loopback keeps the gateway off the network unless someone asks for more.
 pub const DEFAULT_HOST: &str = "127.0.0.1";
 pub const DEFAULT_PORT: u16 = 47399;
+/// An approval with no client is denied after an hour (spec §4.2). Long enough for
+/// someone who stepped away, short enough that a turn does not park for a day.
+pub const DEFAULT_APPROVAL_TTL: Duration = Duration::from_secs(60 * 60);
 /// The Tauri bundle identifier: the app's data directory is the platform data
 /// base plus this, and the lock and database live there. A test reads
 /// tauri.conf.json and fails if the two ever disagree.
@@ -17,7 +21,7 @@ const TOKEN_FILE: &str = "gateway-token";
 pub use crate::data_lock::{claim, Claim};
 
 pub fn usage() -> &'static str {
-    "usage: pandacode-gateway [--data-dir <dir>] [--host <host>] [--port <port>] [--token <token>] [--token-file <file>] [--static-dir <dir>] [--allow-origin <origin>]… [--force-owner]"
+    "usage: pandacode-gateway [--data-dir <dir>] [--host <host>] [--port <port>] [--token <token>] [--token-file <file>] [--static-dir <dir>] [--allow-origin <origin>]… [--approval-ttl <duration>] [--force-owner]"
 }
 
 /// The app's own webview origins; a browser on another origin must be named
@@ -56,6 +60,9 @@ where
     let mut static_dir: Option<PathBuf> = None;
     let mut allowed_origins: Vec<String> = Vec::new();
     let mut force_owner = false;
+    // One hour by default: long enough that a person who stepped away can still
+    // answer, short enough that a turn does not park for a day (spec §4.2).
+    let mut approval_ttl: Option<Duration> = Some(DEFAULT_APPROVAL_TTL);
 
     let mut index = 0;
     while index < args.len() {
@@ -77,6 +84,11 @@ where
             "--token-file" => token_file = Some(PathBuf::from(value(&args, index, &flag)?)),
             "--static-dir" => static_dir = Some(PathBuf::from(value(&args, index, &flag)?)),
             "--allow-origin" => allowed_origins.push(value(&args, index, &flag)?),
+            "--approval-ttl" => {
+                // `0` is the explicit "never auto-deny" choice, logged at start.
+                let ttl = parse_ttl(&value(&args, index, &flag)?)?;
+                approval_ttl = (ttl > Duration::ZERO).then_some(ttl);
+            }
             other => return Err(format!("unknown argument {other}\n{}", usage())),
         }
         index += 2;
@@ -99,6 +111,7 @@ where
         static_dir,
         allowed_origins,
         force_owner,
+        approval_ttl,
     })
 }
 
@@ -124,6 +137,25 @@ pub fn open_store(data_dir: &Path) -> Result<crate::storage::Store, String> {
         }
     }
     crate::storage::Store::open(&path)
+}
+
+/// `30s`, `5m`, `1h`, or a bare number of seconds. `0` means never auto-deny.
+fn parse_ttl(raw: &str) -> Result<Duration, String> {
+    let raw = raw.trim();
+    let (number, unit) = match raw.strip_suffix('s') {
+        Some(number) => (number, 1),
+        None => match raw.strip_suffix('m') {
+            Some(number) => (number, 60),
+            None => match raw.strip_suffix('h') {
+                Some(number) => (number, 3600),
+                None => (raw, 1),
+            },
+        },
+    };
+    let count: u64 = number.parse().map_err(|_| {
+        format!("--approval-ttl needs a duration like 1h, 30m, 45s or 0, not {raw:?}")
+    })?;
+    Ok(Duration::from_secs(count.saturating_mul(unit)))
 }
 
 fn value(args: &[String], index: usize, flag: &str) -> Result<String, String> {

@@ -124,6 +124,7 @@ fn events_query(uri: &Uri) -> Result<(super::events::Filter, Option<u64>), Strin
             "token" => {}
             "session" if !value.is_empty() => filter.session = Some(value.to_owned()),
             "terminal" if !value.is_empty() => filter.terminal = Some(value.to_owned()),
+            "target" if !value.is_empty() => filter.target = Some(value.to_owned()),
             "since" => {
                 since = Some(
                     value

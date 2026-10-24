@@ -1318,7 +1318,7 @@ mod tests {
             .unwrap();
         let state = app_state(store);
         let agent = running_agent();
-        agent.approvals.lock().unwrap().insert("approval-1".into());
+        agent.approvals.lock().unwrap().insert("approval-1".into(), crate::PendingApproval::raised("a question"));
         *agent.assistant.lock().unwrap() = "Worker live text".into();
         state
             .agents
