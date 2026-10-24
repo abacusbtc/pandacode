@@ -38,13 +38,17 @@ const GLOBAL: &str = "*";
 pub struct Filter {
     pub session: Option<String>,
     pub terminal: Option<String>,
+    /// An explicit client target, set by `emit_to`. A subscriber that names one
+    /// sees only frames addressed to it (PAN-106: an app action belongs to a
+    /// client, never to a window label).
+    pub target: Option<String>,
 }
 
 impl Filter {
     /// A frame with no routing key is a process-wide signal, so it reaches every
     /// socket. Everything else must match every filter that was given.
     fn matches(&self, frame: &Frame) -> bool {
-        if frame.session.is_none() && frame.terminal.is_none() {
+        if frame.session.is_none() && frame.terminal.is_none() && frame.target.is_none() {
             return true;
         }
         if let Some(session) = &self.session {
@@ -54,6 +58,11 @@ impl Filter {
         }
         if let Some(terminal) = &self.terminal {
             if frame.terminal.as_ref() != Some(terminal) {
+                return false;
+            }
+        }
+        if let Some(target) = &self.target {
+            if frame.target.as_ref() != Some(target) {
                 return false;
             }
         }
@@ -91,6 +100,9 @@ pub struct Frame {
     /// Routing keys, read out of the payload rather than added to it.
     session: Option<String>,
     terminal: Option<String>,
+    /// An explicit client target, from `emit_to`. On the frame, never inside the
+    /// payload.
+    target: Option<String>,
     /// When it was published, for the ring's age bound. Never serialised.
     at: i64,
 }
@@ -110,15 +122,28 @@ impl Frame {
             session: key("sessionId"),
             terminal: key("terminalId"),
             payload,
+            target: None,
             at: crate::storage::now(),
         }
     }
 
+    /// The same frame, addressed to one client. A window label is not a client
+    /// target; `emit_to` on the desktop never reaches this sink.
+    fn addressed(mut self, target: &str) -> Self {
+        self.target = Some(target.to_owned());
+        self
+    }
+
     /// The bytes a client reads: the number and the name on the frame, and the
     /// payload exactly as the emitting code serialised it. Nothing is re-nested.
+    /// `target` appears only on a frame that has one, so an ordinary event's shape
+    /// is unchanged from task 4.
     pub fn to_json(&self) -> String {
-        serde_json::json!({ "seq": self.seq, "event": self.event, "payload": self.payload })
-            .to_string()
+        let mut frame = serde_json::json!({ "seq": self.seq, "event": self.event, "payload": self.payload });
+        if let Some(target) = &self.target {
+            frame["target"] = serde_json::Value::String(target.clone());
+        }
+        frame.to_string()
     }
 
     fn ring(&self) -> String {
@@ -212,13 +237,35 @@ impl BroadcastSink {
     /// One frame to every socket that wants it. Never awaits and never waits for a
     /// socket: the only wait is this process's own short critical section.
     pub fn publish(&self, name: &str, payload: Value) {
+        self.deliver(name, payload, None);
+    }
+
+    /// Publishes a frame addressed to one client. The desktop's `emit_to` targets a
+    /// window and never comes through here; this is the remote equivalent.
+    pub fn publish_to(&self, target: &str, name: &str, payload: Value) {
+        self.deliver(name, payload, Some(target));
+    }
+
+    fn deliver(&self, name: &str, payload: Value, target: Option<&str>) {
         let seq = self.next.fetch_add(1, Ordering::Relaxed) + 1;
-        let frame = Frame::from_event(seq, name, payload);
+        let mut frame = Frame::from_event(seq, name, payload);
+        if let Some(target) = target {
+            frame = frame.addressed(target);
+        }
         let now = crate::storage::now();
         let mut inner = self.lock();
         let key = frame.ring();
         inner.rings.entry(key).or_default().push(frame.clone(), now);
         inner.deliver(frame);
+    }
+
+    /// How many sockets are attached right now. Dead ones are dropped here rather
+    /// than waiting for the next publish, so "is a client attached?" answers about
+    /// the present.
+    pub fn clients(&self) -> usize {
+        let mut inner = self.lock();
+        inner.subscribers.retain(|subscriber| !subscriber.tx.is_closed());
+        inner.subscribers.len()
     }
 
     /// Registers a socket and takes its replay in one step, so a frame published
@@ -301,11 +348,12 @@ impl Emitter for BroadcastSink {
         Ok(())
     }
 
-    /// A remote client has no windows to target, so a targeted event reaches every
-    /// connected client: the closest honest equivalent, and the only one that does
-    /// not silently drop the event. Task 5 can put a target on the frame instead.
-    fn emit_to(&self, _target: &str, name: &str, payload: Value) -> Result<(), String> {
-        self.emit(name, payload)
+    /// An event addressed to one client. On the desktop a target is a window label
+    /// and goes through the app handle instead; here it is a client target carried
+    /// on the frame, so a subscriber that asked for it receives it.
+    fn emit_to(&self, target: &str, name: &str, payload: Value) -> Result<(), String> {
+        self.publish_to(target, name, payload);
+        Ok(())
     }
 }
 
@@ -358,6 +406,7 @@ mod tests {
             Filter {
                 session: Some("a".into()),
                 terminal: None,
+                target: None,
             },
             None,
         );
@@ -379,6 +428,7 @@ mod tests {
             Filter {
                 session: None,
                 terminal: Some("t1".into()),
+                target: None,
             },
             None,
         );
@@ -450,6 +500,36 @@ mod tests {
             "the replay continues after the announced range"
         );
         assert_eq!(subscription.replay[0].seq, 6);
+    }
+
+    #[test]
+    fn a_targeted_event_carries_its_target_and_reaches_only_that_client() {
+        let sink = BroadcastSink::new();
+        let mut mine = sink.subscribe(
+            Filter {
+                target: Some("client-a".into()),
+                ..Default::default()
+            },
+            None,
+        );
+        sink.publish_to("client-a", "agent-ui-action", json!({"sessionId": "s", "requestId": "r1"}));
+        sink.publish_to("client-b", "agent-ui-action", json!({"sessionId": "s", "requestId": "r2"}));
+        // An ordinary event has no target, and is not this subscriber's business.
+        sink.publish("agent-event", event("s"));
+
+        let received = drain(&mut mine);
+        assert_eq!(received.len(), 1, "only the frame addressed to this client");
+        let wire: Value = serde_json::from_str(&received[0].to_json()).unwrap();
+        assert_eq!(wire["target"], "client-a");
+        assert_eq!(wire["payload"]["requestId"], "r1");
+
+        // An untargeted frame keeps the task-4 shape: no `target` key at all.
+        let sink = BroadcastSink::new();
+        let mut plain = sink.subscribe(Filter::default(), None);
+        sink.publish("agent-event", event("s"));
+        let received = drain(&mut plain);
+        let wire: Value = serde_json::from_str(&received[0].to_json()).unwrap();
+        assert!(wire.get("target").is_none());
     }
 
     #[test]
