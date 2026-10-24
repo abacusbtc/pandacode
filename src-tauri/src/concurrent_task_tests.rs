@@ -17,6 +17,7 @@ pub(crate) fn test_state() -> (Arc<AppState>, String) {
             agents: Arc::new(Mutex::new(HashMap::new())),
             terminals: Arc::new(Mutex::new(HashMap::new())),
             shutdown: AtomicU8::new(0),
+            ui: Default::default(),
         }),
         project.id,
     )

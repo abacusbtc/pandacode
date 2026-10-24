@@ -5,22 +5,13 @@ use rusqlite::{params, OptionalExtension};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::{
-    collections::HashMap,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc,
     },
     time::Duration,
 };
 use tauri::{Manager, State};
-use tokio::sync::oneshot;
-
-struct PendingUi {
-    reply: oneshot::Sender<Result<Value>>,
-    stopped: Arc<AtomicBool>,
-}
-#[derive(Default)]
-pub struct UiRequests(Mutex<HashMap<String, PendingUi>>);
 
 pub(crate) fn spec(name: &str, description: &str, properties: Value, required: &[&str]) -> Value {
     json!({"type":"function","name":format!("pandacode_{name}"),"description":description,
@@ -696,9 +687,10 @@ async fn dispatch(
             } else {
                 None
             };
+            let ctx = crate::desktop_context(&app, &state)?;
             crate::launch_task_in_project(
-                app.clone(),
-                state,
+                ctx,
+                &state,
                 target.id.clone(),
                 text,
                 None,
@@ -801,40 +793,37 @@ async fn dispatch(
     Ok(result)
 }
 
+/// Drops a pending request whose asker is gone.
 struct UiGuard {
-    app: tauri::AppHandle,
+    ui: Arc<crate::run_ctx::UiRequests>,
     id: String,
 }
 impl Drop for UiGuard {
     fn drop(&mut self) {
-        if let Ok(mut pending) = self.app.state::<UiRequests>().0.lock() {
-            pending.remove(&self.id);
-        }
+        self.ui.forget(&self.id);
     }
 }
-async fn request_ui(
-    app: tauri::AppHandle,
+
+/// Asks a client to perform an app action and waits for its answer.
+///
+/// The registry and the emitter come from the caller, so the same flow works for
+/// the desktop (its app state and its sink) and for a headless run (the context's
+/// registry and sink).
+pub(crate) async fn request_ui_on(
+    ui: &Arc<crate::run_ctx::UiRequests>,
+    emit: impl FnOnce(&str, Value) -> Result<()>,
     sid: &str,
     action: &str,
     args: Value,
     stopped: Arc<AtomicBool>,
 ) -> Result<Value> {
     let id = uuid::Uuid::new_v4().to_string();
-    let (tx, rx) = oneshot::channel();
-    {
-        let state = app.state::<UiRequests>();
-        let mut pending = state.0.lock().map_err(|e| e.to_string())?;
-        if pending.len() >= 16 {
-            return Err("Too many pending app actions.".into());
-        }
-        pending.insert(id.clone(), PendingUi { reply: tx, stopped });
-    }
+    let rx = ui.register(id.clone(), stopped)?;
     let _guard = UiGuard {
-        app: app.clone(),
+        ui: ui.clone(),
         id: id.clone(),
     };
-    crate::events::emit_to(&app, 
-        "main",
+    emit(
         "agent-ui-action",
         json!({"requestId":id,"sessionId":sid,"action":action,"args":args}),
     )?;
@@ -844,35 +833,36 @@ async fn request_ui(
         .map_err(|_| "App action cancelled.".to_string())?
 }
 
+async fn request_ui(
+    app: tauri::AppHandle,
+    sid: &str,
+    action: &str,
+    args: Value,
+    stopped: Arc<AtomicBool>,
+) -> Result<Value> {
+    let state = app.state::<AppState>();
+    request_ui_on(
+        &state.ui,
+        |name, payload| crate::events::emit_to(&app, "main", name, payload),
+        sid,
+        action,
+        args,
+        stopped,
+    )
+    .await
+}
+
 #[tauri::command]
-pub fn agent_ui_request_active(state: State<'_, UiRequests>, request_id: String) -> bool {
-    state
-        .0
-        .lock()
-        .ok()
-        .and_then(|pending| {
-            pending
-                .get(&request_id)
-                .map(|p| !p.stopped.load(Ordering::SeqCst))
-        })
-        .unwrap_or(false)
+pub fn agent_ui_request_active(state: State<'_, AppState>, request_id: String) -> bool {
+    state.ui.active(&request_id)
 }
 #[tauri::command]
 pub fn resolve_agent_ui_action(
-    state: State<'_, UiRequests>,
+    state: State<'_, AppState>,
     request_id: String,
     result: Option<Value>,
     error: Option<String>,
 ) -> Result<()> {
-    let pending = state
-        .0
-        .lock()
-        .map_err(|e| e.to_string())?
-        .remove(&request_id)
-        .ok_or("App action expired.")?;
-    if pending.stopped.load(Ordering::SeqCst) {
-        return Err("Task has stopped.".into());
-    }
     let result = match error {
         Some(error) => Err(error.chars().take(1000).collect()),
         None => {
@@ -884,15 +874,13 @@ pub fn resolve_agent_ui_action(
             }
         }
     };
-    pending
-        .reply
-        .send(result)
-        .map_err(|_| "App action expired.".to_owned())
+    state.ui.answer(&request_id, result)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     #[test]
     fn jev_addons_are_independent_and_absent_by_default() {
         assert!(optional_jev_catalog(false, false).is_empty());
@@ -1029,6 +1017,7 @@ mod tests {
             agents: Default::default(),
             terminals: Default::default(),
             shutdown: Default::default(),
+            ui: Default::default(),
         };
         assert!(scoped_task(&state, &one, &two.id).is_err());
         assert!(scoped_task(&state, &one, &one.id).is_ok());
@@ -1048,6 +1037,7 @@ mod tests {
                 agents: Default::default(),
                 terminals: Default::default(),
                 shutdown: Default::default(),
+                ui: Default::default(),
             },
             session,
         )

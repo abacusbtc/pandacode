@@ -1250,6 +1250,7 @@ mod tests {
             agents: std::sync::Arc::new(Mutex::new(Default::default())),
             terminals: std::sync::Arc::new(Mutex::new(Default::default())),
             shutdown: std::sync::atomic::AtomicU8::new(0),
+            ui: Default::default(),
         }
     }
 
@@ -1864,6 +1865,7 @@ mod tests {
             agents: Arc::new(Mutex::new(Default::default())),
             terminals: Arc::new(Mutex::new(Default::default())),
             shutdown: AtomicU8::new(0),
+            ui: Default::default(),
         };
         architect::configure_state(
             &state,

@@ -663,9 +663,10 @@ pub(crate) async fn architect_start_in_project(
     text_check(&text)?;
     let (team, admission) = start_state(&state, &session_id, &text, image_ids.clone(), expected_project.as_deref())?;
     emit(&app, &team);
+    let ctx = crate::desktop_context(&app, &state)?;
     if let Err(error) = crate::launch_team_task(
-        app.clone(),
-        state,
+        ctx,
+        &state,
         session_id.clone(),
         text,
         image_ids,
@@ -1440,16 +1441,21 @@ pub(crate) fn wake(app: tauri::AppHandle) {
                 match action {
                     Ok(Some(action)) => {
                         let state = app.state::<AppState>();
-                        if let Err(error) = crate::launch_team_task(
-                            app.clone(),
-                            state,
-                            action.sid.clone(),
-                            action.prompt,
-                            action.images,
-                            action.admission.clone(),
-                        )
-                        .await
-                        {
+                        let launched = match crate::desktop_context(&app, &state) {
+                            Ok(ctx) => {
+                                crate::launch_team_task(
+                                    ctx,
+                                    &state,
+                                    action.sid.clone(),
+                                    action.prompt,
+                                    action.images,
+                                    action.admission.clone(),
+                                )
+                                .await
+                            }
+                            Err(error) => Err(error),
+                        };
+                        if let Err(error) = launched {
                             fail_launch(&app, &action.admission, &action.sid, &error);
                             // Other teams' launches must not wait for an unrelated event.
                             continue;

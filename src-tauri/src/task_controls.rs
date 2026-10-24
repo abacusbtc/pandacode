@@ -138,9 +138,10 @@ pub(super) async fn task_goal(
         _ => "Goal control".into(),
     };
     let (tx, rx) = oneshot::channel();
+    let ctx = crate::desktop_context(&app, &state)?;
     launch_operation(
-        app,
-        state,
+        ctx,
+        &state,
         session_id,
         Some(text),
         None,
@@ -713,6 +714,7 @@ mod command_tests {
             agents: Arc::new(Mutex::new(HashMap::new())),
             terminals: Arc::new(Mutex::new(HashMap::new())),
             shutdown: AtomicU8::new(0),
+            ui: Default::default(),
         }
     }
     #[test]
