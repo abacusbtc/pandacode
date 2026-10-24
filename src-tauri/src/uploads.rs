@@ -30,6 +30,9 @@ const DATA: &str = "data";
 #[cfg(any(feature = "gateway", test))]
 const PARTIAL: &str = "data.part";
 const META: &str = "meta.json";
+/// Metadata is written here and renamed into place, so no reader can see half of
+/// it and mistake a complete upload for an interrupted one.
+const META_PARTIAL: &str = "meta.json.part";
 
 /// How many uploads one message may name (spec section 6.1).
 pub(crate) const MAX_UPLOAD_IDS: usize = 8;
@@ -145,6 +148,15 @@ fn read_meta(dir: &Path) -> Option<Meta> {
     serde_json::from_slice(&bytes).ok()
 }
 
+/// Writes the metadata through a side file: a sweep, or another reader, sees
+/// either the previous `meta.json` or the whole new one, never a truncated one.
+fn write_meta(dir: &Path, meta: &Meta) -> crate::Result<()> {
+    let encoded = serde_json::to_vec(meta).map_err(|error| error.to_string())?;
+    let staged = dir.join(META_PARTIAL);
+    private_file(&staged, &encoded)?;
+    std::fs::rename(&staged, dir.join(META)).map_err(|error| error.to_string())
+}
+
 /// Binds an upload to the task that used it, so its retention follows that task.
 /// The first task to use an upload owns it: sending the same id twice keeps the
 /// first binding, because the second send already carries its own copy.
@@ -154,9 +166,8 @@ pub(crate) fn bind(root: &Path, id: &str, session_id: &str) -> crate::Result<()>
         return Ok(());
     }
     upload.meta.session_id = Some(session_id.to_owned());
-    let encoded = serde_json::to_vec(&upload.meta).map_err(|error| error.to_string())?;
     let dir = upload_dir(root, id)?;
-    private_file(&dir.join(META), &encoded)
+    write_meta(&dir, &upload.meta)
 }
 
 /// Removes one upload. Missing is success: a sweep and a deletion may race.
@@ -245,8 +256,7 @@ impl Staged {
             created_at: now,
             session_id: None,
         };
-        let encoded = serde_json::to_vec(&meta).map_err(|error| error.to_string())?;
-        private_file(&self.dir.join(META), &encoded)?;
+        write_meta(&self.dir, &meta)?;
         self.done = true;
         Ok(Upload { meta, path: data })
     }
@@ -455,6 +465,25 @@ mod tests {
         runtime
             .block_on(staged.finish(name.to_owned(), kind, now))
             .unwrap()
+    }
+
+    #[test]
+    fn metadata_is_written_whole_or_not_at_all() {
+        let dir = temp_dir("upload-meta");
+        let root = root(&dir);
+        let upload = stage(&root, "first.txt", Kind::Document, 0);
+        let upload_dir = root.join(&upload.meta.id);
+        // A rename means a reader never sees a half-written metadata file: the one
+        // on disk is either the old whole one or the new whole one.
+        let mut meta = read_meta(&upload_dir).unwrap();
+        meta.session_id = Some("task-1".into());
+        write_meta(&upload_dir, &meta).unwrap();
+        assert_eq!(read_meta(&upload_dir).unwrap().session_id.as_deref(), Some("task-1"));
+        assert!(
+            !upload_dir.join(META_PARTIAL).exists(),
+            "the side file does not survive a successful write"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -758,11 +787,7 @@ mod tests {
         drop(file);
         let mut meta = read_meta(&root.join(&upload.meta.id)).unwrap();
         meta.bytes = 25 * 1024 * 1024;
-        private_file(
-            &root.join(&upload.meta.id).join(META),
-            &serde_json::to_vec(&meta).unwrap(),
-        )
-        .unwrap();
+        write_meta(&root.join(&upload.meta.id), &meta).unwrap();
 
         let ctx = context(&dir);
         let error =
