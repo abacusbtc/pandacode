@@ -2194,8 +2194,7 @@ async fn respond_approval(
 ) -> Result<()> {
     respond_approval_inner(&state, &session_id, request_id, approved).await
 }
-#[tauri::command]
-async fn list_providers(force: Option<bool>) -> Vec<providers::ProviderInfo> {
+pub(crate) async fn list_providers_inner(force: Option<bool>) -> Vec<providers::ProviderInfo> {
     if force.unwrap_or(false) {
         providers::acp_catalog::invalidate("antigravity");
         providers::acp_catalog::invalidate("grok");
@@ -2205,9 +2204,19 @@ async fn list_providers(force: Option<bool>) -> Vec<providers::ProviderInfo> {
         .unwrap_or_default()
 }
 #[tauri::command]
-async fn list_provider_models(provider: String, force: Option<bool>) -> Result<Vec<providers::ModelInfo>> {
+async fn list_providers(force: Option<bool>) -> Vec<providers::ProviderInfo> {
+    list_providers_inner(force).await
+}
+pub(crate) async fn list_provider_models_inner(
+    provider: String,
+    force: Option<bool>,
+) -> Result<Vec<providers::ModelInfo>> {
     if force.unwrap_or(false) { providers::acp_catalog::invalidate(&provider); }
     providers::list_models(&provider).await
+}
+#[tauri::command]
+async fn list_provider_models(provider: String, force: Option<bool>) -> Result<Vec<providers::ModelInfo>> {
+    list_provider_models_inner(provider, force).await
 }
 
 /// The saved gateway, or `None` when the app runs against its own backend.

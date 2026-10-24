@@ -484,6 +484,92 @@ fn approval_ttl_is_parsed_and_zero_disables_auto_deny() {
 }
 
 #[tokio::test]
+async fn a_remote_client_picks_a_real_model_and_creates_a_task() {
+    install_crypto_provider();
+    let data = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let handle = start(data.path()).await;
+
+    // What a client does first: ask what exists.
+    let providers = call(&handle, "list_providers", json!({})).await;
+    let providers = providers.as_array().expect("a list of providers");
+    assert!(!providers.is_empty(), "the host installs at least one harness");
+    let provider = providers
+        .iter()
+        .find(|entry| entry["installed"] == true)
+        .unwrap_or(&providers[0]);
+    let provider_id = provider["id"].as_str().unwrap().to_string();
+
+    // Then that provider's models. The answer may carry them, or the model call may,
+    // depending on whether the provider ships a static catalog.
+    let models = rpc(&handle, "list_provider_models", json!({"provider": provider_id})).await;
+    let model_id = models["result"]
+        .as_array()
+        .and_then(|list| list.first())
+        .and_then(|model| model["id"].as_str())
+        .or_else(|| {
+            provider["models"]
+                .as_array()
+                .and_then(|list| list.first())
+                .and_then(|model| model["id"].as_str())
+        })
+        .map(str::to_owned)
+        .unwrap_or_else(|| panic!("{provider_id} names no model: {models}"));
+
+    let created = call(
+        &handle,
+        "add_project",
+        json!({ "path": project.path().to_str().unwrap() }),
+    )
+    .await;
+    let session = call(
+        &handle,
+        "create_session",
+        json!({
+            "projectId": created["id"],
+            "provider": provider_id,
+            "model": model_id,
+        }),
+    )
+    .await;
+    assert_eq!(session["provider"], provider_id, "the provider the client picked");
+    assert_eq!(session["model"], model_id, "the model the client picked");
+
+    // Read it back through the served list, not from the create answer.
+    let listed = call(&handle, "list_sessions", json!({})).await;
+    let read_back = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["id"] == session["id"])
+        .expect("the new task is listed");
+    assert_eq!(read_back["provider"], provider_id);
+    assert_eq!(read_back["model"], model_id);
+
+    // Honest validation: the provider is checked, the model is a string the desktop
+    // never checks against the catalog either. Both halves are asserted so nobody
+    // reads more into this proof than it holds.
+    let refused = rpc(
+        &handle,
+        "create_session",
+        json!({ "projectId": created["id"], "provider": "no-such-harness", "model": "x" }),
+    )
+    .await;
+    assert_eq!(refused["error"], "Unknown provider.");
+    let unchecked = call(
+        &handle,
+        "create_session",
+        json!({ "projectId": created["id"], "provider": provider_id, "model": "definitely-not-a-model" }),
+    )
+    .await;
+    assert_eq!(
+        unchecked["model"], "definitely-not-a-model",
+        "a model id is not validated against the catalog, on the desktop or here"
+    );
+    handle.stop().await;
+}
+
+#[tokio::test]
 async fn a_second_gateway_on_the_same_data_directory_is_refused() {    install_crypto_provider();
     let dir = tempfile::tempdir().unwrap();
     let handle = start(dir.path()).await;
