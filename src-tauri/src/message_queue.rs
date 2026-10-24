@@ -147,59 +147,88 @@ pub(crate) fn restore(store: &Store, entry: &QueuedMessage) -> Result<QueuedMess
     get(store, &entry.id)
 }
 
-#[tauri::command]
-pub async fn queue_list(state: State<'_, AppState>, session_id: Option<String>) -> Result<Vec<QueuedMessage>> {
+/// The queue commands' work, taking the plain state the gateway also holds. The
+/// `#[tauri::command]` wrappers below only hand over that state (PAN-103).
+pub fn queue_list_inner(state: &AppState, session_id: Option<String>) -> Result<Vec<QueuedMessage>> {
     let store = state.store.lock().map_err(|e| e.to_string())?;
     list(&store, session_id.as_deref())
 }
 
-#[tauri::command]
-pub async fn queue_add(state: State<'_, AppState>, session_id: String, text: String, attachments: Option<serde_json::Value>) -> Result<QueuedMessage> {
+pub fn queue_add_inner(state: &AppState, session_id: String, text: String, attachments: Option<serde_json::Value>) -> Result<QueuedMessage> {
     let store = state.store.lock().map_err(|e| e.to_string())?;
     add(&store, &session_id, &text, &attachments.unwrap_or_else(|| serde_json::json!([])))
 }
 
-#[tauri::command]
-pub async fn queue_update(state: State<'_, AppState>, id: String, text: String, attachments: Option<serde_json::Value>) -> Result<QueuedMessage> {
+pub fn queue_update_inner(state: &AppState, id: String, text: String, attachments: Option<serde_json::Value>) -> Result<QueuedMessage> {
     let store = state.store.lock().map_err(|e| e.to_string())?;
     update(&store, &id, &text, &attachments.unwrap_or_else(|| serde_json::json!([])))
 }
 
-#[tauri::command]
-pub async fn queue_remove(state: State<'_, AppState>, id: String) -> Result<()> {
+pub fn queue_remove_inner(state: &AppState, id: String) -> Result<()> {
     let store = state.store.lock().map_err(|e| e.to_string())?;
     remove(&store, &id)
 }
 
-#[tauri::command]
-pub async fn queue_reorder(state: State<'_, AppState>, session_id: String, ids: Vec<String>) -> Result<Vec<QueuedMessage>> {
+pub fn queue_reorder_inner(state: &AppState, session_id: String, ids: Vec<String>) -> Result<Vec<QueuedMessage>> {
     let store = state.store.lock().map_err(|e| e.to_string())?;
     reorder(&store, &session_id, &ids)
 }
 
-#[tauri::command]
-pub async fn queue_take(state: State<'_, AppState>, id: String) -> Result<QueuedMessage> {
+pub fn queue_take_inner(state: &AppState, id: String) -> Result<QueuedMessage> {
     let store = state.store.lock().map_err(|e| e.to_string())?;
     take(&store, &id)
 }
 
-#[tauri::command]
-pub async fn queue_restore(state: State<'_, AppState>, entry: QueuedMessage) -> Result<QueuedMessage> {
+pub fn queue_restore_inner(state: &AppState, entry: QueuedMessage) -> Result<QueuedMessage> {
     let store = state.store.lock().map_err(|e| e.to_string())?;
     restore(&store, &entry)
 }
 
+#[tauri::command]
+pub async fn queue_list(state: State<'_, AppState>, session_id: Option<String>) -> Result<Vec<QueuedMessage>> {
+    queue_list_inner(&state, session_id)
+}
+
+#[tauri::command]
+pub async fn queue_add(state: State<'_, AppState>, session_id: String, text: String, attachments: Option<serde_json::Value>) -> Result<QueuedMessage> {
+    queue_add_inner(&state, session_id, text, attachments)
+}
+
+#[tauri::command]
+pub async fn queue_update(state: State<'_, AppState>, id: String, text: String, attachments: Option<serde_json::Value>) -> Result<QueuedMessage> {
+    queue_update_inner(&state, id, text, attachments)
+}
+
+#[tauri::command]
+pub async fn queue_remove(state: State<'_, AppState>, id: String) -> Result<()> {
+    queue_remove_inner(&state, id)
+}
+
+#[tauri::command]
+pub async fn queue_reorder(state: State<'_, AppState>, session_id: String, ids: Vec<String>) -> Result<Vec<QueuedMessage>> {
+    queue_reorder_inner(&state, session_id, ids)
+}
+
+#[tauri::command]
+pub async fn queue_take(state: State<'_, AppState>, id: String) -> Result<QueuedMessage> {
+    queue_take_inner(&state, id)
+}
+
+#[tauri::command]
+pub async fn queue_restore(state: State<'_, AppState>, entry: QueuedMessage) -> Result<QueuedMessage> {
+    queue_restore_inner(&state, entry)
+}
+
 /// Sends a message into the running turn. On success it is saved to the transcript;
 /// a harness that cannot steer returns an error and the message should stay queued.
-#[tauri::command]
-pub async fn steer_task(state: State<'_, AppState>, session_id: String, text: String) -> Result<()> {
+pub async fn steer_task_inner(state: &AppState, session_id: &str, text: String) -> Result<()> {
     let text = text.trim().to_owned();
     if text.is_empty() {
         return Err("Write a message to steer with.".into());
     }
     let reply = {
         let agents = state.agents.lock().map_err(|e| e.to_string())?;
-        let agent = agents.get(&session_id).ok_or("The agent is not running; the message stays queued.")?;
+        let agent = agents.get(session_id).ok_or("The agent is not running; the message stays queued.")?;
         let (tx, rx) = tokio::sync::oneshot::channel();
         agent.send(RunInput::Steer { text: text.clone(), reply: tx }).map_err(|_| "The agent has stopped.".to_string())?;
         rx
@@ -208,7 +237,12 @@ pub async fn steer_task(state: State<'_, AppState>, session_id: String, text: St
         .await
         .map_err(|_| "The agent did not accept the message in time; it stays queued.".to_owned())?
         .map_err(|_| "The agent stopped before taking the message.".to_owned())??;
-    state.store.lock().map_err(|e| e.to_string())?.message(&session_id, "user", &text)
+    state.store.lock().map_err(|e| e.to_string())?.message(session_id, "user", &text)
+}
+
+#[tauri::command]
+pub async fn steer_task(state: State<'_, AppState>, session_id: String, text: String) -> Result<()> {
+    steer_task_inner(&state, &session_id, text).await
 }
 
 #[cfg(test)]

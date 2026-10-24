@@ -45,26 +45,26 @@ pub async fn handle(
     let command = request.command;
     let args = request.args;
     let ctx = state.ctx.clone();
-    // Store work is blocking; keep it off the request's own worker.
+    // Store work is blocking; keep it off the request's own worker. A turn command
+    // hands back a future instead, which is awaited here rather than in that worker.
     let outcome = tokio::task::spawn_blocking(move || dispatch::handle(&command, args, &ctx)).await;
-    let body = match outcome {
-        Ok(Ok(result)) => ResponseBody {
+    let result = match outcome {
+        Ok(dispatch::Answer::Ready(result)) => result,
+        Ok(dispatch::Answer::Pending(future)) => future.await,
+        Err(error) => Err(format!("the command did not finish: {error}")),
+    };
+    let body = match result {
+        Ok(result) => ResponseBody {
             id: request.id,
             ok: true,
             result: Some(result),
             error: None,
         },
-        Ok(Err(error)) => ResponseBody {
-            id: request.id,
-            ok: false,
-            result: None,
-            error: Some(error),
-        },
         Err(error) => ResponseBody {
             id: request.id,
             ok: false,
             result: None,
-            error: Some(format!("the command did not finish: {error}")),
+            error: Some(error),
         },
     };
     Json(body).into_response()
