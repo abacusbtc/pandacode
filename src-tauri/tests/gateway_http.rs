@@ -369,6 +369,53 @@ async fn turn_commands_answer_with_the_commands_own_error() {
 }
 
 #[tokio::test]
+async fn the_live_registry_is_empty_and_advertised() {
+    install_crypto_provider();
+    let data = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let handle = start(data.path()).await;
+
+    // Nothing is running, so nothing is live — and a task that exists is not live
+    // either, because the registry is written by launches, not read from rows.
+    let listed = call(&handle, "gateway_live_tasks", json!({})).await;
+    assert_eq!(listed, json!([]));
+
+    let created = call(
+        &handle,
+        "add_project",
+        json!({ "path": project.path().to_str().unwrap() }),
+    )
+    .await;
+    call(
+        &handle,
+        "create_session",
+        json!({ "projectId": created["id"], "provider": "claude", "model": "sonnet" }),
+    )
+    .await;
+    let listed = call(&handle, "gateway_live_tasks", json!({})).await;
+    assert_eq!(listed, json!([]), "an idle task is not a live task");
+
+    let url = format!("http://{}/capabilities", handle.addr);
+    let body: Value = reqwest::Client::new()
+        .get(&url)
+        .header("Authorization", "Bearer test-token")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let commands: Vec<&str> = body["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|command| command.as_str())
+        .collect();
+    assert!(commands.contains(&"gateway_live_tasks"));
+    handle.stop().await;
+}
+
+#[tokio::test]
 async fn a_second_gateway_on_the_same_data_directory_is_refused() {    install_crypto_provider();
     let dir = tempfile::tempdir().unwrap();
     let handle = start(dir.path()).await;

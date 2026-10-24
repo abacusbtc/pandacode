@@ -8,6 +8,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use super::commands;
+use super::live::Live;
 use crate::AppState;
 
 /// The commands the gateway serves. `handle` and `/capabilities` both read this
@@ -38,6 +39,8 @@ pub(crate) const COMMANDS: &[&str] = &[
     "queue_reorder",
     "queue_take",
     "queue_restore",
+    // M2 task 3: which tasks this gateway is driving (PAN-104).
+    "gateway_live_tasks",
 ];
 
 /// What the client may rely on beyond the raw command list.
@@ -54,9 +57,21 @@ const TEAMS_NOT_SERVED: &str = "Teams are not served over the gateway; this task
 pub(crate) struct Ctx {
     pub(crate) state: Arc<AppState>,
     /// What a turn runs with in this process: the gateway's own sink, its own
-    /// directories, and (until task 5 gives it approvals over the socket) a
-    /// surface that offers no desktop hosts.
+    /// directories, and (until task 5 gives it approvals over the socket) its own
+    /// surface.
     pub(crate) run: crate::run_ctx::RunContext,
+    /// The runs this process is actually driving, which no row can answer (§5).
+    pub(crate) live: Arc<Live>,
+}
+
+/// The provider a task would run, for the live entry.
+///
+/// One store read on the gateway's own send path. It is deliberately not folded
+/// into `resolve_send`/`resolve_start`: those are shared with the desktop
+/// wrappers, which have no use for it and should not pay for it.
+fn provider_of(state: &AppState, session_id: &str) -> Result<String, String> {
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    Ok(store.session(session_id)?.provider)
 }
 
 /// A command's answer.
@@ -192,15 +207,27 @@ pub fn handle(command: &str, args: Value, ctx: &Ctx) -> Answer {
                 if target.team {
                     return Err(TEAMS_NOT_SERVED.to_owned());
                 }
-                crate::send_message_inner(
+                let provider = provider_of(&ctx.state, &session_id)?;
+                // Recorded before the launch so a turn that ends at once cannot end
+                // before it was listed; the surface clears it when the run ends. A
+                // second send on a live session leaves the running turn's entry
+                // alone, including when its own launch is then refused.
+                let recorded = ctx.live.start(&session_id, &provider)?;
+                if let Err(error) = crate::send_message_inner(
                     &ctx.state,
                     ctx.run.clone(),
-                    session_id,
+                    session_id.clone(),
                     text,
                     image_ids,
                     target.project_id,
                 )
-                .await?;
+                .await
+                {
+                    if recorded {
+                        ctx.live.finish(&session_id);
+                    }
+                    return Err(error);
+                }
                 Ok(json!(null))
             })
         }
@@ -216,7 +243,16 @@ pub fn handle(command: &str, args: Value, ctx: &Ctx) -> Answer {
                 if crate::resolve_start(&ctx.state, &args.session_id)?.is_some() {
                     return Err(TEAMS_NOT_SERVED.to_owned());
                 }
-                crate::start_task_inner(&ctx.state, ctx.run.clone(), args.session_id).await?;
+                let provider = provider_of(&ctx.state, &args.session_id)?;
+                let recorded = ctx.live.start(&args.session_id, &provider)?;
+                if let Err(error) =
+                    crate::start_task_inner(&ctx.state, ctx.run.clone(), args.session_id.clone()).await
+                {
+                    if recorded {
+                        ctx.live.finish(&args.session_id);
+                    }
+                    return Err(error);
+                }
                 Ok(json!(null))
             })
         }
@@ -385,6 +421,8 @@ pub fn handle(command: &str, args: Value, ctx: &Ctx) -> Answer {
             )?)
         }),
 
+        "gateway_live_tasks" => ready(|| to_value(ctx.live.tasks())),
+
         other => ready(|| Err(format!("unsupported_command: {other}"))),
     }
 }
@@ -428,6 +466,7 @@ mod tests {
         Ctx {
             state: Arc::new(state),
             run,
+            live: Arc::new(Live::default()),
         }
     }
 
@@ -498,6 +537,129 @@ mod tests {
             error,
             "This task is already running in an agent or harness console."
         );
+    }
+
+    #[test]
+    fn a_row_that_claims_to_run_is_not_live_and_a_failed_launch_leaves_nothing_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx(dir.path());
+        let project = ctx.state.store.lock().unwrap().add_project(dir.path()).unwrap();
+        let session = ctx
+            .state
+            .store
+            .lock()
+            .unwrap()
+            .create_session(&project.id, "claude", "sonnet", "full")
+            .unwrap();
+        // A row claiming to run, with no process behind it. The registry is the
+        // proof of life, so the row alone must not appear.
+        ctx.state
+            .store
+            .lock()
+            .unwrap()
+            .begin_task_turn(&session.id, "hello")
+            .unwrap();
+        let listed = match handle("gateway_live_tasks", json!({}), &ctx) {
+            Answer::Ready(result) => result.unwrap(),
+            Answer::Pending(_) => panic!("gateway_live_tasks answers immediately"),
+        };
+        assert_eq!(listed, json!([]), "a stale row is not a live task");
+
+        // A launch that fails must not leave the entry behind. The guard is the
+        // failure this suite can drive without a harness: a turn is already
+        // running, so the launch is refused after the entry was recorded.
+        let other = ctx
+            .state
+            .store
+            .lock()
+            .unwrap()
+            .create_session(&project.id, "claude", "sonnet", "full")
+            .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        ctx.state.agents.lock().unwrap().insert(
+            other.id.clone(),
+            crate::RunningAgent::new(tx, Arc::new(std::sync::atomic::AtomicBool::new(false))),
+        );
+        let error = match handle(
+            "send_message",
+            json!({"sessionId": other.id, "text": "hi"}),
+            &ctx,
+        ) {
+            Answer::Pending(future) => runtime().block_on(future).unwrap_err(),
+            Answer::Ready(_) => panic!("send_message answers later"),
+        };
+        assert_eq!(
+            error, "This task is already running in an agent or harness console.",
+            "the guard is the failure path this test drives"
+        );
+        assert!(
+            ctx.live.tasks().is_empty(),
+            "a launch that failed must not stay listed: {:?}",
+            ctx.live.tasks()
+        );
+    }
+
+    #[test]
+    fn a_refused_second_send_leaves_the_running_turn_listed() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx(dir.path());
+        let project = ctx.state.store.lock().unwrap().add_project(dir.path()).unwrap();
+        let session = ctx
+            .state
+            .store
+            .lock()
+            .unwrap()
+            .create_session(&project.id, "claude", "sonnet", "full")
+            .unwrap();
+
+        // A turn is running: the registry has it and the agent registry agrees.
+        ctx.live.start(&session.id, "claude").unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        ctx.state.agents.lock().unwrap().insert(
+            session.id.clone(),
+            crate::RunningAgent::new(tx, Arc::new(std::sync::atomic::AtomicBool::new(false))),
+        );
+
+        let error = match handle(
+            "send_message",
+            json!({"sessionId": session.id, "text": "again"}),
+            &ctx,
+        ) {
+            Answer::Pending(future) => runtime().block_on(future).unwrap_err(),
+            Answer::Ready(_) => panic!("send_message answers later"),
+        };
+        assert_eq!(
+            error,
+            "This task is already running in an agent or harness console."
+        );
+        let listed = match handle("gateway_live_tasks", json!({}), &ctx) {
+            Answer::Ready(result) => result.unwrap(),
+            Answer::Pending(_) => panic!("gateway_live_tasks answers immediately"),
+        };
+        assert_eq!(
+            listed[0]["sessionId"], session.id,
+            "the refusal must not clear the turn that is still running"
+        );
+    }
+
+    #[test]
+    fn the_live_list_carries_what_a_client_needs_to_address_the_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx(dir.path());
+        ctx.live.start("s1", "claude").unwrap();
+        let listed = match handle("gateway_live_tasks", json!({}), &ctx) {
+            Answer::Ready(result) => result.unwrap(),
+            Answer::Pending(_) => panic!("gateway_live_tasks answers immediately"),
+        };
+        assert_eq!(listed[0]["sessionId"], "s1");
+        assert_eq!(listed[0]["provider"], "claude");
+        assert!(listed[0]["startedAt"].is_i64());
+        ctx.live.finish("s1");
+        let empty = match handle("gateway_live_tasks", json!({}), &ctx) {
+            Answer::Ready(result) => result.unwrap(),
+            Answer::Pending(_) => panic!("gateway_live_tasks answers immediately"),
+        };
+        assert_eq!(empty, json!([]));
     }
 
     #[test]

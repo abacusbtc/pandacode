@@ -8,9 +8,13 @@ pub mod config;
 mod commands;
 mod dispatch;
 mod events;
+mod live;
 mod rpc;
 mod server;
 mod static_files;
+
+#[cfg(test)]
+mod recovery_tests;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -76,16 +80,17 @@ pub async fn spawn(config: GatewayConfig) -> std::io::Result<GatewayHandle> {
     // guard against two sinks in one process.
     let _ = crate::events::set_sink(sink.clone());
     // A turn runs with the gateway's own context: the sink installed just above,
-    // directories under the data directory this process owns, and (until task 5
-    // gives it approvals over the socket) a surface with no desktop hosts. Built
-    // after the sink, because a context without one is refused.
+    // directories under the data directory this process owns, and its own surface,
+    // which keeps the live registry true. Built after the sink, because a context
+    // without one is refused.
     let cache_dir = config.data_dir.join("cache");
     std::fs::create_dir_all(&cache_dir).map_err(std::io::Error::other)?;
+    let live = Arc::new(live::Live::default());
     let run = crate::run_ctx::RunContext::headless(
         cache_dir,
         config.data_dir.clone(),
         state.ui.clone(),
-        Arc::new(crate::run_ctx::NoSurface),
+        Arc::new(live::GatewaySurface::new(live.clone())),
     )
     .map_err(std::io::Error::other)?;
     let router = server::router(server::RouterState {
@@ -96,6 +101,7 @@ pub async fn spawn(config: GatewayConfig) -> std::io::Result<GatewayHandle> {
         ctx: dispatch::Ctx {
             state: Arc::new(state),
             run,
+            live,
         },
     });
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
