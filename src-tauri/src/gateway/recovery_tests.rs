@@ -84,6 +84,7 @@ fn gateway_config(dir: &Path) -> GatewayConfig {
         token: "test-token".into(),
         static_dir: None,
         allowed_origins: config::default_origins(),
+        upload_max: config::DEFAULT_UPLOAD_MAX,
         force_owner: false,
     }
 }

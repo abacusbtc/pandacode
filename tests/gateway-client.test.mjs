@@ -155,3 +155,61 @@ test('unsubscribing every listener stops the dropped socket from reconnecting', 
 
   client.close();
 });
+
+class FakeUpload {
+  static instances = [];
+  constructor() {
+    this.opened = null;
+    this.headers = {};
+    this.upload = { onprogress: null };
+    this.status = 200;
+    this.responseText = '';
+    FakeUpload.instances.push(this);
+  }
+  open(method, url) { this.opened = { method, url }; }
+  setRequestHeader(name, value) { this.headers[name] = value; }
+  send(body) { this.body = body; }
+  progress(loaded, total) { this.upload.onprogress?.({ lengthComputable: true, loaded, total }); }
+  answer(status, body) { this.status = status; this.responseText = JSON.stringify(body); this.onload?.(); }
+  fail() { this.onerror?.(); }
+}
+
+const uploads = () => {
+  FakeUpload.instances = [];
+  return FakeUpload;
+};
+
+test('upload posts the bytes to /upload with the token and a name in the query', async () => {
+  const Impl = uploads();
+  const client = createGatewayClient({ url: 'http://gw.test/', token: 't', fetchImpl: async () => ok(null), WebSocketImpl: sockets(), XMLHttpRequestImpl: Impl });
+  const progress = [];
+  const receipt = { id: 'u1', name: 'My scan.pdf', kind: 'document', bytes: 3, sha256: 'abc', createdAt: 1 };
+  const pending = client.upload(new Blob(['abc']), 'My scan.pdf', 'document', (sent, total) => progress.push([sent, total]));
+  const request = Impl.instances[0];
+  assert.equal(request.opened.method, 'POST');
+  assert.equal(request.opened.url, 'http://gw.test/upload?name=My%20scan.pdf&kind=document');
+  assert.equal(request.headers.Authorization, 'Bearer t');
+  request.progress(1, 3);
+  request.progress(3, 3);
+  request.answer(200, receipt);
+  assert.deepEqual(await pending, receipt);
+  assert.deepEqual(progress, [[1, 3], [3, 3]]);
+  client.close();
+});
+
+test('a refused upload rejects with the server sentence, not a status code', async () => {
+  const Impl = uploads();
+  const client = createGatewayClient({ url: 'http://gw.test', token: 't', fetchImpl: async () => ok(null), WebSocketImpl: sockets(), XMLHttpRequestImpl: Impl });
+  const pending = client.upload(new Blob(['x']), 'big.bin', 'document');
+  Impl.instances[0].answer(413, { error: 'This file is larger than 200 MB.' });
+  await assert.rejects(() => pending, /larger than 200 MB/);
+
+  const unauthorized = client.upload(new Blob(['x']), 'a.txt', 'document');
+  Impl.instances[1].answer(401, {});
+  await assert.rejects(() => unauthorized, /unauthorized/i);
+
+  const offline = client.upload(new Blob(['x']), 'a.txt', 'document');
+  Impl.instances[2].fail();
+  await assert.rejects(() => offline, /unreachable/i);
+  client.close();
+});

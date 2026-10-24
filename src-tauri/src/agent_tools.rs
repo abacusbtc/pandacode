@@ -694,6 +694,7 @@ async fn dispatch(
                 target.id.clone(),
                 text,
                 None,
+                None,
                 Some(current.project_id),
             )
             .await?;

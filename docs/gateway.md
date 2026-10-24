@@ -31,7 +31,7 @@ The binary is a normal cargo target; `--help` prints the flags:
 
 ```sh
 cargo run --manifest-path src-tauri/Cargo.toml --features gateway --bin pandacode-gateway -- --help
-usage: pandacode-gateway [--data-dir <dir>] [--host <host>] [--port <port>] [--token <token>] [--token-file <file>] [--static-dir <dir>] [--allow-origin <origin>]… [--force-owner]
+usage: pandacode-gateway [--data-dir <dir>] [--host <host>] [--port <port>] [--token <token>] [--token-file <file>] [--static-dir <dir>] [--allow-origin <origin>]… [--upload-max <size>] [--force-owner]
 ```
 
 `--host` defaults to `127.0.0.1` and `--port` to `47399`. `--static-dir` is
@@ -39,6 +39,11 @@ optional: without it the gateway is API-only and every page request is a 404,
 which is the right mode behind a proxy that already serves the files. `--help` and
 `Ctrl-C` work as they should; the lock and the listener are both released on
 SIGINT.
+
+`--upload-max` is the largest single file `POST /upload` accepts: `200MiB` by
+default, written as plain bytes or with a unit (`200MiB`, `512KB`, `1G`). It is an
+accident guard — a phone photo of a document fits, a mistaken video does not — not
+a security control. The RPC surface keeps its own 64 MiB cap regardless.
 
 ## The data directory
 
@@ -198,12 +203,23 @@ proxy; do not expose the HTTP port itself.
   allow a long read timeout — nginx's default 60 s drops an idle socket. The app
   reconnects, so a drop is a hiccup rather than a failure, but the event stream is
   only as good as the proxy's timeout.
-- **Body limit.** `client_max_body_size 64m` in nginx, the same number as the
-  gateway's own cap. A smaller proxy limit refuses bodies the gateway would have
-  taken, and the client sees the proxy's HTML error page instead of an RPC error.
+- **Body limit.** `client_max_body_size 220m` in nginx. Two limits are in play: an
+  RPC call is capped at 64 MiB, and `/upload` takes one file of up to 200 MiB
+  (`--upload-max`). Set the proxy to the largest of them plus headroom — a proxy
+  limit below the upload cap refuses a file the gateway would have taken, and the
+  client sees the proxy's HTML error page instead of the gateway's sentence. If you
+  change `--upload-max`, change this line with it.
+- **Uploads.** `POST /upload?name=<urlencoded>&kind=image|document` with the file as
+  the raw request body; the answer is `{id, name, kind, bytes, sha256, createdAt}`,
+  and a message names those ids in `uploadIds`. Raise `client_body_timeout` (and
+  nginx's `proxy_request_buffering off`) if you upload over a slow link: the
+  gateway streams, but a proxy that buffers the whole body first turns a 200 MiB
+  upload into 200 MiB of proxy memory. Uploaded files live in
+  `<data-dir>/uploads/<uuid>/`, are cleaned up after 24 hours if no message refers
+  to them, and at most 7 days even when one does.
 - **Paths.** Serve everything under one host: the SPA, `/rpc`, `/capabilities`,
-  `/events` and `/healthz`. Client routes are answered by `index.html`, so do not
-  rewrite unknown paths to a 404.
+  `/events`, `/upload` and `/healthz`. Client routes are answered by `index.html`,
+  so do not rewrite unknown paths to a 404.
 - **Origin.** When the app is served *by* the gateway it is same-origin and needs
   no flag. A page on another origin calling the API must be named with
   `--allow-origin https://…`, once per origin; the default list is the app's own
