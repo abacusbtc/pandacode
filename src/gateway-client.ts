@@ -19,13 +19,40 @@ export type GatewayOptions = {
   token: string;
   fetchImpl?: typeof fetch;
   WebSocketImpl?: GatewaySocketImpl;
+  /** Uploads report progress, which needs `XMLHttpRequest`; tests inject a stub. */
+  XMLHttpRequestImpl?: UploadRequestImpl;
   /** Delay before reopening a dropped events socket. Tests set it to a few ms. */
   reconnectDelayMs?: number;
 };
 
+/** What `/upload` answers: the id a message names, never a path. */
+export type UploadReceipt = {
+  id: string;
+  name: string;
+  kind: 'image' | 'document';
+  bytes: number;
+  sha256: string;
+  createdAt: number;
+};
+
+/** The smallest upload surface this needs, so a stub can stand in for XHR. */
+export type UploadRequest = {
+  upload: { onprogress: ((event: { lengthComputable: boolean; loaded: number; total: number }) => void) | null };
+  onload: (() => void) | null;
+  onerror: (() => void) | null;
+  status: number;
+  responseText: string;
+  open(method: string, url: string): void;
+  setRequestHeader(name: string, value: string): void;
+  send(body: unknown): void;
+};
+export type UploadRequestImpl = new () => UploadRequest;
+
 export type GatewayClient = {
   call<T>(command: string, args?: Record<string, unknown>): Promise<T>;
   subscribe(name: string, callback: (payload: any) => void): Promise<() => void>;
+  /** Streams one file to the gateway; `onProgress` gets bytes sent of the total. */
+  upload(file: Blob, name: string, kind: 'image' | 'document', onProgress?: (sent: number, total: number) => void): Promise<UploadReceipt>;
   close(): void;
 };
 
@@ -109,6 +136,31 @@ export function createGatewayClient(options: GatewayOptions): GatewayClient {
         // sees zero listeners once the last one goes.
         if (set.size === 0) listeners.delete(name);
       };
+    },
+    upload(file: Blob, name: string, kind: 'image' | 'document', onProgress?: (sent: number, total: number) => void): Promise<UploadReceipt> {
+      // The request body is the file itself, so the server streams it rather than
+      // parsing anything; the name is display metadata in the query, and `call`
+      // cannot carry bytes without base64.
+      const Impl = options.XMLHttpRequestImpl ?? (XMLHttpRequest as unknown as UploadRequestImpl);
+      return new Promise<UploadReceipt>((resolve, reject) => {
+        const request = new Impl();
+        request.open('POST', `${base}/upload?name=${encodeURIComponent(name)}&kind=${kind}`);
+        request.setRequestHeader('Authorization', `Bearer ${token}`);
+        request.upload.onprogress = event => {
+          if (event.lengthComputable && onProgress) onProgress(event.loaded, event.total);
+        };
+        request.onerror = () => reject(`gateway_unreachable: the upload to ${base} failed`);
+        request.onload = () => {
+          if (request.status === 401) return reject('unauthorized: the gateway rejected the token');
+          let body: Partial<UploadReceipt> & { error?: string } = {};
+          try { body = JSON.parse(request.responseText); } catch { /* a non-JSON reply is reported below */ }
+          if (request.status !== 200 || typeof body.id !== 'string') {
+            return reject(body.error || `gateway_error: ${request.status}`);
+          }
+          resolve(body as UploadReceipt);
+        };
+        request.send(file);
+      });
     },
     close() {
       closed = true;

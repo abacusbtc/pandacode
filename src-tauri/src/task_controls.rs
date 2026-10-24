@@ -146,6 +146,7 @@ pub(super) async fn task_goal(
         Some(text),
         None,
         None,
+        None,
         Some(GoalLaunch { request, reply: tx }),
     )
     .await?;

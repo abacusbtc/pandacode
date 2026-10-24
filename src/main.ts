@@ -2048,7 +2048,7 @@ async function deliverQueued(task: Session, entry: QueuedMessage): Promise<void>
     task.lastPromptAt = sentAt; task.draft = false; pendingPromptActivity.set(task.id, sentAt);
     stream(task.id).lastPromptAt = sentAt; stream(task.id).status = 'Starting agent'; task.status = 'running'; task.taskStage = 'in_progress'; task.completedAt = null;
     if (task.id === state.sessionId) { state.messages = [...state.messages, { id: transientId--, sessionId: task.id, role: 'user', content, createdAt: sentAt }]; render(); } else renderNavigation();
-    await call(teams.get(task.id) ? 'architect_start' : 'send_message', { sessionId: task.id, text: content, imageIds: attachments.imageIds(promptItems), moodboardIds: [] });
+    await call(teams.get(task.id) ? 'architect_start' : 'send_message', { sessionId: task.id, text: content, imageIds: attachments.imageIds(promptItems), uploadIds: currentMode() === 'remote' ? attachments.uploadIds(promptItems) : [], moodboardIds: [] });
   } catch (error) {
     // Put it back at the front and hold, so nothing is lost or sent out of order.
     pendingPromptActivity.delete(task.id); state.streams.delete(task.id); task.status = 'idle';
@@ -2164,10 +2164,12 @@ async function send(): Promise<void> {
       if (sent.length) enterView(sent[sent.length - 1], 12);
     } else renderNavigation();
     const imageIds = [...screenshots, ...attachments.imageIds(promptItems)];
+    // Uploaded files travel as ids: the gateway already holds the bytes (PAN-108).
+    const uploadIds = currentMode() === 'remote' ? attachments.uploadIds(promptItems) : [];
     // A bot's own conversation goes through the bot, which adds its brief and memories.
     const bot = sidebarBots.find(item => item.desktopSession === s.id);
-    if (bot && !imageIds.length && !moodboardItems.length && !teams.get(s.id)) await call('bot_message', { botId: bot.id, text: content });
-    else await call(teams.get(s.id) && !moodboardItems.length ? 'architect_start' : 'send_message', { sessionId: s.id, text: content, imageIds, moodboardIds: moodboardItems.map(item => item.id) });
+    if (bot && !imageIds.length && !uploadIds.length && !moodboardItems.length && !teams.get(s.id)) await call('bot_message', { botId: bot.id, text: content });
+    else await call(teams.get(s.id) && !moodboardItems.length ? 'architect_start' : 'send_message', { sessionId: s.id, text: content, imageIds, uploadIds, moodboardIds: moodboardItems.map(item => item.id) });
   } catch (error) {
     pendingPromptActivity.delete(s.id);
     state.streams.delete(s.id); s.status = 'idle';

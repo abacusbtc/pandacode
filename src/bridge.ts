@@ -69,6 +69,23 @@ export async function call<T>(command: string, args: Record<string, unknown> = {
   }
   return callShell<T>(command, args);
 }
+/**
+ * Sends one file to the gateway that this window is driving.
+ *
+ * This is the only path an attachment takes in remote mode: the file's bytes go to
+ * the gateway, which answers with an id a message can name. Nothing here reads the
+ * file for the prompt — a document's text comes back through the agent's context,
+ * and an image previews from the local file the person picked.
+ */
+export async function uploadAttachment(
+  file: Blob,
+  name: string,
+  kind: 'image' | 'document',
+  onProgress?: (sent: number, total: number) => void,
+): Promise<import('./gateway-client').UploadReceipt> {
+  if (mode !== 'remote' || !remote) throw new Error('Uploading needs a connected gateway.');
+  return remote.upload(file, name, kind, onProgress);
+}
 export async function subscribe(name: 'agent-update-progress', callback: (event: import('./agent-updates').AgentUpdateProgress) => void): Promise<() => void>;
 export async function subscribe(name: 'jev-run', callback: (event: import('./jev').JevReport) => void): Promise<() => void>;
 export async function subscribe(name: 'jev-frame', callback: (event: import('./jev-live').JevFrame) => void): Promise<() => void>;

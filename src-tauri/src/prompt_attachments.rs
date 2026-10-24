@@ -229,11 +229,26 @@ pub fn import_image(dir: &Path, source: ImageSource) -> Result<ImportedImage, St
     })
 }
 
-fn extension(path: &Path) -> String {
-    path.extension()
-        .and_then(|ext| ext.to_str())
+fn extension(name: &str) -> String {
+    name.rsplit_once('.')
+        .map(|(_, ext)| ext.to_ascii_lowercase())
         .unwrap_or_default()
-        .to_ascii_lowercase()
+}
+
+/// A client's filename as a person reads it: no control characters, bounded, and
+/// never empty. It is display text only — the bytes are read from the path.
+fn display_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(120)
+        .collect();
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() {
+        "Document".to_owned()
+    } else {
+        cleaned.to_owned()
+    }
 }
 
 /// Decode the string literal that `mdimport -d3` prints for `kMDItemTextContent`:
@@ -346,9 +361,16 @@ fn extract_with(_tool: &str, _args: &[&str], _path: &Path) -> Result<String, Str
 /// rich-text formats go through `textutil`, everything else through Spotlight's
 /// importers (`mdimport`), which cover PDF, iWork, EPUB and many more.
 pub fn read_document(path: &Path) -> Result<DocumentText, String> {
-    let (mut file, size) = checked_file(path, MAX_DOCUMENT_BYTES, "document")?;
     let name = file_name(path, "Document");
-    let ext = extension(path);
+    read_document_as(path, &name)
+}
+
+/// The same, for a file whose stored path says nothing about its format: an upload
+/// is `<uuid>/data`, so the format has to come from the name the client gave it.
+pub(crate) fn read_document_as(path: &Path, name: &str) -> Result<DocumentText, String> {
+    let (mut file, size) = checked_file(path, MAX_DOCUMENT_BYTES, "document")?;
+    let name = display_name(name);
+    let ext = extension(&name);
     let mut cut = false;
     let (text, method) = match ext.as_str() {
         "doc" | "docx" | "rtf" | "rtfd" | "odt" | "wordml" | "webarchive" => (
