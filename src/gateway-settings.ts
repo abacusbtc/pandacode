@@ -7,14 +7,14 @@
 // transport, because in remote mode that transport is the gateway itself.
 
 import { createGatewayClient, type GatewayClient } from './gateway-client';
-import { GATED, serves } from './gateway-gating';
+import { GATED, featureServed, serves } from './gateway-gating';
 import { callShell, currentMode, preview, setMode, type Mode } from './bridge';
 import { escape } from './dom';
 
 /** The gateway's answer to `gateway_status` (D2/D4). */
 type StatusReply = { commands?: string[]; features?: string[] };
 
-type Connection = { url: string; commands: string[]; reachable: boolean };
+type Connection = { url: string; commands: string[]; features: string[]; reachable: boolean };
 
 let client: GatewayClient | null = null;
 let connection: Connection | null = null;
@@ -27,6 +27,14 @@ export function gatewayStatus(): { url: string; mode: Mode } | null {
 /** Whether the connected gateway serves a command. The local transports serve everything. */
 export function capabilityEnabled(command: string): boolean {
   return serves(connection ? connection.commands : null, command);
+}
+
+/**
+ * Whether the connected gateway advertises a capability such as `turns`. The local
+ * transports have every capability; a gateway has only what its answer named.
+ */
+export function featureEnabled(feature: string): boolean {
+  return featureServed(connection ? connection.features : null, feature);
 }
 
 export function gatewayHost(url: string): string {
@@ -90,7 +98,7 @@ export async function attachGateway(url: string, token: string): Promise<boolean
   const next = createGatewayClient({ url: base, token });
   client?.close();
   client = next;
-  connection = { url: base, commands: [], reachable: false };
+  connection = { url: base, commands: [], features: [], reachable: false };
   await setMode('remote', next);
   paintGatewayBadge();
   applyCapabilities([]);
@@ -98,7 +106,8 @@ export async function attachGateway(url: string, token: string): Promise<boolean
     const status = await next.call<StatusReply>('gateway_status', {});
     const commands = Array.isArray(status?.commands) ? status.commands.filter((command): command is string => typeof command === 'string') : null;
     if (!commands) throw 'The gateway did not answer with a command list.';
-    connection = { url: base, commands, reachable: true };
+    const features = Array.isArray(status?.features) ? status.features.filter((feature): feature is string => typeof feature === 'string') : [];
+    connection = { url: base, commands, features, reachable: true };
     applyCapabilities(commands);
   } catch {
     // Keep the client and the address: the next attempt or the next launch can retry,

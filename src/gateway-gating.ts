@@ -24,3 +24,14 @@ export const GATED: { command: string; selector: string }[] = [
 export function serves(commands: string[] | null, command: string): boolean {
   return !commands || commands.includes(command);
 }
+
+/**
+ * Whether a gateway advertises a *capability* rather than a command. The rule is the
+ * same: `null` is this computer's own backend, which has every capability, and a
+ * gateway has only what its answer named. A feature is coarser than a command on
+ * purpose — `turns` says "this gateway can drive an agent turn", and a client that
+ * does not see it must not offer a remote turn at all (PAN-107).
+ */
+export function featureServed(features: string[] | null, feature: string): boolean {
+  return !features || features.includes(feature);
+}

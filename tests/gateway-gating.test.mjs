@@ -4,7 +4,7 @@
 // tests/gateway-e2e.spec.ts; this pins the rule itself.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { GATED, serves } from '../src/gateway-gating.ts';
+import { GATED, featureServed, serves } from '../src/gateway-gating.ts';
 
 // The M1 table in src-tauri/src/gateway/dispatch.rs. A name added there is not gated
 // here until someone says which surface it makes real, which is the point of the list.
@@ -26,6 +26,17 @@ test('a gateway that named no commands serves none, rather than falling back to 
   // `attachGateway` paints with [] before the status reply arrives: a half-connected
   // window must not claim a surface it has not been told about.
   assert.equal(serves([], 'list_projects'), false);
+});
+
+test('a capability is advertised by the gateway, not assumed from the command list', () => {
+  const turns = ['projects', 'sessions', 'turns'];
+  assert.equal(featureServed(turns, 'turns'), true);
+  // A gateway that predates the capability -- the M1/M2 shape before task 6 -- cannot
+  // drive a turn, and telling it apart is the whole reason the name exists.
+  assert.equal(featureServed(['projects', 'sessions'], 'turns'), false);
+  // Local transports have every capability, and a half-connected window has none.
+  assert.equal(featureServed(null, 'turns'), true);
+  assert.equal(featureServed([], 'turns'), false);
 });
 
 test('every gated surface names the command that would make it real, and a selector to hide', () => {

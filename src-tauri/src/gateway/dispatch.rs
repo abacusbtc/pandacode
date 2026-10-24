@@ -41,10 +41,17 @@ pub(crate) const COMMANDS: &[&str] = &[
     "queue_restore",
     // M2 task 3: which tasks this gateway is driving (PAN-104).
     "gateway_live_tasks",
+    // M2 task 6: the catalog a client picks from (PAN-107).
+    "list_providers",
+    "list_provider_models",
 ];
 
 /// What the client may rely on beyond the raw command list.
-pub(crate) const FEATURES: &[&str] = &["projects", "sessions"];
+///
+/// `turns` is the one that changes what a client offers: a gateway that answers the
+/// turn commands advertises it, and a client that does not see it must not show a
+/// remote turn surface at all (PAN-107).
+pub(crate) const FEATURES: &[&str] = &["projects", "sessions", "turns"];
 
 /// A team is N runs driven by the architect, which a window owns; M2 does not
 /// serve teams (spec section 8, rows 2 and 6). Saying so is better than starting
@@ -423,6 +430,28 @@ pub fn handle(command: &str, args: Value, ctx: &Ctx) -> Answer {
 
         "gateway_live_tasks" => ready(|| to_value(ctx.live.tasks())),
 
+        // A catalog read runs the provider CLIs, so it answers with a future like the
+        // other work that is not a store read (PAN-107).
+        "list_providers" => pending(async move {
+            #[derive(serde::Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct Args {
+                force: Option<bool>,
+            }
+            let args: Args = from_value(args)?;
+            to_value(crate::list_providers_inner(args.force).await)
+        }),
+        "list_provider_models" => pending(async move {
+            #[derive(serde::Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct Args {
+                provider: String,
+                force: Option<bool>,
+            }
+            let args: Args = from_value(args)?;
+            to_value(crate::list_provider_models_inner(args.provider, args.force).await?)
+        }),
+
         other => ready(|| Err(format!("unsupported_command: {other}"))),
     }
 }
@@ -660,6 +689,72 @@ mod tests {
             Answer::Pending(_) => panic!("gateway_live_tasks answers immediately"),
         };
         assert_eq!(empty, json!([]));
+    }
+
+    #[test]
+    fn the_catalog_over_rpc_is_the_desktop_commands_own_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx(dir.path());
+        let runtime = runtime();
+
+        let over_rpc = match handle("list_providers", json!({}), &ctx) {
+            Answer::Pending(future) => runtime.block_on(future).unwrap(),
+            Answer::Ready(_) => panic!("list_providers answers later"),
+        };
+        let desktop = runtime.block_on(crate::list_providers(None));
+        assert_eq!(
+            over_rpc,
+            serde_json::to_value(&desktop).unwrap(),
+            "the wire carries the command's own answer, not a re-shaping"
+        );
+
+        // A provider's models: the same answer success or failure, because it is the
+        // same call underneath.
+        if let Some(provider) = desktop.iter().find(|p| p.installed).or_else(|| desktop.first()) {
+            let rpc = match handle(
+                "list_provider_models",
+                json!({"provider": provider.id}),
+                &ctx,
+            ) {
+                Answer::Pending(future) => runtime.block_on(future),
+                Answer::Ready(_) => panic!("list_provider_models answers later"),
+            };
+            match runtime.block_on(crate::list_provider_models(provider.id.clone(), None)) {
+                Ok(models) => assert_eq!(rpc.unwrap(), serde_json::to_value(&models).unwrap()),
+                Err(error) => assert_eq!(rpc.unwrap_err(), error, "a failure is the same failure"),
+            }
+        }
+    }
+
+    #[test]
+    fn capabilities_advertise_turns_and_the_catalog_is_listed() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx(dir.path());
+        let value = match handle("gateway_status", json!({}), &ctx) {
+            Answer::Ready(result) => result.unwrap(),
+            Answer::Pending(_) => panic!("gateway_status answers immediately"),
+        };
+        let features: Vec<&str> = value["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|feature| feature.as_str())
+            .collect();
+        assert!(
+            features.contains(&"turns"),
+            "a client decides whether to offer remote turns from this: {features:?}"
+        );
+        // And the rule from task 3 still holds: a command a client is promised is in
+        // the same list the dispatcher answers from.
+        let advertised: Vec<&str> = value["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|command| command.as_str())
+            .collect();
+        for command in ["list_providers", "list_provider_models"] {
+            assert!(advertised.contains(&command), "{command} is served but not advertised");
+        }
     }
 
     #[test]
