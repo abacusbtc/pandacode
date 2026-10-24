@@ -808,10 +808,14 @@ impl Drop for UiGuard {
 ///
 /// The registry and the emitter come from the caller, so the same flow works for
 /// the desktop (its app state and its sink) and for a headless run (the context's
-/// registry and sink).
+/// registry and sink). `attached` is the run's own surface answering whether a
+/// client is there: an app action needs a live client to open a picker or render a
+/// preview, so with none it gives up after five seconds instead of twelve rather
+/// than waiting for somebody who is not listening (PAN-106).
 pub(crate) async fn request_ui_on(
     ui: &Arc<crate::run_ctx::UiRequests>,
     emit: impl FnOnce(&str, Value) -> Result<()>,
+    attached: bool,
     sid: &str,
     action: &str,
     args: Value,
@@ -827,9 +831,22 @@ pub(crate) async fn request_ui_on(
         "agent-ui-action",
         json!({"requestId":id,"sessionId":sid,"action":action,"args":args}),
     )?;
-    tokio::time::timeout(Duration::from_secs(12), rx)
+    // An app action asks a client to do something only a client can do, so with no
+    // client it fails fast instead of waiting out the desktop's patience.
+    let wait = if attached {
+        Duration::from_secs(12)
+    } else {
+        Duration::from_secs(5)
+    };
+    tokio::time::timeout(wait, rx)
         .await
-        .map_err(|_| "App action timed out.".to_string())?
+        .map_err(|_| {
+            if attached {
+                "The app waited too long for an answer.".to_string()
+            } else {
+                "No client is attached to answer this app action.".to_string()
+            }
+        })?
         .map_err(|_| "App action cancelled.".to_string())?
 }
 
@@ -844,6 +861,9 @@ async fn request_ui(
     request_ui_on(
         &state.ui,
         |name, payload| crate::events::emit_to(&app, "main", name, payload),
+        // A window is an attached client, so the desktop keeps waiting exactly as
+        // it does today.
+        true,
         sid,
         action,
         args,

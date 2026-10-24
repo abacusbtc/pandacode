@@ -62,7 +62,7 @@ pub use usage_keychain::handle_usage_keychain_helper;
 use providers::{AgentEvent, RunConfig, RunInput};
 use serde::Serialize;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicU8, Ordering},
@@ -75,11 +75,46 @@ use tauri::{Manager, State};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
 type Result<T> = std::result::Result<T, String>;
+
+/// One question a turn is waiting on, with the moment it was asked.
+///
+/// The text rides along for the audit line an auto-deny writes; the deadline is
+/// counted from `raised_at`, never from the last event a turn happened to send
+/// (PAN-106). Both fields are read by the gateway's watchdog, which is not
+/// compiled into a desktop build.
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub(crate) struct PendingApproval {
+    pub(crate) raised_at: i64,
+    pub(crate) text: String,
+}
+
+impl PendingApproval {
+    pub(crate) fn raised(text: impl Into<String>) -> Self {
+        Self {
+            raised_at: storage::now(),
+            text: text.into(),
+        }
+    }
+
+    /// Raised at a chosen moment, for tests that need an approval already old.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn at(raised_at: i64, text: impl Into<String>) -> Self {
+        Self {
+            raised_at,
+            text: text.into(),
+        }
+    }
+}
+
 pub(crate) struct RunningAgent {
     input: UnboundedSender<RunInput>,
     stopped: Arc<AtomicBool>,
     run_id: String,
-    approvals: Arc<Mutex<HashSet<String>>>,
+    /// Pending approval and question ids with the moment each was raised, so a
+    /// headless turn can deny one that nobody answers (PAN-106).
+    approvals: Arc<Mutex<HashMap<String, PendingApproval>>>,
     subagents: Arc<Mutex<subagent_state::SubagentState>>,
     assistant: Arc<Mutex<String>>,
     /// When the harness last sent anything; team watchdogs stop a turn that went silent.
@@ -91,7 +126,7 @@ impl RunningAgent {
             input,
             stopped,
             run_id: uuid::Uuid::new_v4().to_string(),
-            approvals: Arc::new(Mutex::new(HashSet::new())),
+            approvals: Arc::new(Mutex::new(HashMap::new())),
             subagents: Arc::new(Mutex::new(subagent_state::SubagentState::default())),
             assistant: Arc::new(Mutex::new(String::new())),
             last_event: Arc::new(std::sync::atomic::AtomicI64::new(storage::now())),
@@ -116,7 +151,7 @@ impl RunningAgent {
         // Lock order is registry (caller) -> approvals -> store. A new request
         // cannot become waiting between deciding the status and persisting it.
         let mut approvals = self.approvals.lock().map_err(|error| error.to_string())?;
-        if self.stopped.load(Ordering::SeqCst) || !approvals.contains(&request_id) {
+        if self.stopped.load(Ordering::SeqCst) || !approvals.contains_key(&request_id) {
             return Err("This approval is no longer pending.".into());
         }
         let original_id = request_id
@@ -157,7 +192,7 @@ type Agents = Arc<Mutex<HashMap<String, RunningAgent>>>;
 
 fn save_approval(
     store: &Mutex<Store>,
-    approvals: &Mutex<HashSet<String>>,
+    approvals: &Mutex<HashMap<String, PendingApproval>>,
     run_id: &str,
     activity: &mut AgentEvent,
 ) -> Result<()> {
@@ -169,7 +204,10 @@ fn save_approval(
     activity.request_id = Some(request_id.clone());
     let mut approvals = approvals.lock().map_err(|error| error.to_string())?;
     if matches!(activity.kind.as_str(), "approval" | "input_request") {
-        approvals.insert(request_id);
+        approvals.insert(
+            request_id,
+            PendingApproval::raised(activity.text.chars().take(200).collect::<String>()),
+        );
     } else {
         approvals.remove(&request_id);
     }
@@ -187,6 +225,8 @@ fn save_approval(
 mod concurrent_task_tests;
 #[cfg(test)]
 mod turn_command_tests;
+#[cfg(test)]
+mod app_action_tests;
 
 /// A provider can finish while the database is temporarily unable to write its
 /// final status. The process registry remains authoritative for whether work is
@@ -1236,7 +1276,7 @@ struct PreparedRun {
     turn_started: std::time::Instant,
     context_handoff: Option<i64>,
     run_id: String,
-    pending_approvals: Arc<Mutex<HashSet<String>>>,
+    pending_approvals: Arc<Mutex<HashMap<String, PendingApproval>>>,
     subagents: Arc<Mutex<subagent_state::SubagentState>>,
     assistant: Arc<Mutex<String>>,
     last_event: Arc<std::sync::atomic::AtomicI64>,
@@ -1441,6 +1481,11 @@ struct DesktopSurface {
 }
 
 impl run_ctx::TurnSurface for DesktopSurface {
+    fn client_attached(&self) -> bool {
+        // A window is the client, and it is attached for as long as the app runs.
+        true
+    }
+
     fn base_host(
         &self,
         provider: &str,
@@ -2198,7 +2243,7 @@ pub(crate) async fn respond_user_input_inner(
             .get(session_id)
             .ok_or("This agent is no longer running.")?;
         let pending = agent.approvals.lock().map_err(|e| e.to_string())?;
-        if agent.stopped.load(Ordering::SeqCst) || !pending.contains(&request_id) {
+        if agent.stopped.load(Ordering::SeqCst) || !pending.contains_key(&request_id) {
             return Err("This question is no longer pending.".into());
         }
         let original_id = request_id

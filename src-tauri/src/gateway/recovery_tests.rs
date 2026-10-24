@@ -85,6 +85,7 @@ fn gateway_config(dir: &Path) -> GatewayConfig {
         static_dir: None,
         allowed_origins: config::default_origins(),
         force_owner: false,
+        approval_ttl: Some(config::DEFAULT_APPROVAL_TTL),
     }
 }
 

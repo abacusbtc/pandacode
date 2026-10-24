@@ -6,6 +6,7 @@
 pub mod config;
 
 mod commands;
+mod approvals;
 mod dispatch;
 mod events;
 mod live;
@@ -34,6 +35,9 @@ pub struct GatewayConfig {
     pub allowed_origins: Vec<String>,
     /// Take a lock held by another process, for a gateway that died uncleanly.
     pub force_owner: bool,
+    /// How long an approval nobody answers stays pending. `None` disables
+    /// auto-deny (`--approval-ttl 0`), which the gateway logs once at start.
+    pub approval_ttl: Option<std::time::Duration>,
 }
 
 /// A running gateway. `stop` is the only way to shut it down cleanly.
@@ -44,11 +48,17 @@ pub struct GatewayHandle {
     /// This gateway's own sink, so a test never depends on which process-wide sink
     /// won a race.
     sink: Arc<events::BroadcastSink>,
+    /// Auto-deny, when it is on. Aborted with the server so a stopped gateway
+    /// cannot deny anything.
+    watchdog: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl GatewayHandle {
     /// Signals the server and waits for it, so a test never leaves a port behind.
     pub async fn stop(self) {
+        if let Some(watchdog) = &self.watchdog {
+            watchdog.abort();
+        }
         let _ = self.shutdown.send(());
         let _ = self.join.await;
     }
@@ -90,16 +100,29 @@ pub async fn spawn(config: GatewayConfig) -> std::io::Result<GatewayHandle> {
         cache_dir,
         config.data_dir.clone(),
         state.ui.clone(),
-        Arc::new(live::GatewaySurface::new(live.clone())),
+        Arc::new(live::GatewaySurface::new(live.clone(), sink.clone())),
     )
     .map_err(std::io::Error::other)?;
+    let state = Arc::new(state);
+    // Auto-deny: a question with no client attached is denied at its deadline. The
+    // desktop never starts this — a window is an attached client — so its behaviour
+    // is unchanged by construction rather than by a special case.
+    let watchdog = match config.approval_ttl {
+        Some(ttl) => approvals::watch(state.clone(), sink.clone(), Some(ttl)),
+        None => {
+            eprintln!(
+                "approval auto-deny is disabled (--approval-ttl 0): a question with no client attached waits until the turn ends"
+            );
+            None
+        }
+    };
     let router = server::router(server::RouterState {
         token: config.token.clone(),
         allowed_origins: config.allowed_origins.clone(),
         static_dir: config.static_dir.clone(),
         events: sink.clone(),
         ctx: dispatch::Ctx {
-            state: Arc::new(state),
+            state,
             run,
             live,
         },
@@ -124,5 +147,6 @@ pub async fn spawn(config: GatewayConfig) -> std::io::Result<GatewayHandle> {
         shutdown,
         join,
         sink,
+        watchdog,
     })
 }
