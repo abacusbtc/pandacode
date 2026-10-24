@@ -185,6 +185,8 @@ fn save_approval(
 
 #[cfg(test)]
 mod concurrent_task_tests;
+#[cfg(test)]
+mod turn_command_tests;
 
 /// A provider can finish while the database is temporarily unable to write its
 /// final status. The process registry remains authoritative for whether work is
@@ -1102,41 +1104,46 @@ async fn prepare_command(
     }))
 }
 
-#[tauri::command]
-async fn send_message(
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
-    session_id: String,
-    mut text: String,
-    image_ids: Option<Vec<String>>,
-    moodboard_ids: Option<Vec<String>>,
-) -> Result<()> {
-    let (is_team, project_id) = {
-        let store = state.store.lock().map_err(|e| e.to_string())?;
-        let task = store.session(&session_id)?;
-        if let Some(ids) = moodboard_ids.as_deref().filter(|ids| !ids.is_empty()) {
-            text.push_str(&moodboards::resolve_refs(&store, &task.project_id, ids)?);
-        }
-        (
-            architect::load(&store, &session_id)?.is_some(),
-            task.project_id,
-        )
-    };
-    if is_team {
-        return architect::architect_start_in_project(
-            app,
-            state,
-            session_id,
-            text,
-            image_ids,
-            Some(project_id),
-        )
-        .await;
+/// What a send needs from the store, resolved in one lock the way the command
+/// always did.
+pub(crate) struct SendTarget {
+    pub(crate) project_id: String,
+    /// A team session routes to the architect, which only a window can drive.
+    pub(crate) team: bool,
+}
+
+/// Reads the session a send belongs to and folds moodboard references into the
+/// text. One lock, so the text and the project cannot disagree.
+pub(crate) fn resolve_send(
+    state: &AppState,
+    session_id: &str,
+    text: &mut String,
+    moodboard_ids: Option<&[String]>,
+) -> Result<SendTarget> {
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    let task = store.session(session_id)?;
+    if let Some(ids) = moodboard_ids.filter(|ids| !ids.is_empty()) {
+        text.push_str(&moodboards::resolve_refs(&store, &task.project_id, ids)?);
     }
-    let ctx = desktop_context(&app, &state)?;
+    Ok(SendTarget {
+        project_id: task.project_id,
+        team: architect::load(&store, session_id)?.is_some(),
+    })
+}
+
+/// Starts an ordinary turn. It takes a run context instead of an app handle, so
+/// a process with no window starts the same turn (PAN-103).
+pub(crate) async fn send_message_inner(
+    state: &AppState,
+    ctx: RunContext,
+    session_id: String,
+    text: String,
+    image_ids: Option<Vec<String>>,
+    project_id: String,
+) -> Result<()> {
     launch_task_in_project(
         ctx,
-        &state,
+        state,
         session_id,
         Some(text),
         image_ids,
@@ -1146,29 +1153,72 @@ async fn send_message(
 }
 
 #[tauri::command]
+async fn send_message(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    session_id: String,
+    mut text: String,
+    image_ids: Option<Vec<String>>,
+    moodboard_ids: Option<Vec<String>>,
+) -> Result<()> {
+    let target = resolve_send(&state, &session_id, &mut text, moodboard_ids.as_deref())?;
+    if target.team {
+        return architect::architect_start_in_project(
+            app,
+            state,
+            session_id,
+            text,
+            image_ids,
+            Some(target.project_id),
+        )
+        .await;
+    }
+    let ctx = desktop_context(&app, &state)?;
+    send_message_inner(&state, ctx, session_id, text, image_ids, target.project_id).await
+}
+
+/// Whether a task runs a team. A team is N runs an architect drives, which only a
+/// window can do.
+pub(crate) fn is_team(state: &AppState, session_id: &str) -> Result<bool> {
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    Ok(architect::load(&store, session_id)?.is_some())
+}
+
+/// The prompt a Start would carry when the session runs a team, else `None`.
+pub(crate) fn resolve_start(state: &AppState, session_id: &str) -> Result<Option<String>> {
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    if architect::load(&store, session_id)?.is_some() {
+        let task = store.session(session_id)?;
+        Ok(Some(if task.task_description.trim().is_empty() {
+            task.title
+        } else {
+            task.task_description
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Continues an ordinary task with no message of its own.
+pub(crate) async fn start_task_inner(
+    state: &AppState,
+    ctx: RunContext,
+    session_id: String,
+) -> Result<()> {
+    launch_task(ctx, state, session_id, None, None).await
+}
+
+#[tauri::command]
 async fn start_task(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     session_id: String,
 ) -> Result<()> {
-    let team_prompt = {
-        let store = state.store.lock().map_err(|e| e.to_string())?;
-        if architect::load(&store, &session_id)?.is_some() {
-            let task = store.session(&session_id)?;
-            Some(if task.task_description.trim().is_empty() {
-                task.title
-            } else {
-                task.task_description
-            })
-        } else {
-            None
-        }
-    };
-    if let Some(prompt) = team_prompt {
+    if let Some(prompt) = resolve_start(&state, &session_id)? {
         return architect::architect_start(app, state, session_id, prompt, None).await;
     }
     let ctx = desktop_context(&app, &state)?;
-    launch_task(ctx, &state, session_id, None, None).await
+    start_task_inner(&state, ctx, session_id).await
 }
 
 #[derive(Default)]
@@ -2048,31 +2098,48 @@ async fn launch_operation_admitted(
     });
     Ok(())
 }
-#[tauri::command]
-async fn stop_session(
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
-    session_id: String,
-) -> Result<()> {
-    let is_team = {
-        let store = state.store.lock().map_err(|e| e.to_string())?;
-        architect::load(&store, &session_id)?.is_some()
-    };
-    if is_team {
-        architect::architect_control(app, state, session_id, "stop".into()).await?;
-        return Ok(());
-    }
+/// Stops an ordinary task's turn. A team's stop goes through the architect, which
+/// needs a window, so it stays in the command.
+pub(crate) async fn stop_session_inner(state: &AppState, session_id: &str) -> Result<()> {
     if let Some(tx) = state
         .agents
         .lock()
         .map_err(|e| e.to_string())?
-        .get(&session_id)
+        .get(session_id)
     {
         tx.send(RunInput::Stop)
             .map_err(|_| "Agent has stopped.".to_string())?;
     }
     Ok(())
 }
+
+#[tauri::command]
+async fn stop_session(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<()> {
+    let is_team = is_team(&state, &session_id)?;
+    if is_team {
+        architect::architect_control(app, state, session_id, "stop".into()).await?;
+        return Ok(());
+    }
+    stop_session_inner(&state, &session_id).await
+}
+
+pub(crate) async fn respond_approval_inner(
+    state: &AppState,
+    session_id: &str,
+    request_id: String,
+    approved: bool,
+) -> Result<()> {
+    let agents = state.agents.lock().map_err(|e| e.to_string())?;
+    let tx = agents
+        .get(session_id)
+        .ok_or("This agent is no longer running.")?;
+    tx.respond_approval(&state.store, session_id, request_id, approved)
+}
+
 #[tauri::command]
 async fn respond_approval(
     state: State<'_, AppState>,
@@ -2080,11 +2147,7 @@ async fn respond_approval(
     request_id: String,
     approved: bool,
 ) -> Result<()> {
-    let agents = state.agents.lock().map_err(|e| e.to_string())?;
-    let tx = agents
-        .get(&session_id)
-        .ok_or("This agent is no longer running.")?;
-    tx.respond_approval(&state.store, &session_id, request_id, approved)
+    respond_approval_inner(&state, &session_id, request_id, approved).await
 }
 #[tauri::command]
 async fn list_providers(force: Option<bool>) -> Vec<providers::ProviderInfo> {
@@ -2120,10 +2183,9 @@ fn gateway_disconnect() {
     gateway_client::disconnect();
 }
 
-#[tauri::command]
-async fn respond_user_input(
-    state: State<'_, AppState>,
-    session_id: String,
+pub(crate) async fn respond_user_input_inner(
+    state: &AppState,
+    session_id: &str,
     request_id: String,
     response: serde_json::Value,
 ) -> Result<()> {
@@ -2133,7 +2195,7 @@ async fn respond_user_input(
     let reply = {
         let agents = state.agents.lock().map_err(|e| e.to_string())?;
         let agent = agents
-            .get(&session_id)
+            .get(session_id)
             .ok_or("This agent is no longer running.")?;
         let pending = agent.approvals.lock().map_err(|e| e.to_string())?;
         if agent.stopped.load(Ordering::SeqCst) || !pending.contains(&request_id) {
@@ -2159,6 +2221,16 @@ async fn respond_user_input(
         .await
         .map_err(|_| "The agent did not acknowledge the answer. Try again.".to_owned())?
         .map_err(|_| "The agent stopped before accepting the answer.".to_owned())?
+}
+
+#[tauri::command]
+async fn respond_user_input(
+    state: State<'_, AppState>,
+    session_id: String,
+    request_id: String,
+    response: serde_json::Value,
+) -> Result<()> {
+    respond_user_input_inner(&state, &session_id, request_id, response).await
 }
 
 #[tauri::command]

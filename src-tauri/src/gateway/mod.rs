@@ -75,6 +75,19 @@ pub async fn spawn(config: GatewayConfig) -> std::io::Result<GatewayHandle> {
     // the same data directory, which the lock already refuses, so this is only a
     // guard against two sinks in one process.
     let _ = crate::events::set_sink(sink.clone());
+    // A turn runs with the gateway's own context: the sink installed just above,
+    // directories under the data directory this process owns, and (until task 5
+    // gives it approvals over the socket) a surface with no desktop hosts. Built
+    // after the sink, because a context without one is refused.
+    let cache_dir = config.data_dir.join("cache");
+    std::fs::create_dir_all(&cache_dir).map_err(std::io::Error::other)?;
+    let run = crate::run_ctx::RunContext::headless(
+        cache_dir,
+        config.data_dir.clone(),
+        state.ui.clone(),
+        Arc::new(crate::run_ctx::NoSurface),
+    )
+    .map_err(std::io::Error::other)?;
     let router = server::router(server::RouterState {
         token: config.token.clone(),
         allowed_origins: config.allowed_origins.clone(),
@@ -82,6 +95,7 @@ pub async fn spawn(config: GatewayConfig) -> std::io::Result<GatewayHandle> {
         events: sink.clone(),
         ctx: dispatch::Ctx {
             state: Arc::new(state),
+            run,
         },
     });
     let listener = tokio::net::TcpListener::bind(config.bind).await?;

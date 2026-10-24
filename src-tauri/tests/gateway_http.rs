@@ -244,8 +244,132 @@ async fn unsupported_command_is_reported_not_hung() {
 }
 
 #[tokio::test]
-async fn a_second_gateway_on_the_same_data_directory_is_refused() {
+async fn the_message_queue_round_trips_over_rpc() {
     install_crypto_provider();
+    let data = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let handle = start(data.path()).await;
+    let created = call(
+        &handle,
+        "add_project",
+        json!({ "path": project.path().to_str().unwrap() }),
+    )
+    .await;
+    let session = call(
+        &handle,
+        "create_session",
+        json!({ "projectId": created["id"], "provider": "claude", "model": "sonnet" }),
+    )
+    .await;
+    let session_id = session["id"].as_str().unwrap().to_string();
+
+    let first = call(
+        &handle,
+        "queue_add",
+        json!({ "sessionId": session_id, "text": "first" }),
+    )
+    .await;
+    let second = call(
+        &handle,
+        "queue_add",
+        json!({ "sessionId": session_id, "text": "second" }),
+    )
+    .await;
+    let listed = call(&handle, "queue_list", json!({ "sessionId": session_id })).await;
+    assert_eq!(listed.as_array().unwrap().len(), 2);
+    assert_eq!(listed[0]["text"], "first");
+
+    let reordered = call(
+        &handle,
+        "queue_reorder",
+        json!({ "sessionId": session_id, "ids": [second["id"], first["id"]] }),
+    )
+    .await;
+    assert_eq!(reordered[0]["id"], second["id"], "the order the client asked for");
+
+    let edited = call(
+        &handle,
+        "queue_update",
+        json!({ "id": first["id"], "text": "first, edited" }),
+    )
+    .await;
+    assert_eq!(edited["text"], "first, edited");
+
+    call(&handle, "queue_remove", json!({ "id": first["id"] })).await;
+    let taken = call(&handle, "queue_take", json!({ "id": second["id"] })).await;
+    assert_eq!(taken["text"], "second");
+    // Taking delivers once; restoring puts the same entry back at the front.
+    let restored = call(&handle, "queue_restore", json!({ "entry": taken })).await;
+    assert_eq!(restored["text"], "second");
+    let listed = call(&handle, "queue_list", json!({ "sessionId": session_id })).await;
+    assert_eq!(listed.as_array().unwrap().len(), 1);
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn turn_commands_answer_with_the_commands_own_error() {
+    install_crypto_provider();
+    let data = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let handle = start(data.path()).await;
+    let created = call(
+        &handle,
+        "add_project",
+        json!({ "path": project.path().to_str().unwrap() }),
+    )
+    .await;
+    let session = call(
+        &handle,
+        "create_session",
+        json!({ "projectId": created["id"], "provider": "claude", "model": "sonnet" }),
+    )
+    .await;
+    let session_id = session["id"].as_str().unwrap().to_string();
+
+    // Stopping a task with no turn running is the no-op the command is.
+    let stopped = call(&handle, "stop_session", json!({ "sessionId": session_id })).await;
+    assert_eq!(stopped, Value::Null);
+
+    // Steering one keeps the message queued, in the desktop's words.
+    let body = rpc(
+        &handle,
+        "steer_task",
+        json!({ "sessionId": session_id, "text": "go" }),
+    )
+    .await;
+    assert_eq!(body["ok"], false, "{body}");
+    assert_eq!(
+        body["error"],
+        "The agent is not running; the message stays queued."
+    );
+
+    // An approval for a turn that is not running says so rather than hanging.
+    let body = rpc(
+        &handle,
+        "respond_approval",
+        json!({ "sessionId": session_id, "requestId": "r1", "approved": true }),
+    )
+    .await;
+    assert_eq!(body["error"], "This agent is no longer running.");
+
+    // A send and a start reach the shared launch path: an unknown task fails on
+    // the store, not on the command's name, and nothing is launched. A real send
+    // would start a harness turn, which is task 12's end-to-end proof.
+    for command in ["send_message", "start_task"] {
+        let body = rpc(
+            &handle,
+            command,
+            json!({ "sessionId": "no-such-task", "text": "hi" }),
+        )
+        .await;
+        assert_eq!(body["ok"], false, "{command}: {body}");
+        assert_eq!(body["error"], "Conversation not found.", "{command}: {body}");
+    }
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn a_second_gateway_on_the_same_data_directory_is_refused() {    install_crypto_provider();
     let dir = tempfile::tempdir().unwrap();
     let handle = start(dir.path()).await;
     let error = refusal(test_config(dir.path(), "127.0.0.1:0")).await;
@@ -526,9 +650,10 @@ async fn capabilities_come_from_the_table_the_dispatcher_answers() {
         );
     }
 
-    // And something not advertised is refused by name.
-    let body = rpc(&handle, "send_message", json!({})).await;
-    assert_eq!(body["error"], "unsupported_command: send_message");
+    // And something not advertised is refused by name. Teams are M2 scope that a
+    // gateway does not serve, so `architect_start` is the standing example.
+    let body = rpc(&handle, "architect_start", json!({})).await;
+    assert_eq!(body["error"], "unsupported_command: architect_start");
     handle.stop().await;
 }
 
