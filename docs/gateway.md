@@ -27,6 +27,11 @@ gateway with that address and the token from the data directory:
 cat ~/.local/share/ai.pandacode.desktop/gateway-token
 ```
 
+Documents on a gateway host need one external reader: install **poppler-utils**
+for PDFs (`pdftotext`). DOCX, ODT and EPUB are read in-process; without
+poppler-utils a PDF is refused with a message naming the package rather than
+failing vaguely.
+
 The binary is a normal cargo target; `--help` prints the flags:
 
 ```sh

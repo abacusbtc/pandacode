@@ -1603,6 +1603,119 @@ async fn a_gateway_sweeps_aged_uploads_before_it_serves() {
     restarted.stop().await;
 }
 
+#[tokio::test]
+async fn an_uploaded_pdf_is_read_on_the_send_path_instead_of_refused() {
+    install_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = start(dir.path()).await;
+    let (_project, session) = a_task(&handle, dir.path()).await;
+
+    // A one-page PDF with a correct xref table, so poppler reads it as a real file.
+    let content = "0 0 0 rg 72 700 200 100 re f";
+    let objects = [
+        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>".to_string(),
+        format!("<< /Length {} >>\nstream\n{content}\nendstream", content.len()),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+    ];
+    let mut pdf = String::from("%PDF-1.4\n");
+    let mut offsets = Vec::new();
+    for (index, object) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.push_str(&format!("{} 0 obj\n{}\nendobj\n", index + 1, object));
+    }
+    let xref = pdf.len();
+    pdf.push_str(&format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1));
+    for offset in &offsets {
+        pdf.push_str(&format!("{offset:010} 00000 n \n"));
+    }
+    pdf.push_str(&format!(
+        "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+        objects.len() + 1
+    ));
+
+    let (status, scanned) = upload(&handle, "scan.pdf", "document", pdf.into_bytes()).await;
+    assert_eq!(status, 200, "{scanned}");
+
+    // The page draws no glyph, so the extractor has to answer for that: this proves
+    // the send path now runs the reader (task 8) rather than the old blanket refusal,
+    // and that an empty result never looks like an empty document.
+    let body = rpc(
+        &handle,
+        "send_message",
+        json!({ "sessionId": session, "text": "read this", "uploadIds": [scanned["id"]] }),
+    )
+    .await;
+    assert_eq!(body["ok"], false, "{body}");
+    let error = body["error"].as_str().unwrap();
+    assert!(
+        error.contains("No readable text"),
+        "the extractor ran and reported honestly: {error}"
+    );
+
+    // And a PDF that *has* text is read all the way through: the send gets past the
+    // document and is refused by the image cap instead, which is the order the
+    // admission path runs in. A document failure would have answered first.
+    let text = "BT /F1 18 Tf 72 700 Td (Lighthouse keeper duty) Tj ET";
+    let mut pdf = String::from("%PDF-1.4\n");
+    let mut offsets = Vec::new();
+    let objects = [
+        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>".to_string(),
+        format!("<< /Length {} >>\nstream\n{text}\nendstream", text.len()),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+    ];
+    for (index, object) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.push_str(&format!("{} 0 obj\n{}\nendobj\n", index + 1, object));
+    }
+    let xref = pdf.len();
+    pdf.push_str(&format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1));
+    for offset in &offsets {
+        pdf.push_str(&format!("{offset:010} 00000 n \n"));
+    }
+    pdf.push_str(&format!(
+        "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+        objects.len() + 1
+    ));
+    let (_, read) = upload(&handle, "brief.pdf", "document", pdf.into_bytes()).await;
+    let screenshots: Vec<String> = (0..5).map(|_| uuid_like()).collect();
+    let body = rpc(
+        &handle,
+        "send_message",
+        json!({
+            "sessionId": session,
+            "text": "read this",
+            "imageIds": screenshots,
+            "uploadIds": [read["id"]],
+        }),
+    )
+    .await;
+    assert_eq!(body["ok"], false, "{body}");
+    assert_eq!(
+        body["error"],
+        "Attach up to four screenshots per message.",
+        "the PDF resolved and the image cap answered, in that order"
+    );
+    assert_eq!(
+        call(&handle, "gateway_live_tasks", json!({})).await,
+        json!([]),
+        "no turn started"
+    );
+    handle.stop().await;
+}
+
+/// A well-formed uuid the gateway has never stored, for a capture id that only has
+/// to count.
+fn uuid_like() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let value = NEXT.fetch_add(1, Ordering::Relaxed);
+    format!("00000000-0000-4000-8000-{value:012}")
+}
+
 /// The proof that a cap-sized upload is streamed rather than buffered: the real
 /// `pandacode-gateway` binary takes 200 MiB in one request while its own resident
 /// memory is sampled from `/proc`.
