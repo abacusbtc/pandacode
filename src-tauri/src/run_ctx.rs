@@ -272,6 +272,14 @@ impl RunContext {
         self.emitter.emit(name, events::payload_value(payload))
     }
 
+    /// The sink itself, for work that emits on its own thread: a terminal's reader
+    /// pushes output from a dedicated thread, which cannot borrow this context. Only
+    /// the gateway hands it to a terminal today, so a desktop build has no caller.
+    #[cfg_attr(not(feature = "gateway"), allow(dead_code))]
+    pub fn emitter(&self) -> Arc<dyn Emitter> {
+        self.emitter.clone()
+    }
+
     /// Emits to one named target on every surface this process serves.
     ///
     /// Window-targeted events (`agent-ui-action`) go through this once a remote

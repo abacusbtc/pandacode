@@ -16,11 +16,14 @@ const TOKEN_FILE: &str = "gateway-token";
 /// The largest single file `/upload` accepts, as the owner decided (spec section
 /// 6.1): an accident guard for a phone photo of a document, not a security control.
 pub const DEFAULT_UPLOAD_MAX: usize = 200 * 1024 * 1024;
+/// How long a terminal with no client attached and no output is kept before the
+/// gateway closes it (spec section 6.3). `0` keeps them forever.
+pub const DEFAULT_TERMINAL_IDLE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 pub use crate::data_lock::{claim, Claim};
 
 pub fn usage() -> &'static str {
-    "usage: pandacode-gateway [--data-dir <dir>] [--host <host>] [--port <port>] [--token <token>] [--token-file <file>] [--static-dir <dir>] [--allow-origin <origin>]… [--upload-max <size>] [--force-owner]"
+    "usage: pandacode-gateway [--data-dir <dir>] [--host <host>] [--port <port>] [--token <token>] [--token-file <file>] [--static-dir <dir>] [--allow-origin <origin>]… [--upload-max <size>] [--terminal-idle <duration>] [--force-owner]"
 }
 
 /// The app's own webview origins; a browser on another origin must be named
@@ -60,6 +63,7 @@ where
     let mut allowed_origins: Vec<String> = Vec::new();
     let mut force_owner = false;
     let mut upload_max = DEFAULT_UPLOAD_MAX;
+    let mut terminal_idle = DEFAULT_TERMINAL_IDLE;
 
     let mut index = 0;
     while index < args.len() {
@@ -82,6 +86,7 @@ where
             "--static-dir" => static_dir = Some(PathBuf::from(value(&args, index, &flag)?)),
             "--allow-origin" => allowed_origins.push(value(&args, index, &flag)?),
             "--upload-max" => upload_max = parse_size(&value(&args, index, &flag)?)?,
+            "--terminal-idle" => terminal_idle = parse_duration(&value(&args, index, &flag)?)?,
             other => return Err(format!("unknown argument {other}\n{}", usage())),
         }
         index += 2;
@@ -105,7 +110,58 @@ where
         allowed_origins,
         force_owner,
         upload_max,
+        terminal_idle,
     })
+}
+
+/// A duration as a person writes one: `30m`, `90s`, `2h`, `1h30m`, or plain seconds.
+/// `0` is the explicit "never" for the terminal idle rule.
+fn parse_duration(value: &str) -> Result<std::time::Duration, String> {
+    let text = value.trim();
+    if text.is_empty() {
+        return Err(format!("--terminal-idle needs a duration\n{}", usage()));
+    }
+    let mut seconds: u64 = 0;
+    let mut digits = String::new();
+    let mut saw_unit = false;
+    for character in text.chars() {
+        if character.is_ascii_digit() {
+            digits.push(character);
+            continue;
+        }
+        let number: u64 = digits
+            .parse()
+            .map_err(|_| format!("--terminal-idle needs a duration like 30m\n{}", usage()))?;
+        digits.clear();
+        let unit = match character.to_ascii_lowercase() {
+            's' => 1,
+            'm' => 60,
+            'h' => 60 * 60,
+            'd' => 24 * 60 * 60,
+            other => {
+                return Err(format!(
+                    "--terminal-idle does not know the unit {other:?}; use s, m, h or d\n{}",
+                    usage()
+                ))
+            }
+        };
+        seconds = seconds
+            .checked_add(number * unit)
+            .ok_or_else(|| format!("--terminal-idle is too large\n{}", usage()))?;
+        saw_unit = true;
+    }
+    if !digits.is_empty() {
+        // A bare number is seconds, so `--terminal-idle 0` is the documented "never".
+        let number: u64 = digits
+            .parse()
+            .map_err(|_| format!("--terminal-idle needs a duration\n{}", usage()))?;
+        seconds = seconds
+            .checked_add(number)
+            .ok_or_else(|| format!("--terminal-idle is too large\n{}", usage()))?;
+    } else if !saw_unit {
+        return Err(format!("--terminal-idle needs a duration like 30m\n{}", usage()));
+    }
+    Ok(std::time::Duration::from_secs(seconds))
 }
 
 /// A byte count: plain bytes, or a number with a unit (`200MiB`, `512KB`, `1G`).

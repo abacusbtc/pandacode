@@ -611,17 +611,21 @@ pub(super) async fn rename_task(state: &AppState, sid: &str, title: &str) -> Res
         .update(sid, Some(title.into()), None, None, None)
 }
 
-#[tauri::command]
-pub(super) async fn start_harness_terminal(
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
-    session_id: String,
+/// Opens a harness console for a task. Takes the state and the surface to emit on,
+/// so a process with no window opens the same console (PAN-110): the only thing that
+/// needed a handle here was the emitter and the shutdown flag.
+pub(crate) async fn start_harness_terminal_inner(
+    state: &AppState,
+    events: Arc<dyn crate::events::Emitter>,
+    session_id: &str,
     cols: u16,
     rows: u16,
 ) -> Result<String> {
-    let lease = TaskLease::acquire(&state, &session_id)?;
+    let lease = TaskLease::acquire(state, session_id)?;
     let store = state.store.clone();
     let terms = state.terminals.clone();
+    let shutting_down = state.shutdown.load(Ordering::SeqCst) != 0;
+    let session_id = session_id.to_owned();
     let (task, cwd) = {
         let db = store.lock().map_err(|error| error.to_string())?;
         let task = db.session(&session_id)?;
@@ -645,7 +649,7 @@ pub(super) async fn start_harness_terminal(
     }
     blocking(move || {
         let active = lease.agents.lock().map_err(|error| error.to_string())?;
-        if app.state::<AppState>().shutdown.load(Ordering::SeqCst) != 0 {
+        if shutting_down {
             return Err("PandaCode is shutting down.".into());
         }
         if active
@@ -665,7 +669,7 @@ pub(super) async fn start_harness_terminal(
         // Keep the reservation until the terminal is in the registry. The new
         // console becomes its owner before the lease releases the agent slot.
         terminal::start_harness(
-            app,
+            events,
             terms,
             &cwd,
             terminal::HarnessContext {
@@ -681,6 +685,18 @@ pub(super) async fn start_harness_terminal(
         )
     })
     .await
+}
+
+#[tauri::command]
+pub(super) async fn start_harness_terminal(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    session_id: String,
+    cols: u16,
+    rows: u16,
+) -> Result<String> {
+    let events: Arc<dyn crate::events::Emitter> = Arc::new(app);
+    start_harness_terminal_inner(&state, events, &session_id, cols, rows).await
 }
 
 fn verify_console_task(store: &Store, expected: &Session) -> Result<Session> {

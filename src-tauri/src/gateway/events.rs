@@ -25,6 +25,11 @@ use crate::events::Emitter;
 const RING_FRAMES: usize = 4_000;
 const RING_AGE_MS: i64 = 10 * 60 * 1000;
 
+/// A terminal's ring is bounded by bytes as well as frames. A shell's output is
+/// high-volume and a frame count says nothing about how much scrollback that is, so
+/// a terminal keeps 256 KiB of what it printed and no more (PAN-110).
+const TERMINAL_RING_BYTES: usize = 256 * 1024;
+
 /// How far a socket may fall behind before it is told it lagged. Deep enough for a
 /// burst of tool output, shallow enough that the hole it has to ask about is short.
 const SUBSCRIBER_QUEUE: usize = 512;
@@ -93,6 +98,9 @@ pub struct Frame {
     terminal: Option<String>,
     /// When it was published, for the ring's age bound. Never serialised.
     at: i64,
+    /// What this frame costs in a byte-bounded ring: its payload as it goes on the
+    /// wire. Counted once, when the frame is made.
+    bytes: usize,
 }
 
 impl Frame {
@@ -104,6 +112,9 @@ impl Frame {
                 .filter(|value| !value.is_empty())
                 .map(str::to_owned)
         };
+        let bytes = serde_json::to_string(&payload)
+            .map(|encoded| encoded.len())
+            .unwrap_or(0);
         Self {
             seq,
             event: event.to_owned(),
@@ -111,6 +122,7 @@ impl Frame {
             terminal: key("terminalId"),
             payload,
             at: crate::storage::now(),
+            bytes,
         }
     }
 
@@ -138,10 +150,13 @@ struct Ring {
     frames: VecDeque<Frame>,
     /// The newest number this ring threw away, so a resume can name what it lost.
     evicted_through: u64,
+    /// What the frames in the ring weigh, for a byte-bounded terminal ring.
+    bytes: usize,
 }
 
 impl Ring {
-    fn push(&mut self, frame: Frame, now: i64) {
+    fn push(&mut self, frame: Frame, now: i64, max_bytes: Option<usize>) {
+        self.bytes += frame.bytes;
         self.frames.push_back(frame);
         // Both bounds, and the longer one wins: a frame stays if it is among the
         // newest RING_FRAMES or younger than RING_AGE_MS.
@@ -151,10 +166,27 @@ impl Ring {
                 .front()
                 .is_some_and(|oldest| now.saturating_sub(oldest.at) > RING_AGE_MS)
         {
-            if let Some(dropped) = self.frames.pop_front() {
-                self.evicted_through = self.evicted_through.max(dropped.seq);
+            self.evict_one();
+        }
+        // A terminal additionally holds at most its byte budget, but never drops
+        // its newest frame: the thing the client came back for is the tail.
+        if let Some(max) = max_bytes {
+            while self.bytes > max && self.frames.len() > 1 {
+                self.evict_one();
             }
         }
+    }
+
+    fn evict_one(&mut self) {
+        if let Some(dropped) = self.frames.pop_front() {
+            self.bytes = self.bytes.saturating_sub(dropped.bytes);
+            self.evicted_through = self.evicted_through.max(dropped.seq);
+        }
+    }
+
+    /// When this ring last carried a frame: a terminal's last output.
+    fn newest_at(&self) -> Option<i64> {
+        self.frames.back().map(|frame| frame.at)
     }
 }
 
@@ -187,6 +219,10 @@ pub struct Subscription {
     /// Numbers the ring could not serve, as `(from, to)`: the client is told to
     /// refetch rather than handed a stream that quietly skips.
     pub hole: Option<(u64, u64)>,
+    /// The same situation for a terminal, where there is nothing to refetch: the
+    /// scrollback the client missed is gone, so it is told to clear and redraw what
+    /// follows instead of resuming into a hole (PAN-110).
+    pub reset: Option<(u64, u64)>,
     pub frames: mpsc::Receiver<Frame>,
     /// Set while this socket is behind; the socket sends a `lagged` frame for it
     /// before it sends anything newer.
@@ -217,8 +253,18 @@ impl BroadcastSink {
         let now = crate::storage::now();
         let mut inner = self.lock();
         let key = frame.ring();
-        inner.rings.entry(key).or_default().push(frame.clone(), now);
+        let budget = frame.terminal.is_some().then_some(TERMINAL_RING_BYTES);
+        inner.rings.entry(key).or_default().push(frame.clone(), now, budget);
         inner.deliver(frame);
+    }
+
+    /// When this terminal last printed, for the idle rule. `None` while it has
+    /// printed nothing: a shell sitting at an empty prompt is still idle.
+    pub fn last_terminal_output(&self, terminal_id: &str) -> Option<i64> {
+        self.lock()
+            .rings
+            .get(&format!("t:{terminal_id}"))
+            .and_then(Ring::newest_at)
     }
 
     /// Registers a socket and takes its replay in one step, so a frame published
@@ -238,8 +284,8 @@ impl BroadcastSink {
         replay.sort_by_key(|frame| frame.seq);
 
         let mut hole = None;
+        let mut reset = None;
         if let Some(since) = since {
-            replay.retain(|frame| frame.seq > since);
             let evicted = inner
                 .rings
                 .iter()
@@ -247,9 +293,17 @@ impl BroadcastSink {
                 .map(|(_, ring)| ring.evicted_through)
                 .max()
                 .unwrap_or(0);
-            if evicted > since {
-                hole = Some((since + 1, evicted));
-                replay.retain(|frame| frame.seq > evicted);
+            if evicted > since && filter.terminal.is_some() {
+                // A terminal cannot refetch: the shell's own scrollback ended at
+                // the ring's start. The client clears and redraws from what the
+                // replay carries, and is told the numbers it will never see.
+                reset = Some((since, evicted));
+            } else {
+                replay.retain(|frame| frame.seq > since);
+                if evicted > since {
+                    hole = Some((since + 1, evicted));
+                    replay.retain(|frame| frame.seq > evicted);
+                }
             }
         }
 
@@ -261,6 +315,7 @@ impl BroadcastSink {
         Subscription {
             replay,
             hole,
+            reset,
             frames,
             dropped,
         }
@@ -313,6 +368,13 @@ impl Emitter for BroadcastSink {
 /// stream continues from `toSeq + 1`.
 pub fn lagged_frame(from: u64, to: u64) -> String {
     serde_json::json!({ "event": "lagged", "payload": { "fromSeq": from, "toSeq": to } })
+        .to_string()
+}
+
+/// A terminal's scrollback loss, as a frame a client reads: clear what you drew and
+/// start again from the frames that follow (PAN-110).
+pub fn terminal_reset_frame(from: u64, to: u64) -> String {
+    serde_json::json!({ "event": "terminal-reset", "payload": { "fromSeq": from, "toSeq": to } })
         .to_string()
 }
 
@@ -450,6 +512,96 @@ mod tests {
             "the replay continues after the announced range"
         );
         assert_eq!(subscription.replay[0].seq, 6);
+    }
+
+    #[test]
+    fn a_terminal_resume_past_its_ring_asks_for_a_reset_and_a_session_does_not() {
+        let sink = BroadcastSink::new();
+        // 300 KiB of terminal output, in ordinary chunks: more than the 256 KiB a
+        // terminal keeps, and far fewer than RING_FRAMES, so the byte bound is what
+        // evicts here.
+        let chunk = "x".repeat(4 * 1024);
+        for _ in 0..80 {
+            sink.publish(
+                "terminal-event",
+                json!({ "terminalId": "t1", "data": chunk, "exit": false }),
+            );
+        }
+        let subscription = sink.subscribe(
+            Filter {
+                session: None,
+                terminal: Some("t1".into()),
+            },
+            Some(1),
+        );
+        assert!(
+            subscription.reset.is_some(),
+            "a terminal cannot refetch scrollback: it is told to reset"
+        );
+        assert_eq!(subscription.hole, None, "and not handed a refetch instruction");
+        let (_, lost_through) = subscription.reset.unwrap();
+        assert!(lost_through > 1, "the reset names what was lost");
+        assert!(
+            subscription.replay.iter().all(|frame| frame.seq > lost_through),
+            "the redraw starts after the loss"
+        );
+        assert!(
+            subscription.replay.len() > 1,
+            "there is something to redraw from: {}",
+            subscription.replay.len()
+        );
+
+        // A session filter is never told to reset: a client can refetch a turn, and
+        // `a_resume_from_before_the_ring_gets_a_lagged_range_not_a_quiet_jump` proves
+        // that range is named rather than skipped.
+        for _ in 0..10 {
+            sink.publish("agent-event", json!({ "sessionId": "s1", "kind": "text" }));
+        }
+        let session = sink.subscribe(
+            Filter {
+                session: Some("s1".into()),
+                terminal: None,
+            },
+            Some(1),
+        );
+        assert_eq!(session.reset, None, "only a terminal is told to clear and redraw");
+    }
+
+    #[test]
+    fn a_terminal_ring_keeps_its_last_bytes_and_never_drops_what_it_just_got() {
+        let sink = BroadcastSink::new();
+        let chunk = "y".repeat(8 * 1024);
+        for index in 0..40 {
+            sink.publish(
+                "terminal-event",
+                json!({ "terminalId": "t1", "data": chunk, "exit": false, "n": index }),
+            );
+        }
+        let mut all = sink.subscribe(
+            Filter {
+                session: None,
+                terminal: Some("t1".into()),
+            },
+            Some(0),
+        );
+        let kept = std::mem::take(&mut all.replay);
+        let bytes: usize = kept
+            .iter()
+            .map(|frame| frame.bytes)
+            .sum();
+        assert!(
+            bytes <= TERMINAL_RING_BYTES + 8 * 1024,
+            "the ring holds its budget plus the frame that crossed it: {bytes}"
+        );
+        assert_eq!(
+            kept.last().unwrap().payload["n"], 39,
+            "the newest frame is never evicted"
+        );
+        assert!(
+            kept.first().unwrap().seq > 1,
+            "older output went to make room: {:?}",
+            kept.first().map(|frame| frame.seq)
+        );
     }
 
     #[test]

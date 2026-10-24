@@ -46,6 +46,8 @@ pub(crate) struct RouterState {
     pub(crate) uploads: PathBuf,
     /// The largest single file `/upload` accepts (`--upload-max`).
     pub(crate) upload_max: usize,
+    /// Who is watching which terminal, so an idle shell can be closed (PAN-110).
+    pub(crate) watch: Arc<super::terminals::Watch>,
 }
 
 pub(crate) fn router(state: RouterState) -> Router {
@@ -270,8 +272,14 @@ async fn events_socket(
         Ok(query) => query,
         Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
     };
-    let subscription = state.events.subscribe(filter, since);
-    upgrade.on_upgrade(move |socket| forward(socket, subscription))
+    let subscription = state.events.subscribe(filter.clone(), since);
+    // A socket filtered to one terminal is the client watching it. Held for the life
+    // of the socket: the idle rule closes a shell only when nobody is attached.
+    let attached = filter
+        .terminal
+        .as_deref()
+        .map(|terminal| state.watch.attach(terminal));
+    upgrade.on_upgrade(move |socket| forward(socket, subscription, attached))
 }
 
 /// The `/events` query. Unknown parameters are ignored so an older client keeps
@@ -302,9 +310,24 @@ fn events_query(uri: &Uri) -> Result<(super::events::Filter, Option<u64>), Strin
     Ok((filter, since))
 }
 
-async fn forward(mut socket: WebSocket, mut subscription: super::events::Subscription) {
+async fn forward(
+    mut socket: WebSocket,
+    mut subscription: super::events::Subscription,
+    // Dropped with this future: a socket that closes detaches its terminal.
+    _attached: Option<super::terminals::Attached>,
+) {
     // A resume the ring could not serve is announced before anything else, so the
-    // client knows to refetch instead of trusting a stream with a hole in it.
+    // client knows to refetch instead of trusting a stream with a hole in it. A
+    // terminal cannot refetch, so it is told to clear and redraw from the replay.
+    if let Some((from, to)) = subscription.reset {
+        if socket
+            .send(Message::Text(super::events::terminal_reset_frame(from, to).into()))
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
     if let Some((from, to)) = subscription.hole {
         if send_lagged(&mut socket, from, to).await.is_err() {
             return;

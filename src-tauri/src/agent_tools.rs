@@ -853,9 +853,15 @@ async fn request_ui(
     .await
 }
 
+/// Whether a client is still waiting for this app action. A plain-state form, so a
+/// process with no window (and no IPC) can ask the same registry (PAN-110).
+pub(crate) fn ui_request_active(state: &AppState, request_id: &str) -> bool {
+    state.ui.active(request_id)
+}
+
 #[tauri::command]
 pub fn agent_ui_request_active(state: State<'_, AppState>, request_id: String) -> bool {
-    state.ui.active(&request_id)
+    ui_request_active(&state, &request_id)
 }
 #[tauri::command]
 pub fn resolve_agent_ui_action(
