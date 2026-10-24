@@ -29,6 +29,7 @@ fn test_config(data_dir: &Path, bind: &str) -> GatewayConfig {
         static_dir: None,
         allowed_origins: config::default_origins(),
         force_owner: false,
+        approval_ttl: Some(config::DEFAULT_APPROVAL_TTL),
     }
 }
 
@@ -446,6 +447,40 @@ async fn the_live_registry_is_empty_and_advertised() {
         .collect();
     assert!(commands.contains(&"gateway_live_tasks"));
     handle.stop().await;
+}
+
+#[test]
+fn approval_ttl_is_parsed_and_zero_disables_auto_deny() {
+    let dir = tempfile::tempdir().unwrap();
+    let parse = |extra: &[&str]| {
+        let mut args: Vec<String> = vec![
+            "--data-dir".into(),
+            dir.path().to_str().unwrap().into(),
+            "--token".into(),
+            "test-token".into(),
+        ];
+        args.extend(extra.iter().map(|value| value.to_string()));
+        config::from_args(args)
+    };
+    assert_eq!(
+        parse(&[]).unwrap().approval_ttl,
+        Some(std::time::Duration::from_secs(3600)),
+        "one hour by default"
+    );
+    assert_eq!(
+        parse(&["--approval-ttl", "30m"]).unwrap().approval_ttl,
+        Some(std::time::Duration::from_secs(1800))
+    );
+    assert_eq!(
+        parse(&["--approval-ttl", "45s"]).unwrap().approval_ttl,
+        Some(std::time::Duration::from_secs(45))
+    );
+    assert_eq!(
+        parse(&["--approval-ttl", "0"]).unwrap().approval_ttl,
+        None,
+        "0 is the explicit never-auto-deny choice"
+    );
+    assert!(parse(&["--approval-ttl", "soon"]).is_err(), "a bad duration is refused");
 }
 
 #[tokio::test]

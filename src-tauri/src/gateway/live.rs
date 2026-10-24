@@ -98,15 +98,24 @@ impl Live {
 /// true. Task 5 fills in the approval half here.
 pub struct GatewaySurface {
     live: Arc<Live>,
+    /// The sockets that could answer a question, so an app action knows whether
+    /// anybody is there before it waits.
+    clients: Arc<super::events::BroadcastSink>,
 }
 
 impl GatewaySurface {
-    pub fn new(live: Arc<Live>) -> Self {
-        Self { live }
+    pub fn new(live: Arc<Live>, clients: Arc<super::events::BroadcastSink>) -> Self {
+        Self { live, clients }
     }
 }
 
 impl TurnSurface for GatewaySurface {
+    fn client_attached(&self) -> bool {
+        // Only a connected `/events` socket can answer a question or be asked to
+        // open a picker; with none attached, an app action must not wait.
+        self.clients.clients() > 0
+    }
+
     fn base_host(
         &self,
         _provider: &str,
@@ -149,7 +158,7 @@ mod tests {
     use std::sync::atomic::AtomicBool;
 
     fn surface(live: &Arc<Live>) -> GatewaySurface {
-        GatewaySurface::new(live.clone())
+        GatewaySurface::new(live.clone(), super::super::events::BroadcastSink::new())
     }
 
     #[test]
@@ -199,6 +208,20 @@ mod tests {
             &agents,
         );
         assert!(live.tasks().is_empty());
+    }
+
+    #[test]
+    fn the_gateway_reports_a_client_only_while_a_socket_is_attached() {
+        let sink = super::super::events::BroadcastSink::new();
+        let surface = GatewaySurface::new(Arc::new(Live::default()), sink.clone());
+        assert!(!surface.client_attached(), "nobody is listening yet");
+        let socket = sink.subscribe(Default::default(), None);
+        assert!(surface.client_attached());
+        drop(socket);
+        assert!(
+            !surface.client_attached(),
+            "a socket that went away is not a client"
+        );
     }
 
     #[test]
