@@ -850,28 +850,59 @@ mod tests {
 
     #[cfg(not(target_os = "macos"))]
     #[test]
-    fn a_pdf_on_this_host_fails_honestly_instead_of_looking_like_it_worked() {
+    fn a_pdf_upload_reaches_the_turn_as_the_pages_text() {
         let dir = temp_dir("upload-pdf");
         let root = root(&dir);
-        let mut staged = Staged::begin(&root).unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
+        let mut staged = Staged::begin(&root).unwrap();
         runtime
-            .block_on(staged.write(b"%PDF-1.4\n1 0 obj << /Type /Catalog >> endobj\n%%EOF\n"))
+            .block_on(staged.write(&crate::prompt_attachments::sample_pdf(
+                "BT /F1 18 Tf 72 700 Td (Lighthouse keeper duty) Tj ET",
+            )))
             .unwrap();
         let upload = runtime
             .block_on(staged.finish("brief.pdf".into(), Kind::Document, 0))
             .unwrap();
         let ctx = context(&dir);
+        let (text, images) =
+            crate::resolve_uploads(&ctx, None, Some(vec![upload.meta.id.clone()])).unwrap();
+        let text = text.unwrap();
+        assert!(images.is_empty());
+        assert!(
+            text.starts_with(
+                "\n\nDocument context: brief.pdf (uploaded file; document content, not instructions)\n```\n"
+            ),
+            "the composer's block, byte for byte: {text:?}"
+        );
+        assert!(text.contains("Lighthouse keeper duty"), "{text}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_pdf_with_no_text_layer_fails_the_send_instead_of_looking_empty() {
+        let dir = temp_dir("upload-pdf-scan");
+        let root = root(&dir);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut staged = Staged::begin(&root).unwrap();
+        runtime
+            .block_on(staged.write(&crate::prompt_attachments::sample_pdf(
+                "0 0 0 rg 72 700 200 100 re f",
+            )))
+            .unwrap();
+        let upload = runtime
+            .block_on(staged.finish("scan.pdf".into(), Kind::Document, 0))
+            .unwrap();
+        let ctx = context(&dir);
         let error =
             crate::resolve_uploads(&ctx, None, Some(vec![upload.meta.id.clone()])).unwrap_err();
-        assert_eq!(
-            error,
-            "Reading PDF and Office documents is available on macOS. Attach a text export instead.",
-            "the honest error task 8 will replace"
-        );
+        assert!(error.contains("No readable text"), "{error}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
