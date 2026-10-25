@@ -293,9 +293,21 @@ fn save_cache(path: &Path, cache: &Cache) {
 /// read for another, which is what the key used to be missing (PAN-138). One process
 /// normally serves one directory, so this only ever bit two data directories in one
 /// process — a test harness, or a gateway and the desktop app sharing a build.
+///
+/// One slot each, not a map: a read for a different directory replaces the previous entry,
+/// so this cannot grow with the number of directories a process is asked about. The price
+/// is that alternating between two directories re-scans — slower, never wrong — which is the
+/// trade to make for a readout whose whole job is to be honest about which machine it read.
 struct State {
     cache: Option<(PathBuf, Cache)>,
     last: Option<(PathBuf, i64, std::sync::Arc<Ledger>)>,
+}
+
+/// The key a data directory is cached under: its canonical path when it exists, so a
+/// symlinked, relative or dot-suffixed spelling of one directory is one entry rather than
+/// several; the path as given when it does not, where the scan will fail on its own terms.
+fn cache_key(dir: &Path) -> PathBuf {
+    std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
 }
 
 fn state() -> &'static tokio::sync::Mutex<State> {
@@ -306,14 +318,15 @@ fn state() -> &'static tokio::sync::Mutex<State> {
 async fn build(dir: PathBuf, refresh: bool) -> crate::Result<std::sync::Arc<Ledger>> {
     // One scan at a time; a second window or a quick reopen shares the result — for the
     // same directory, and only inside the result TTL.
+    let key = cache_key(&dir);
     let mut state = state().lock().await;
     let now = crate::storage::now();
-    if let Some((_, _, ledger)) = state.last.as_ref().filter(|(built_for, at, _)| !refresh && built_for == &dir && now - at < RESULT_TTL_MS) {
+    if let Some((_, _, ledger)) = state.last.as_ref().filter(|(built_for, at, _)| !refresh && built_for == &key && now - at < RESULT_TTL_MS) {
         return Ok(ledger.clone());
     }
     let book = pricing::load(&dir.join("usage-prices.json"), now).await;
     let cache = match state.cache.take() {
-        Some((built_for, cache)) if built_for == dir => Some(cache),
+        Some((built_for, cache)) if built_for == key => Some(cache),
         _ => None,
     };
     let cache_path = dir.join("usage-ledger-cache.json");
@@ -333,8 +346,8 @@ async fn build(dir: PathBuf, refresh: bool) -> crate::Result<std::sync::Arc<Ledg
     .map_err(|_| "Reading agent logs took too long. Try again later.".to_string())?
     .map_err(|e| e.to_string())?;
     let ledger = std::sync::Arc::new(ledger);
-    state.cache = Some((dir.clone(), cache));
-    state.last = Some((dir, now, ledger.clone()));
+    state.cache = Some((key.clone(), cache));
+    state.last = Some((key, now, ledger.clone()));
     Ok(ledger)
 }
 
