@@ -4,6 +4,12 @@ name: Unsigned artifacts
 # publishes, never touches an existing release, and never signs: the artifacts are
 # unsigned on purpose, and the run summary says what that means for each platform.
 #
+# The runner image is pinned to ubuntu-24.04 (see ci.yml) rather than ubuntu-latest,
+# which moves to Ubuntu 26.
+#
+# Artifact names carry the short commit, so two builds of one version are
+# distinguishable without a checksum: `pandacode-unsigned-<version>+<sha>-<target>`.
+#
 # This is deliberately a separate file from release.yml, so a bad day here cannot
 # break shipping. Pins, toolchain and build steps are copied from release.yml; when
 # those change there, change them here too.
@@ -30,16 +36,22 @@ concurrency:
 
 jobs:
   prepare:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       version: ${{ steps.version.outputs.version }}
+      sha: ${{ steps.sha.outputs.short }}
       matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Read the version
         id: version
         run: echo "version=$(node -p "require('./src-tauri/tauri.conf.json').version")" >> "$GITHUB_OUTPUT"
+      - name: Read the commit
+        id: sha
+        # The short commit goes in the artifact name, so two builds of one version
+        # cannot be confused for each other. The full sha is still in the run.
+        run: echo "short=${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
       - name: Choose the platforms
         id: matrix
         env:
@@ -66,8 +78,8 @@ jobs:
     env:
       RELEASE_TARGET: ${{ matrix.target }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with: { node-version: '22', cache: npm }
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
@@ -81,9 +93,9 @@ jobs:
         if: runner.os != 'macOS'
         timeout-minutes: 4
         run: node scripts/release/ci-startup-smoke.mjs
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: pandacode-unsigned-${{ needs.prepare.outputs.version }}-${{ matrix.target }}
+          name: pandacode-unsigned-${{ needs.prepare.outputs.version }}+${{ needs.prepare.outputs.sha }}-${{ matrix.target }}
           path: release/${{ needs.prepare.outputs.version }}/
           if-no-files-found: error
           retention-days: 7
@@ -96,6 +108,8 @@ jobs:
         run: |
           {
             echo "### Unsigned ${{ matrix.target }} build"
+            echo ""
+            echo "Built from \`${{ needs.prepare.outputs.sha }}\` on \`${{ github.head_ref || github.ref_name }}\` — artifact \`pandacode-unsigned-${{ needs.prepare.outputs.version }}+${{ needs.prepare.outputs.sha }}-${{ matrix.target }}\`."
             echo ""
             echo "These files are **unsigned and unnotarised**. That is deliberate: this workflow exists so a tester can run current code without cutting a release."
             echo ""

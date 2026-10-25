@@ -1,4 +1,9 @@
 name: CI
+# The runner image is pinned to ubuntu-24.04 rather than ubuntu-latest: ubuntu-latest
+# moves to Ubuntu 26, and the Rust job's apt packages are version-sensitive. 24.04 is
+# also the image the installers are actually built on (release.yml,
+# unsigned-artifacts.yml), so this job validates the image we ship from. Bump all
+# three workflows together.
 on:
   pull_request:
   push:
@@ -12,11 +17,11 @@ concurrency:
 jobs:
   web:
     name: Typecheck, unit tests, website
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
           cache: npm
@@ -34,11 +39,11 @@ jobs:
 
   rust:
     name: Rust check and tests (Linux)
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with: { node-version: '22', cache: npm }
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
