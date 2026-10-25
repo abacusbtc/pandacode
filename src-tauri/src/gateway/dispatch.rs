@@ -20,6 +20,9 @@ pub(crate) const COMMANDS: &[&str] = &[
     "remove_project",
     "list_sessions",
     "create_session",
+    // M3: a remote client can pick the model a session runs, which the picker has been
+    // offering since PAN-121 (PAN-159). A live turn is refused rather than re-pointed.
+    "configure_session",
     // M3 task 3: a remote client can delete a task, and a live turn is refused with a
     // reason instead of being orphaned (PAN-124).
     "delete_session",
@@ -202,6 +205,36 @@ pub fn handle(command: &str, args: Value, ctx: &Ctx) -> Answer {
                 args.model,
                 args.mode,
                 None,
+            )?)
+        }),
+        "configure_session" => ready(|| {
+            #[derive(serde::Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct Args {
+                session_id: String,
+                provider: String,
+                model: String,
+                project_id: Option<String>,
+            }
+            let args: Args = from_value(args)?;
+            // A turn already in flight keeps the model it started with: the desktop
+            // refuses here for the same reason, asking the agent map instead of the live
+            // registry (PAN-159).
+            if ctx.live.running(&args.session_id) {
+                return Err("Stop the agent before changing its project, provider, or model.".into());
+            }
+            // The picker's own catalogue is the client's list; a model this host cannot
+            // negotiate is a sentence here rather than a turn that dies at negotiation.
+            let narrowed = crate::provider_settings::opencode_model_ids().unwrap_or_default();
+            if let Some(refusal) = crate::providers::model_refusal(&args.provider, &args.model, &narrowed) {
+                return Err(refusal);
+            }
+            to_value(crate::configure_session_inner(
+                &ctx.state,
+                &args.session_id,
+                &args.provider,
+                &args.model,
+                args.project_id.as_deref(),
             )?)
         }),
         "get_messages" => ready(|| {

@@ -234,7 +234,7 @@ which is how a client hides a surface instead of discovering it by hanging.
 
 | Group | Commands |
 | --- | --- |
-| Projects and sessions | `list_projects`, `add_project`, `remove_project`, `list_sessions`, `create_session`, `delete_session`, `get_messages` |
+| Projects and sessions | `list_projects`, `add_project`, `remove_project`, `list_sessions`, `create_session`, `configure_session`, `delete_session`, `get_messages` |
 | Remote folder picker | `gateway_list_dirs` |
 | Catalog | `gateway_status`, `list_providers`, `list_provider_models` |
 | Usage | `agent_usage`, `usage_ledger` |
@@ -258,6 +258,7 @@ row no longer names. A refusal is reversible and names the command that unblocks
 `stop_session`, then delete. The same rule covers the other live holders the store
 already knows about (a waiting agent, an open harness console, an active Jev run); each
 refusal names what to stop.
+
 
 ### Usage: `agent_usage` and `usage_ledger`
 
@@ -283,6 +284,27 @@ HH:MM", never as a live reading.
 The gateway reports *its own* machine's limits and costs. That is the point — it is the
 machine running the turns — but it is worth knowing when you read it from a laptop.
 
+### `configure_session`: which model a session runs
+
+A remote client picks the model with `configure_session` — `{sessionId, provider, model,
+projectId?}` — and the answer is the updated session. `projectId` is optional; when it is
+absent the session keeps its project.
+
+**A turn already in flight is never re-pointed.** If this gateway is driving that session,
+the change is refused with "Stop the agent before changing its project, provider, or
+model.", and nothing is written. That is the desktop's rule, asked of the gateway's own
+live registry instead of the desktop's agent map: the model a turn started with is the
+model it finishes with.
+
+**Which model ids are accepted.** Any well-formed id — 1 to 200 characters, no control
+characters — because the picker offers a custom model and the CLIs tell people to enter
+one when catalog discovery fails. The exception is a provider whose session negotiates a
+set this app already holds: an OpenCode session accepts only the models selected in
+Settings (PAN-121), so an id outside a configured selection is refused here, with a
+sentence, rather than accepted and left to die at negotiation. `default` always passes.
+
+An unknown provider is refused by the store ("Unknown provider.") rather than by a second
+list of agent ids kept alongside it.
 ### `get_terminal_preferences`
 
 The gateway runs as the owner, so this reads the same terminal configs the desktop's
