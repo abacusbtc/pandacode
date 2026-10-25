@@ -222,6 +222,8 @@ mark{background:color-mix(in srgb,var(--accent) 45%,transparent);color:inherit;b
 @media(prefers-contrast:more){.tool-activity pre{border-color:var(--text);background:var(--bg)}.tool-activity-note,.tool-activity-section h4,.tool-activity-hint,.tool-activity-status{color:var(--text)}}
 .tool-extra{font-size:0.642857rem;background:var(--raised);padding:0 4px;border-radius:1px}
 .message-error{display:flex;gap:9px;padding:12px;margin-bottom:20px;color:var(--danger);background:#fff0ef;border-radius:2px;font-size:0.857143rem}
+.message-denied{display:flex;gap:9px;padding:12px;margin-bottom:20px;color:var(--text);background:var(--raised);border-radius:2px;font-size:0.857143rem}
+.message-denied>.icon{color:var(--danger);flex:none}
 .composer-area{padding:0 30px 17px;margin:0 auto;width:100%;max-width:950px;flex-shrink:0}
 .composer{border:1px solid transparent;border-radius:6px;background:#ffffff;box-shadow:0 2px 5px rgb(0 0 0 / .025), 0 8px 24px rgb(0 0 0 / .035);transition:border-color 120ms, box-shadow 120ms}
 .composer:focus-within{border-color:transparent;box-shadow:0 0 0 3px rgb(var(--accent-rgb) / .12), 0 8px 24px rgb(0 0 0 / .035)}
@@ -733,6 +735,7 @@ html[data-theme="dark"] .user-avatar{background:var(--raised)}
 html[data-theme="dark"] :is(.markdown pre,.tool-activity pre){background:#252522;border-color:var(--border);color:var(--text)}
 html[data-theme="dark"] .markdown :not(pre)>code{background:var(--raised);color:#dfdccb}
 html[data-theme="dark"] .message-error{background:#402b29}
+html[data-theme="dark"] .message-denied{background:#2f2c28}
 html[data-theme="dark"] .composer{background:#262624;border-color:transparent;box-shadow:0 2px 5px rgb(0 0 0 / .1),0 8px 24px rgb(0 0 0 / .15)}
 html[data-theme="dark"] .composer:focus-within{border-color:transparent;box-shadow:0 0 0 3px rgb(var(--accent-rgb) / .1),0 8px 24px rgb(0 0 0 / .15)}
 html[data-theme="dark"] .composer-context{background:#24241f;border-color:transparent}

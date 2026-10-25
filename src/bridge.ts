@@ -1,5 +1,5 @@
 import type { AgentEvent, BrowserElement, BrowserStatus, TerminalEvent } from './types';
-import type { GatewayClient } from './gateway-client';
+import type { GatewayClient, MissedFrames } from './gateway-client';
 
 export const preview = !('__TAURI_INTERNALS__' in window);
 
@@ -41,13 +41,30 @@ export async function rebindSubscriptions(): Promise<void> {
   }
 }
 
+/** Everything that must restart when the active transport changes. */
+const transportListeners = new Set<() => void>();
+
 /** Remote mode is chosen at boot, before the first `call`. */
 export async function setMode(next: Mode, client?: GatewayClient | null): Promise<void> {
   // A replaced or discarded remote client stops its socket and reconnect timer.
   if (remote && remote !== client) remote.close();
+  const changed = mode !== next || remote !== (client ?? null);
   mode = next;
   remote = client ?? null;
   await rebindSubscriptions();
+  if (!changed) return;
+  // A terminal's PTY belongs to the backend that started it: its id means nothing on
+  // the transport that is now active, so a console restarts rather than typing into a
+  // shell that is no longer there. Everything that holds backend-owned state opts in
+  // here instead of each caller watching the mode itself.
+  for (const listener of transportListeners) {
+    try { listener(); } catch (error) { console.warn('A transport-change handler failed', error); }
+  }
+}
+/** Runs `listener` whenever the active transport changes. Returns an unsubscribe. */
+export function onTransportChange(listener: () => void): () => void {
+  transportListeners.add(listener);
+  return () => transportListeners.delete(listener);
 }
 export function currentMode(): Mode {
   return mode;
@@ -86,6 +103,30 @@ export async function uploadAttachment(
   if (mode !== 'remote' || !remote) throw new Error('Uploading needs a connected gateway.');
   return remote.upload(file, name, kind, onProgress);
 }
+/**
+ * One terminal's frames, from a gateway.
+ *
+ * This is a socket filtered to that terminal (`?terminal=`), replayed from the start of
+ * its ring: that is both the scrollback a console opening late needs and how the gateway
+ * knows somebody is watching it. The app's own transports deliver terminal frames on
+ * their shared stream instead — terminal.ts subscribes before the PTY exists, because
+ * there is no ring there to replay what it missed.
+ */
+export async function watchTerminal(
+  terminalId: string,
+  onFrame: (event: TerminalEvent) => void,
+  onReset: (missed: MissedFrames) => void,
+): Promise<() => void> {
+  if (mode !== 'remote' || !remote) throw 'gateway_disconnected: no gateway is connected';
+  return remote.watchTerminal(terminalId, onFrame, onReset);
+}
+/**
+ * A hole in the live stream: frames `fromSeq`..`toSeq` were dropped by the gateway's
+ * ring. The payload names the range and nothing else, so the handler decides what to
+ * refetch (`lagged` carries no session). It follows that a frame the client lost may
+ * belong to any task, which is why recovering from one reloads more than the open one.
+ */
+export async function subscribe(name: 'lagged', callback: (event: MissedFrames) => void): Promise<() => void>;
 export async function subscribe(name: 'agent-update-progress', callback: (event: import('./agent-updates').AgentUpdateProgress) => void): Promise<() => void>;
 export async function subscribe(name: 'jev-run', callback: (event: import('./jev').JevReport) => void): Promise<() => void>;
 export async function subscribe(name: 'jev-frame', callback: (event: import('./jev-live').JevFrame) => void): Promise<() => void>;

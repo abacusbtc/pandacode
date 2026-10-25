@@ -85,6 +85,7 @@ fn gateway_config(dir: &Path) -> GatewayConfig {
         static_dir: None,
         allowed_origins: config::default_origins(),
         upload_max: config::DEFAULT_UPLOAD_MAX,
+        terminal_idle: config::DEFAULT_TERMINAL_IDLE,
         force_owner: false,
         approval_ttl: Some(config::DEFAULT_APPROVAL_TTL),
     }

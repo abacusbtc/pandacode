@@ -1,119 +1,8 @@
 import { expect, test, type Page } from '@playwright/test';
-import { createHash } from 'node:crypto';
-import { createServer } from 'node:http';
-import type { Socket } from 'node:net';
+import { startGateway, type Replies } from './gateway-stub';
 
-// The connect UI against a stub gateway that answers the same JSON-RPC envelope the
-// real server does: POST /rpc {id, command, args} -> {id, ok, result} or {id, ok: false, error},
-// plus a minimal RFC 6455 handshake on /events so a subscription can actually be seen.
-
-type Reply = unknown | ((args: any) => unknown);
-type Replies = Record<string, Reply>;
-
-type Stub = {
-  url: string;
-  calls: string[];
-  /** Open event sockets. Zero means the app never subscribed to this gateway. */
-  sockets: () => number;
-  /** Pushes one `{event, payload}` frame to every open socket, as the real gateway does. */
-  emit: (event: string, payload?: unknown) => void;
-  close: () => Promise<void>;
-};
-
-/** RFC 6455 appendix A: the accept key is SHA-1 of key + this GUID, base64. */
-const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
-
-/** One unmasked text frame; the server-to-client direction is never masked. */
-function textFrame(text: string): Buffer {
-  const payload = Buffer.from(text);
-  if (payload.length < 126) return Buffer.concat([Buffer.from([0x81, payload.length]), payload]);
-  const header = Buffer.alloc(4);
-  header[0] = 0x81; header[1] = 126; header.writeUInt16BE(payload.length, 2);
-  return Buffer.concat([header, payload]);
-}
-
-async function startGateway(replies: Replies): Promise<Stub> {
-  const calls: string[] = [];
-  const sockets: Socket[] = [];
-  const server = createServer((request, response) => {
-    // The real gateway answers the browser's token-less preflight and names the
-    // headers a client may send (src-tauri/src/gateway/server.rs, `cors`). Without
-    // this the browser fails the fetch before /rpc is ever reached.
-    const allow: Record<string, string> = {
-      'Access-Control-Allow-Origin': request.headers.origin ?? '*',
-      'Access-Control-Allow-Methods': 'GET, POST',
-      'Access-Control-Allow-Headers': 'authorization, content-type',
-      'Access-Control-Max-Age': '600',
-      Vary: 'Origin',
-    };
-    if (request.method === 'OPTIONS') {
-      response.writeHead(204, allow);
-      response.end();
-      return;
-    }
-    let body = '';
-    request.on('data', chunk => { body += chunk; });
-    request.on('end', async () => {
-      if (request.method !== 'POST' || !request.url?.startsWith('/rpc')) {
-        response.writeHead(404, allow);
-        response.end('not found');
-        return;
-      }
-      const frame = JSON.parse(body || '{}');
-      calls.push(frame.command);
-      const reply = replies[frame.command];
-      const footer = { ...allow, 'Content-Type': 'application/json' };
-      if (reply === undefined) {
-        response.writeHead(200, footer);
-        response.end(JSON.stringify({ id: frame.id, ok: false, error: `unsupported_command: ${frame.command}` }));
-        return;
-      }
-      // A reply may be a promise, so a test can hold a request open and watch a loading
-      // state. A command that fails is an error envelope, exactly what the real server sends.
-      let result: { ok: true; value: unknown } | { ok: false; value: unknown };
-      try {
-        const raw = typeof reply === 'function' ? (reply as (args: unknown) => unknown)(frame.args) : reply;
-        result = { ok: true, value: await raw };
-      } catch (error) {
-        result = { ok: false, value: error instanceof Error ? error.message : String(error) };
-      }
-      if (response.writableEnded) return;
-      response.writeHead(200, footer);
-      response.end(result.ok
-        ? JSON.stringify({ id: frame.id, ok: true, result: result.value })
-        : JSON.stringify({ id: frame.id, ok: false, error: result.value }));
-    });
-  });
-  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
-  const port = (server.address() as { port: number }).port;
-  // The gateway's /events socket (src-tauri/src/gateway/server.rs). Only the handshake
-  // and one-way text frames are needed: the client sends nothing on it.
-  server.on('upgrade', (request, socket) => {
-    const key = request.headers['sec-websocket-key'];
-    if (typeof key !== 'string') { socket.destroy(); return; }
-    const accept = createHash('sha1').update(key + WS_GUID).digest('base64');
-    socket.on('error', () => undefined);
-    socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`);
-    sockets.push(socket);
-  });
-  return {
-    url: `http://127.0.0.1:${port}`,
-    calls,
-    sockets: () => sockets.length,
-    emit: (event, payload = null) => {
-      const frame = textFrame(JSON.stringify({ event, payload }));
-      for (const socket of sockets) socket.write(frame);
-    },
-    close: () => new Promise<void>(resolve => {
-      // fetch keeps its connections alive and the event socket is long-lived;
-      // closing both keeps teardown instant.
-      for (const socket of sockets) socket.destroy();
-      sockets.length = 0;
-      server.closeAllConnections?.();
-      server.close(() => resolve());
-    }),
-  };
-}
+// The connect UI against a stub gateway (tests/gateway-stub.ts) that answers the same
+// JSON-RPC envelope and numbered event stream the real server does.
 
 // A seeded project and task, so the assertions can tell the gateway's data from the
 // preview's fixtures (orbit, pandacode) and prove boot really went remote.
@@ -322,10 +211,8 @@ test('the Settings Test probe reports the gateway without moving onto it', async
 
 // ---- Task 10: the remote folder picker -------------------------------------------------
 // The native dialog returns a path on *this* computer, which does not exist on the
-// gateway (D6). These drive the real surfaces: the sidebar's Open project button, the
-// form's Browse…, and the composer's attach menu.
-
-const ATTACH_FILES = 'Attach files for context';
+// gateway (D6). These drive the real surfaces: the sidebar's Open project button and
+// the form's Browse…
 
 test('picks a project folder from the server in remote mode', async ({ page }) => {
   let projects = [PROJECT];
@@ -408,22 +295,6 @@ test('the server picker reports a server error, walks up, and closes on Escape',
     await page.keyboard.press('Escape');
     await expect(page.locator('.remote-files')).toBeHidden();
     await expect(page.locator('#dialog')).not.toHaveAttribute('open', '');
-  } finally {
-    await gateway.close();
-  }
-});
-
-test('attaching files says why a gateway cannot read them', async ({ page }) => {
-  const gateway = await startGateway(seeded());
-  try {
-    await openApp(page);
-    await waitForBoot(page);
-    await connect(page, gateway);
-
-    await page.getByRole('button', { name: ATTACH_FILES }).click();
-    await page.getByRole('dialog', { name: 'Attach', exact: true }).getByRole('menuitem', { name: /Attach files…/ }).click();
-    // read_document lives in this computer's shell, not in the gateway's command table.
-    await expect(page.locator('#toast')).toContainText('gateway');
   } finally {
     await gateway.close();
   }

@@ -3068,62 +3068,154 @@ async fn get_run_script_preview(
     }
     Ok(None)
 }
-#[tauri::command]
-async fn start_run_script_terminal(
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
-    project_id: String,
-    session_id: Option<String>,
-    request_id: Option<String>,
-    cols: u16,
-    rows: u16,
-) -> Result<String> {
-    if state.shutdown.load(Ordering::SeqCst) != 0 { return Err("PandaCode is shutting down.".into()); }
-    let root = state.root(&project_id, session_id.as_deref())?;
-    let terms = state.terminals.clone();
-    blocking(move || {
-        let state = app.state::<AppState>();
-        let _admission = state.agents.lock().map_err(|_| "Agent state is unavailable.")?;
-        agent_updates::ensure_not_installing()?;
-        if request_id.is_some_and(|id| !agent_tools::agent_ui_request_active(app.state(), id)) {
-            return Err("Run request was cancelled before the script could start.".into());
-        }
-        terminal::start_script(app.clone(), terms, &root, cols, rows)
-    }).await
-}
-#[tauri::command]
-async fn start_terminal(
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
-    project_id: String,
-    session_id: Option<String>,
+/// The terminal commands' work, taking the state and the surface to emit on. The
+/// `#[tauri::command]` wrappers below only hand over those two, so a process with no
+/// window opens the same shell (PAN-110).
+pub(crate) fn start_terminal_inner(
+    state: &AppState,
+    events: Arc<dyn events::Emitter>,
+    project_id: &str,
+    session_id: Option<&str>,
     cols: u16,
     rows: u16,
 ) -> Result<String> {
     if state.shutdown.load(Ordering::SeqCst) != 0 {
         return Err("PandaCode is shutting down.".into());
     }
-    let root = state.root(&project_id, session_id.as_deref())?;
+    let root = state.root(project_id, session_id)?;
+    start_admitted_terminal(state, events, root, cols, rows, false)
+}
+
+/// A run script's terminal. The UI request check is the same registry task 1 moved
+/// onto the state, so nothing here needs a window.
+pub(crate) fn start_run_script_terminal_inner(
+    state: &AppState,
+    events: Arc<dyn events::Emitter>,
+    project_id: &str,
+    session_id: Option<&str>,
+    request_id: Option<&str>,
+    cols: u16,
+    rows: u16,
+) -> Result<String> {
+    if state.shutdown.load(Ordering::SeqCst) != 0 {
+        return Err("PandaCode is shutting down.".into());
+    }
+    let root = state.root(project_id, session_id)?;
+    if request_id.is_some_and(|id| !agent_tools::ui_request_active(state, id)) {
+        return Err("Run request was cancelled before the script could start.".into());
+    }
+    start_admitted_terminal(state, events, root, cols, rows, true)
+}
+
+/// One admission for both starts: a terminal must not open while an agent update is
+/// installing, and it is serialised against runs by the same lock a run takes.
+fn start_admitted_terminal(
+    state: &AppState,
+    events: Arc<dyn events::Emitter>,
+    root: PathBuf,
+    cols: u16,
+    rows: u16,
+    script: bool,
+) -> Result<String> {
     let terms = state.terminals.clone();
+    let _admission = state
+        .agents
+        .lock()
+        .map_err(|_| "Agent state is unavailable.")?;
+    agent_updates::ensure_not_installing()?;
+    if script {
+        terminal::start_script(events, terms, &root, cols, rows)
+    } else {
+        terminal::start(events, terms, &root, cols, rows)
+    }
+}
+
+pub(crate) fn write_terminal_inner(
+    state: &AppState,
+    terminal_id: &str,
+    data: &str,
+) -> Result<()> {
+    let terms = state.terminals.clone();
+    terminal::write(&terms, terminal_id, data)
+}
+
+pub(crate) fn resize_terminal_inner(
+    state: &AppState,
+    terminal_id: &str,
+    cols: u16,
+    rows: u16,
+) -> Result<()> {
+    terminal::resize(&state.terminals, terminal_id, cols, rows)
+}
+
+pub(crate) fn terminal_activity_inner(
+    state: &AppState,
+    terminal_id: &str,
+) -> Result<terminal::TerminalActivity> {
+    let terms = state.terminals.clone();
+    terminal::activity(&terms, terminal_id)
+}
+
+pub(crate) fn close_terminal_inner(state: &AppState, terminal_id: &str) -> Result<()> {
+    terminal::close(&state.terminals, terminal_id)
+}
+
+#[tauri::command]
+async fn start_run_script_terminal(
+    app: tauri::AppHandle,
+    project_id: String,
+    session_id: Option<String>,
+    request_id: Option<String>,
+    cols: u16,
+    rows: u16,
+) -> Result<String> {
+    blocking(move || {
+        // The state a blocking closure may hold is the one the handle resolves.
+        let state = app.state::<AppState>();
+        start_run_script_terminal_inner(
+            &state,
+            Arc::new(app.clone()),
+            &project_id,
+            session_id.as_deref(),
+            request_id.as_deref(),
+            cols,
+            rows,
+        )
+    })
+    .await
+}
+#[tauri::command]
+async fn start_terminal(
+    app: tauri::AppHandle,
+    project_id: String,
+    session_id: Option<String>,
+    cols: u16,
+    rows: u16,
+) -> Result<String> {
     blocking(move || {
         let state = app.state::<AppState>();
-        let _admission = state
-            .agents
-            .lock()
-            .map_err(|_| "Agent state is unavailable.")?;
-        agent_updates::ensure_not_installing()?;
-        terminal::start(app.clone(), terms, &root, cols, rows)
+        start_terminal_inner(
+            &state,
+            Arc::new(app.clone()),
+            &project_id,
+            session_id.as_deref(),
+            cols,
+            rows,
+        )
     })
     .await
 }
 #[tauri::command]
 async fn write_terminal(
-    state: State<'_, AppState>,
+    app: tauri::AppHandle,
     terminal_id: String,
     data: String,
 ) -> Result<()> {
-    let terms = state.terminals.clone();
-    blocking(move || terminal::write(&terms, &terminal_id, &data)).await
+    blocking(move || {
+        let state = app.state::<AppState>();
+        write_terminal_inner(&state, &terminal_id, &data)
+    })
+    .await
 }
 #[tauri::command]
 async fn resize_terminal(
@@ -3132,7 +3224,7 @@ async fn resize_terminal(
     cols: u16,
     rows: u16,
 ) -> Result<()> {
-    terminal::resize(&state.terminals, &terminal_id, cols, rows)
+    resize_terminal_inner(&state, &terminal_id, cols, rows)
 }
 #[tauri::command]
 async fn get_terminal_preferences() -> Result<terminal_preferences::TerminalPreferences> {
@@ -3140,15 +3232,18 @@ async fn get_terminal_preferences() -> Result<terminal_preferences::TerminalPref
 }
 #[tauri::command]
 async fn get_terminal_activity(
-    state: State<'_, AppState>,
+    app: tauri::AppHandle,
     terminal_id: String,
 ) -> Result<terminal::TerminalActivity> {
-    let terms = state.terminals.clone();
-    blocking(move || terminal::activity(&terms, &terminal_id)).await
+    blocking(move || {
+        let state = app.state::<AppState>();
+        terminal_activity_inner(&state, &terminal_id)
+    })
+    .await
 }
 #[tauri::command]
 async fn close_terminal(state: State<'_, AppState>, terminal_id: String) -> Result<()> {
-    terminal::close(&state.terminals, &terminal_id)
+    close_terminal_inner(&state, &terminal_id)
 }
 
 #[derive(Serialize)]

@@ -50,6 +50,12 @@ default, written as plain bytes or with a unit (`200MiB`, `512KB`, `1G`). It is 
 accident guard — a phone photo of a document fits, a mistaken video does not — not
 a security control. The RPC surface keeps its own 64 MiB cap regardless.
 
+`--terminal-idle` is how long a terminal is kept when **no client is attached to it
+and it has printed nothing**: `30m` by default, written as `90s`, `30m`, `2h` or
+`1h30m`, and `0` to keep them forever. A terminal with a client watching is never
+closed, however quiet it is, and a closed one's process group is killed and the
+client is told it was closed for being idle rather than losing the shell silently.
+
 ## The data directory
 
 `--data-dir` is the folder holding `kingcode.sqlite3` — the **same file** the

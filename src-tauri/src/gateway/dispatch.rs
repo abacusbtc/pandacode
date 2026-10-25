@@ -44,6 +44,15 @@ pub(crate) const COMMANDS: &[&str] = &[
     // M2 task 6: the catalog a client picks from (PAN-107).
     "list_providers",
     "list_provider_models",
+    // M2 task 9: a real shell, over the socket the events already travel on
+    // (PAN-110). `start_run_script_terminal` is deliberately absent: it is the
+    // desktop's Run button, driven by an app action, not a client's own shell.
+    "start_terminal",
+    "write_terminal",
+    "resize_terminal",
+    "close_terminal",
+    "get_terminal_activity",
+    "start_harness_terminal",
 ];
 
 /// What the client may rely on beyond the raw command list.
@@ -51,7 +60,7 @@ pub(crate) const COMMANDS: &[&str] = &[
 /// `turns` is the one that changes what a client offers: a gateway that answers the
 /// turn commands advertises it, and a client that does not see it must not show a
 /// remote turn surface at all (PAN-107).
-pub(crate) const FEATURES: &[&str] = &["projects", "sessions", "turns"];
+pub(crate) const FEATURES: &[&str] = &["projects", "sessions", "turns", "terminal"];
 
 /// A team is N runs driven by the architect, which a window owns; M2 does not
 /// serve teams (spec section 8, rows 2 and 6). Saying so is better than starting
@@ -69,6 +78,10 @@ pub(crate) struct Ctx {
     pub(crate) run: crate::run_ctx::RunContext,
     /// The runs this process is actually driving, which no row can answer (§5).
     pub(crate) live: Arc<Live>,
+    /// The terminals this process is holding open, and which sockets watch them:
+    /// the idle rule is the gateway's, so the client never has to send a heartbeat
+    /// (PAN-110).
+    pub(crate) watch: Arc<super::terminals::Watch>,
 }
 
 /// The provider a task would run, for the live entry.
@@ -441,6 +454,130 @@ pub fn handle(command: &str, args: Value, ctx: &Ctx) -> Answer {
 
         "gateway_live_tasks" => ready(|| to_value(ctx.live.tasks())),
 
+        // ---- terminals (M2 task 9) -----------------------------------------
+        // A shell is a PTY write and a process spawn: the work is blocking, so it
+        // runs on the blocking pool and the answer comes back as a future, exactly
+        // like the turn commands.
+        "start_terminal" => {
+            let ctx = ctx.clone();
+            pending(async move {
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct Args {
+                    project_id: String,
+                    session_id: Option<String>,
+                    cols: u16,
+                    rows: u16,
+                }
+                let args: Args = from_value(args)?;
+                let state = ctx.state.clone();
+                let events = ctx.run.emitter();
+                let id = tokio::task::spawn_blocking(move || {
+                    crate::start_terminal_inner(
+                        &state,
+                        events,
+                        &args.project_id,
+                        args.session_id.as_deref(),
+                        args.cols,
+                        args.rows,
+                    )
+                })
+                .await
+                .map_err(|error| format!("the terminal did not start: {error}"))??;
+                // Registered before the id reaches the client, so an idle shell
+                // cannot outlive the rule that closes it.
+                ctx.watch.watch(&id);
+                Ok(json!(id))
+            })
+        }
+        "write_terminal" => {
+            let ctx = ctx.clone();
+            pending(async move {
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct Args {
+                    terminal_id: String,
+                    data: String,
+                }
+                let args: Args = from_value(args)?;
+                let state = ctx.state.clone();
+                tokio::task::spawn_blocking(move || {
+                    crate::write_terminal_inner(&state, &args.terminal_id, &args.data)
+                })
+                .await
+                .map_err(|error| format!("the write did not finish: {error}"))??;
+                Ok(json!(null))
+            })
+        }
+        "resize_terminal" => ready(|| {
+            #[derive(serde::Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct Args {
+                terminal_id: String,
+                cols: u16,
+                rows: u16,
+            }
+            let args: Args = from_value(args)?;
+            crate::resize_terminal_inner(&ctx.state, &args.terminal_id, args.cols, args.rows)?;
+            Ok(json!(null))
+        }),
+        "close_terminal" => ready(|| {
+            #[derive(serde::Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct Args {
+                terminal_id: String,
+            }
+            let args: Args = from_value(args)?;
+            crate::close_terminal_inner(&ctx.state, &args.terminal_id)?;
+            // A closed shell is not a candidate for the idle rule.
+            ctx.watch.unwatch(&args.terminal_id);
+            Ok(json!(null))
+        }),
+        "get_terminal_activity" => {
+            let ctx = ctx.clone();
+            pending(async move {
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct Args {
+                    terminal_id: String,
+                }
+                let args: Args = from_value(args)?;
+                let state = ctx.state.clone();
+                // Probing what runs in the shell means reading the process table,
+                // which is blocking work like the rest of the terminal surface.
+                let activity = tokio::task::spawn_blocking(move || {
+                    crate::terminal_activity_inner(&state, &args.terminal_id)
+                })
+                .await
+                .map_err(|error| format!("the activity check did not finish: {error}"))??;
+                to_value(activity)
+            })
+        }
+        "start_harness_terminal" => {
+            let ctx = ctx.clone();
+            pending(async move {
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct Args {
+                    session_id: String,
+                    cols: u16,
+                    rows: u16,
+                }
+                let args: Args = from_value(args)?;
+                let events = ctx.run.emitter();
+                let id = crate::task_controls::start_harness_terminal_inner(
+                    &ctx.state,
+                    events,
+                    &args.session_id,
+                    args.cols,
+                    args.rows,
+                )
+                .await?;
+                ctx.watch.watch(&id);
+                Ok(json!(id))
+            })
+        }
+
         // A catalog read runs the provider CLIs, so it answers with a future like the
         // other work that is not a store read (PAN-107).
         "list_providers" => pending(async move {
@@ -507,6 +644,7 @@ mod tests {
             state: Arc::new(state),
             run,
             live: Arc::new(Live::default()),
+            watch: crate::gateway::terminals::Watch::new(std::time::Duration::from_secs(1800)),
         }
     }
 
