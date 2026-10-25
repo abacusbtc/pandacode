@@ -20,6 +20,9 @@ pub(crate) const COMMANDS: &[&str] = &[
     "remove_project",
     "list_sessions",
     "create_session",
+    // M3 task 3: a remote client can delete a task, and a live turn is refused with a
+    // reason instead of being orphaned (PAN-124).
+    "delete_session",
     "get_messages",
     "gateway_list_dirs",
     "gateway_status",
@@ -52,6 +55,9 @@ pub(crate) const COMMANDS: &[&str] = &[
     "resize_terminal",
     "close_terminal",
     "get_terminal_activity",
+    // M3 task 3: the owner's own terminal appearance, which the client renders with
+    // (PAN-125).
+    "get_terminal_preferences",
     "start_harness_terminal",
 ];
 
@@ -256,6 +262,48 @@ pub fn handle(command: &str, args: Value, ctx: &Ctx) -> Answer {
                 Ok(json!(null))
             })
         }
+        "delete_session" => {
+            let ctx = ctx.clone();
+            pending(async move {
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct Args {
+                    session_id: String,
+                }
+                let args: Args = from_value(args)?;
+                // A turn this gateway is driving owns a harness process; deleting its row
+                // would leave that process writing into nothing, so the request is
+                // refused with the one instruction that makes it possible (PAN-124).
+                if ctx
+                    .live
+                    .tasks()
+                    .iter()
+                    .any(|task| task.session_id == args.session_id)
+                {
+                    return Err("This task is running on the gateway. Stop it before deleting it.".to_owned());
+                }
+                // A deleted task never sends a follow-up; free its waiting agent.
+                crate::providers::discard_warm_agent(&args.session_id);
+                let state = ctx.state.clone();
+                // The gateway keeps uploads under the data directory both processes
+                // share, so the delete can remove them before it answers rather than
+                // waiting for the next sweep.
+                let root = crate::uploads::root(ctx.run.data_dir());
+                let session_id = args.session_id.clone();
+                let deleted = tokio::task::spawn_blocking(move || {
+                    crate::task_deletion::delete_state_at(&state, &session_id, Some(&root))
+                })
+                .await
+                .map_err(|error| format!("the delete did not finish: {error}"))??;
+                let _ = ctx.run.emit(
+                    "sessions-deleted",
+                    json!({ "sessionIds": &deleted.deleted_session_ids }),
+                );
+                let _ = ctx.run.emit("sessions-changed", ());
+                to_value(deleted)
+            })
+        }
+        "get_terminal_preferences" => ready(|| to_value(crate::terminal_preferences::discover())),
         "start_task" => {
             let ctx = ctx.clone();
             pending(async move {
@@ -653,6 +701,40 @@ mod tests {
             .enable_all()
             .build()
             .unwrap()
+    }
+
+    /// PAN-125: the answer is the owner's own terminal config, read by the same code the
+    /// desktop command uses. A gateway-side default would answer the same all-null shape
+    /// on this host, so the test supplies a config it can recognise.
+    #[test]
+    fn terminal_preferences_are_the_owners_own_values_not_a_gateway_default() {
+        let data = tempfile::tempdir().unwrap();
+        let config = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(config.path().join("ghostty")).unwrap();
+        std::fs::write(
+            config.path().join("ghostty/config"),
+            "font-family = Iosevka Term\nadjust-cell-height = 25%\ncursor-style = block\n",
+        )
+        .unwrap();
+        let previous = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("XDG_CONFIG_HOME", config.path());
+
+        let answer = handle("get_terminal_preferences", json!({}), &ctx(data.path()));
+        let desktop = serde_json::to_value(crate::terminal_preferences::discover()).unwrap();
+        match previous {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+
+        let Answer::Ready(served) = answer else {
+            panic!("get_terminal_preferences must answer inside the worker");
+        };
+        let served = served.unwrap();
+        assert_eq!(served, desktop, "the wire answer is the desktop reader's answer");
+        assert_eq!(served["fontFamily"], "Iosevka Term");
+        assert_eq!(served["source"], "Ghostty");
+        assert_eq!(served["lineHeight"], 1.25);
+        assert_eq!(served["cursorStyle"], "block");
     }
 
     #[test]

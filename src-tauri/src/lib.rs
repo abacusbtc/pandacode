@@ -47,7 +47,10 @@ mod support;
 mod task_controls;
 mod task_deletion;
 mod terminal;
-mod terminal_preferences;
+// Public so a test can assert the gateway's answer is this reader's answer rather
+// than a second implementation (PAN-125). The command and the gateway both call
+// `discover()`; there is no other source.
+pub mod terminal_preferences;
 mod turn_changes;
 mod uploads;
 mod usage_keychain;
