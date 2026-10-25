@@ -24,6 +24,9 @@ executable on PATH serves every test and no test has to touch the process enviro
                                    append the decision this child was given to <path>
     --model fake:hold              one delta, then hold the turn open until stdin
                                    closes (a mid-turn kill, a dropped client)
+    --model fake:report:<path>     append the model this child was launched with to
+                                   <path>, then stream (PAN-159: the turn reports the
+                                   model the session was configured with)
 
 The environment is a fallback for running it by hand: FAKE_DELTAS, FAKE_DELAY_MS,
 FAKE_APPROVAL, FAKE_LOG, FAKE_HOLD, FAKE_TEXT.
@@ -51,16 +54,22 @@ def read_stdin_line():
 
 def parse_model(argv):
     """`fake:<verb>[:<arg>[:<arg>]]` -> (verb, args). Anything else is ignored."""
+    value = next_model(argv)
+    if not value or not value.startswith("fake:"):
+        return None
+    parts = value.split(":")
+    return parts[1], parts[2:]
+
+
+def next_model(argv):
+    """The `--model` value this child was launched with, however the caller spelled it."""
     value = None
     for index, argument in enumerate(argv):
         if argument == "--model" and index + 1 < len(argv):
             value = argv[index + 1]
         elif argument.startswith("--model="):
             value = argument.split("=", 1)[1]
-    if not value or not value.startswith("fake:"):
-        return None
-    parts = value.split(":")
-    return parts[1], parts[2:]
+    return value
 
 
 def main():
@@ -77,9 +86,16 @@ def main():
         pad = int(args[2]) if len(args) > 2 else 0
     if verb == "approval" and args:
         log = args[0]
-    hold = verb == "hold" or os.environ.get("FAKE_HOLD") == "1"
+    if verb == "report" and args:
+        # PAN-159: say which model this child was actually launched with. A test that
+        # configures a session and then runs a turn can prove the configured model
+        # reached the child, rather than only that the session row changed.
+        with open(args[0], "a") as handle:
+            handle.write(json.dumps({"model": next_model(sys.argv[1:])}) + "\n")
+    hold = verb == "hold" or "hold" in args or os.environ.get("FAKE_HOLD") == "1"
 
-    emit({"type": "system", "subtype": "init", "session_id": "fake-session", "model": "fake-model"})
+    # The model this child was started with, so the frame is honest rather than a constant.
+    emit({"type": "system", "subtype": "init", "session_id": "fake-session", "model": next_model(sys.argv[1:])})
 
     # The app sends the prompt as one JSON line on stdin. Reading it is the whole
     # handshake: a harness that ignored stdin would deadlock the app's writer.

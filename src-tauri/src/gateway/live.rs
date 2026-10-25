@@ -79,6 +79,16 @@ impl Live {
         }
     }
 
+    /// Whether this gateway is driving that session right now. Asked before a change that
+    /// must not land under a turn already in flight — a model, a provider, a project
+    /// (PAN-159); the desktop asks its own `agents` map for the same question.
+    pub fn running(&self, session_id: &str) -> bool {
+        self.0
+            .lock()
+            .map(|live| live.contains_key(session_id))
+            .unwrap_or(false)
+    }
+
     /// What is live now, oldest first so a client polling the list sees a stable
     /// order rather than a hash order.
     pub fn tasks(&self) -> Vec<LiveTask> {
