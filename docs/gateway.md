@@ -7,11 +7,16 @@ the app's Rust library with a different entry point: same `AppState`, same
 never compiles or starts it — everything behind the `gateway` Cargo feature
 (axum, tower-http, the `/events` socket) stays out of the app bundle.
 
-This is milestone 1. It serves projects and sessions. Agent turns, files, git,
-terminals, the browser, VMs and the simulator are not in it, and a client is told
-so rather than discovering it by hanging: the command table below is the whole
-surface, and `/capabilities` can never advertise a command the dispatcher does
-not answer.
+This is milestone 2. It serves projects, sessions, agent turns, uploads and
+terminals. Files, git, the browser, VMs and the simulator are not in it, and a
+client is told so rather than discovering it by hanging: the command table below is
+the whole surface, and `/capabilities` can never advertise a command the dispatcher
+does not answer.
+
+It runs **as you**, on your machine, with your credentials and your projects — the
+owner's decision for M2, and the reason a remote turn is indistinguishable from one
+started at the desk. The consequences are in "What you are trusting" below; the
+short version is that the token is as good as your SSH key.
 
 ## Run it
 
@@ -32,11 +37,18 @@ for PDFs (`pdftotext`). DOCX, ODT and EPUB are read in-process; without
 poppler-utils a PDF is refused with a message naming the package rather than
 failing vaguely.
 
+Which formats a Linux gateway reads, so nobody has to guess: plain text and
+Markdown; PDF through `pdftotext`; DOCX, ODT and EPUB in-process. Legacy binary
+formats — `.doc`, `.rtf`, `.pages`, `.pptx`, `.xlsx` — are refused on any host that
+has no system reader for them, with a message asking for a text export; that
+message is the same sentence a Mac user sees, and on Linux it means "export it
+first", not "this gateway cannot read documents".
+
 The binary is a normal cargo target; `--help` prints the flags:
 
 ```sh
 cargo run --manifest-path src-tauri/Cargo.toml --features gateway --bin pandacode-gateway -- --help
-usage: pandacode-gateway [--data-dir <dir>] [--host <host>] [--port <port>] [--token <token>] [--token-file <file>] [--static-dir <dir>] [--allow-origin <origin>]… [--upload-max <size>] [--force-owner]
+usage: pandacode-gateway [--data-dir <dir>] [--host <host>] [--port <port>] [--token <token>] [--token-file <file>] [--static-dir <dir>] [--allow-origin <origin>]… [--approval-ttl <duration>] [--upload-max <size>] [--terminal-idle <duration>] [--force-owner]
 ```
 
 `--host` defaults to `127.0.0.1` and `--port` to `47399`. `--static-dir` is
@@ -56,6 +68,14 @@ and it has printed nothing**: `30m` by default, written as `90s`, `30m`, `2h` or
 closed, however quiet it is, and a closed one's process group is killed and the
 client is told it was closed for being idle rather than losing the shell silently.
 
+`--approval-ttl` is how long an approval stays pending with **no client attached**
+before the gateway denies it on the person's behalf: `1h` by default, in the same
+units, and `0` turns auto-deny off (logged once at start — an approval nobody
+answers then waits until the turn ends). The clock starts when the question was
+raised, not when the turn last did anything, so a busy turn cannot silence it. The
+denial reaches the run as a refusal it can plan around, appears in the transcript,
+and is one of the audited events below.
+
 ## The data directory
 
 `--data-dir` is the folder holding `kingcode.sqlite3` — the **same file** the
@@ -68,6 +88,12 @@ The default is the desktop app's own directory, built without a Tauri handle:
 `~/.local/share`) on Linux, `~/Library/Application Support` on macOS, `%APPDATA%`
 on Windows. A test pins that identifier against `tauri.conf.json`, so the two
 directories cannot drift apart by renaming the bundle.
+
+**Run as a service it is your directory, not a system one.** The unit in
+`scripts/gateway/` runs as `User=abacus` with no `--data-dir`, so on Linux that is
+`~/.local/share/ai.pandacode.desktop` — the same folder the desktop app uses, with
+the same `kingcode.sqlite3`, created on first start by the gateway itself. Nothing
+in `/var/lib` is involved any more, and nothing needs `sudo` to read the token.
 
 Three files live there, all created with `0600` where they are secret:
 
@@ -89,7 +115,7 @@ dies, including on `SIGKILL`, so holding the lock *is* the state and there is no
 stale-lock recovery to get wrong. A second process finds it held and refuses:
 
 ```
-/var/lib/pandacode is in use by another process (pid 4711): a second PandaCode or
+/home/abacus/.local/share/ai.pandacode.desktop is in use by another process (pid 4711): a second PandaCode or
 the pandacode-gateway holds the database lock.
 Stop that process and try again.
 ```
@@ -128,6 +154,31 @@ Binding anything other than loopback requires a token you chose — `--token` or
 enough to expose the database to a network, so `--host 0.0.0.0` without one is
 refused before the token file is even resolved.
 
+### Rotating it
+
+The token has no expiry and no second copy, so rotation is a restart:
+
+1. Stop the gateway (`sudo systemctl stop pandacode-gateway`, or Ctrl-C).
+2. Delete `<data-dir>/gateway-token` — on a service install that is
+   `~/.local/share/ai.pandacode.desktop/gateway-token`, and no `sudo` is needed.
+3. Start it again. The next start writes a new 32-byte token, `0600`, in the same
+   place.
+4. `cat` the file and paste it into Settings → General → Remote gateway. The app
+   keeps it in the OS keychain; every other client, and anything you gave the old
+   token to, is now locked out.
+
+`--token`/`--token-file` installs ignore the data directory's file entirely, so
+rotating one of those means changing what the flag points at and restarting.
+
+### Guessing it
+
+Ten failed authorisations from one address in a rolling minute is what a source
+gets before the gateway answers `429` for the rest of that minute. The limit counts
+**failures**, never requests: a client holding the right token is never limited, so
+a brute force from an address cannot lock you out of the gateway you reach from the
+same address. Every failure is audited (see "Audit" below), and the window rolls —
+a source that stops trying starts again from zero.
+
 ## The HTTP surface
 
 `GET /healthz` answers `ok` with no token, so a supervisor, a proxy or a test can
@@ -145,45 +196,66 @@ in the same envelope the client sends:
 Command failures keep HTTP 200 and travel in `error`, because they are the same
 strings the Tauri commands already return and the UI handles them the same way.
 The status codes that are not 200 mean the request itself was wrong: `401`
-without a usable token, `413` for a body over 64 MiB, `405` for a write to a
-client route, `400` for a body that is not JSON.
+without a usable token, `429` after ten failed tokens from one address in a
+minute, `413` for a body over 64 MiB (or an upload over `--upload-max`), `405` for
+a write to a client route, `400` for a body that is not JSON.
 
-The body cap is 64 MiB, chosen here rather than inherited: base64 attachments are
-the largest thing this surface will carry. The proxy must allow the same number
-(see below) or it will refuse a body the gateway would have accepted.
+`POST /rpc` is capped at 64 MiB, chosen here rather than inherited: base64
+attachments are the largest thing this surface carries. `/upload` has its own cap
+(`--upload-max`, 200 MiB by default) because a file streams instead of being
+buffered. The proxy must allow the larger of the two (see below) or it will refuse
+a body the gateway would have accepted.
 
 `GET /capabilities` and the `gateway_status` command answer the same list, from
 one constant in `src-tauri/src/gateway/dispatch.rs` that the dispatcher also
 matches on. A test pins both directions — advertised implies answered, and
 answered implies advertised.
 
-| Command | Args | Result |
-| --- | --- | --- |
-| `list_projects` | — | `Project[]` |
-| `add_project` | `{path}` | `Project` |
-| `remove_project` | `{projectId}` | `null` |
-| `list_sessions` | `{projectId?}` | `Session[]` |
-| `create_session` | `{projectId, provider, model, mode?}` | `Session` |
-| `get_messages` | `{sessionId, beforeId?}` | message page |
-| `gateway_list_dirs` | `{path?, showHidden?}` | `{path, parent, entries}` |
-| `gateway_status` | — | `{commands, features}` |
+The table below lists the groups. `gateway_status` is the authority for the exact
+list a given binary serves; anything absent from it answers `unsupported_command`,
+which is how a client hides a surface instead of discovering it by hanging.
 
-`features` is `["projects", "sessions"]`. The app asks a connected gateway only
-for what this list names, and hides what it does not serve — the browser toggle,
-the VM and simulator tabs, the quick launcher, the GitHub view, the Run button
-and the `.vsix` import — then shows them again on disconnect. The inspector's
-Changes and Files tabs say the backend does not read them rather than claiming a
-clean tree or an empty folder, and a window connected to a gateway never calls
-itself the browser preview.
+| Group | Commands |
+| --- | --- |
+| Projects and sessions | `list_projects`, `add_project`, `remove_project`, `list_sessions`, `create_session`, `get_messages` |
+| Remote folder picker | `gateway_list_dirs` |
+| Catalog | `gateway_status`, `list_providers`, `list_provider_models` |
+| Turns | `send_message`, `start_task`, `stop_session`, `respond_approval`, `respond_user_input`, `steer_task` |
+| The queue | `queue_list`, `queue_add`, `queue_update`, `queue_remove`, `queue_reorder`, `queue_take`, `queue_restore` |
+| Which turns this gateway runs | `gateway_live_tasks` |
+| Terminal | `start_terminal`, `start_harness_terminal`, `write_terminal`, `resize_terminal`, `close_terminal`, `get_terminal_activity` |
+
+`features` is `["projects", "sessions", "turns", "terminal"]`. The app asks a
+connected gateway only for what this list names, and hides what it does not serve —
+the browser toggle, the VM and simulator tabs, the quick launcher, the GitHub view,
+the Run button, the `.vsix` import, the usage panel, and (without `turns`) the
+composer itself — then shows them again on disconnect. The inspector's Changes and
+Files tabs say the backend does not read them rather than claiming a clean tree or
+an empty folder, and a window connected to a gateway never calls itself the
+browser preview.
 
 `GET /events` upgrades to a WebSocket and sends one JSON text frame per event,
-`{"event": "sessions-changed", "payload": null}`, with the same event names the
-desktop emits. A browser cannot send a header on the handshake, so this is the one
-place the token rides in the query string. A client that falls behind skips ahead
-rather than stalling the emitter — the socket is a refresh hint, not a log — and
-the app reloads its state on reconnect. None of the milestone-1 commands emits an
-event today — they are reads and single writes — so a milestone-1 client sees an
-empty socket; it exists so a later command's event has somewhere to go.
+with the same event names the desktop emits. Every frame is numbered:
+`{"seq": 41, "event": "sessions-changed", "payload": null}`, and the number is the
+whole guarantee that nothing was missed. A browser cannot send a header on the
+handshake, so this is the one place the token rides in the query string.
+
+Two query parameters choose what a socket receives and where it starts:
+
+- `?session=<id>` and `?terminal=<id>` filter to one task or one shell. A frame
+  with no routing key is a process-wide signal and reaches every socket.
+- `?since=<seq>` replays what the socket missed, exclusively after that number. A
+  client that reconnects therefore resumes exactly where it stopped instead of
+  starting at "now".
+
+A socket that falls so far behind that its frames have left the ring is **told**,
+never skipped: it receives `{"event": "lagged", "payload": {"fromSeq": 3, "toSeq": 9}}`
+and then the stream continues from 10. A turn can be refetched from `get_messages`,
+so that is what a client does. A terminal cannot, so its socket is told to clear
+and redraw instead: `{"event": "terminal-reset", ...}`, followed by whatever the
+terminal's 256 KiB ring still holds. Frame numbers come from one process-wide
+counter; the payload is exactly what the emitting code serialised, so a desktop and
+a gateway event are the same shape.
 
 Anything else is the SPA: a real file from `--static-dir` when it exists,
 `index.html` for every other path, and a plain 404 when the gateway was started
@@ -204,6 +276,23 @@ only, never file contents and never files, and it does not follow a path outside
 what the OS already permits for that user. Run the gateway as an account whose
 read access you are willing to hand to every token holder, and treat the token as
 an administrative credential rather than a convenience.
+
+### What you are trusting
+
+**The gateway runs as you, on your machine; anyone with its token can do anything
+you can do.** Not "can open your projects" — can run a turn, and a turn is a shell
+with your credentials: your git config, your provider CLI logins, your SSH agent,
+your files. So:
+
+- Keep it on your LAN, behind the proxy, with TLS at the proxy.
+- Treat the token like an SSH key: never in a URL, a chat message or a screenshot,
+  and rotate it (above) if it may have leaked.
+- Prefer the standard approval mode. It is the brake that turns "the agent can run
+  anything" into "the agent asks before it runs anything"; `full` exists for when
+  you mean it.
+- The audit lines below are a record, not a sandbox. They tell you what happened;
+  they do not stop it happening. Nothing here isolates the agent from your
+  account — decision 2 of M2 says exactly that.
 
 ## Behind a reverse proxy
 
@@ -242,35 +331,81 @@ proxy; do not expose the HTTP port itself.
 ## As a service
 
 `scripts/gateway/pandacode-gateway.service` is a systemd unit for a host that
-serves one data directory:
+serves one data directory **as its owner**:
 
 ```sh
+cargo build --release --manifest-path src-tauri/Cargo.toml --features gateway --bin pandacode-gateway
 sudo install -m 0755 src-tauri/target/release/pandacode-gateway /usr/local/bin/pandacode-gateway
 sudo install -d /srv/pandacode/dist && sudo cp -r dist/. /srv/pandacode/dist/
 sudo install -m 0644 scripts/gateway/pandacode-gateway.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now pandacode-gateway
 curl -s http://127.0.0.1:47399/healthz
-sudo cat /var/lib/pandacode/gateway-token
+cat ~/.local/share/ai.pandacode.desktop/gateway-token
 ```
 
-Build the release binary with `cargo build --release --manifest-path
-src-tauri/Cargo.toml --features gateway --bin pandacode-gateway`.
+The unit is `User=abacus` / `Group=abacus` and nothing else: no `DynamicUser`, no
+`StateDirectory`, no `--data-dir`. That is the M2 decision in one place — the
+gateway runs as the person, so a remote turn has their credentials, their git
+config, their provider CLIs and their `~/projects`, exactly as if they had typed it
+at the desk. The data directory is therefore **their** app data directory,
+`~/.local/share/ai.pandacode.desktop` on Linux (the same folder the desktop app
+opens), created on first start by the gateway itself. There is no `/var/lib` in the
+picture, nothing to pre-create, and nothing needs `sudo` to read the token.
 
-**Do not create `/var/lib/pandacode` by hand.** The unit runs as `DynamicUser=yes`,
-an ephemeral user, and `StateDirectory=pandacode` is what makes the data directory
-work: systemd creates it, owns it as that user, and puts it in the write path
-itself. The real directory is `/var/lib/private/pandacode` (mode `0700`, which
-`StateDirectoryMode=` and `UMask=` pin down) and `/var/lib/pandacode` is a symlink
-to it, so another local user cannot read the database. A root-owned
-`/var/lib/pandacode` already in the way defeats that and the gateway fails on its
-lock with `Permission denied`; `ReadWritePaths=` would not have helped, because it
-only opens the mount namespace and never grants ownership.
+Two settings are deliberately **not** in the unit, and the second is load-bearing:
 
-The token is created on first start at `/var/lib/pandacode/gateway-token` — the
-same path, reached through the symlink. `sudo cat` reads it as root; keep it out of
-shell history. The unit binds loopback, so the proxy must run on the same host or
-share its network namespace; a network bind needs `--host` **and** an explicit
-`--token-file` (see above).
+- `ProtectSystem=` and `PrivateTmp=` are gone *by decision*. A strict system view
+  and a private `/tmp` make a build unable to write `~/.cargo` or its own
+  `target/`; "as if I were on the host machine" is incompatible with them. Do not
+  re-tighten them and then wonder why a build fails.
+- `ProtectHome=` is absent, and now load-bearing rather than incidental:
+  credentials, projects and the data directory all live under `/home`. Hiding it
+  would leave the remote folder picker listing an empty root and every turn unable
+  to read its own configuration.
+
+`NoNewPrivileges=yes` stays, `UMask=0077` stays, and `StandardOutput=journal` is
+what makes the audit lines below survive: systemd copies them into the journal as
+they are written, where the gateway's own processes cannot edit them.
+
+The unit binds loopback, so the proxy must run on the same host or share its
+network namespace; a network bind needs `--host` **and** an explicit
+`--token-file` (see above). A system unit with `User=` needs no
+`loginctl enable-linger` — that is only for `--user` units.
+
+Starting and stopping the service is an operational step, not something this
+document automates: stop the desktop app first, because only one process may hold
+the data directory's lock (above).
+
+## Audit
+
+Every RPC command, approval decision, auto-deny, upload and failed authorisation
+writes **one line** to stdout — which the unit sends to the journal (`journalctl
+-u pandacode-gateway --grep 'audit event='`). Lines are `key=value` so a journal
+query can filter on them:
+
+```text
+audit event=command client=127.0.0.1:54321 command=send_message session=9f2c outcome=ok duration_ms=41
+audit event=approval client=127.0.0.1:54321 decision=approved session=9f2c request=9f2c:3 duration_ms=3
+audit event=approval_denied session=9f2c request=9f2c:3 ttl_ms=3600000 action="Run `git push`?"
+audit event=upload client=127.0.0.1:54321 upload=1b7e kind=document bytes=20481 sha256=9c1f… duration_ms=12
+audit event=auth client=203.0.113.9 path=/rpc failures=11 window_s=60 status=429
+```
+
+| Field | Meaning |
+| --- | --- |
+| `event` | `command`, `approval`, `approval_denied`, `upload`, `auth` |
+| `client` | The connection the request arrived on. For a command or an upload it is that request's peer; the audit names the connection, not a person — the token is the identity |
+| `command`, `outcome` | What was asked and whether it answered (`ok` / `failed`). The error *text* is deliberately not logged: it can quote the work |
+| `session`, `request`, `decision` | The task a command names; the approval request and the word the client answered (`approved` / `denied`) |
+| `ttl_ms`, `action` | The auto-deny's configured TTL and the question it answered. The question is the one piece of prose here, because it *is* the decision |
+| `upload`, `bytes`, `sha256`, `kind` | The stored file: its id, size, digest and kind. **Not** its name, and never its content |
+| `failures`, `window_s`, `status` | An auth failure, how many that source has made in the window, and what it was answered (`401`, or `429` once over the limit) |
+| `duration_ms` | Wall time the gateway spent, for commands, approvals and uploads |
+
+What is never in an audit line: message text, prompt text, document or image
+content, file paths from a project. A line names ids and sizes so the operator can
+find the thing; it does not copy the thing. That is the rule that keeps the
+journal from becoming a second, unaudited copy of the person's work.
 
 ## Tests
 
