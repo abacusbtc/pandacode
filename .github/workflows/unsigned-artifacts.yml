@@ -89,6 +89,10 @@ jobs:
           retention-days: 7
       - name: What you just downloaded
         if: always()
+        # The Windows runner's default shell is PowerShell, where this bash block is a
+        # parse error; the build and upload had already succeeded, so a cosmetic step
+        # turned the job red.
+        shell: bash
         run: |
           {
             echo "### Unsigned ${{ matrix.target }} build"
