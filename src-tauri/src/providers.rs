@@ -34,7 +34,6 @@ mod claude_stream_tests;
 mod codex_stream_tests;
 #[cfg(all(test, unix))]
 pub(crate) mod concurrent_process_tests;
-mod extra_models;
 mod glm;
 mod mimo;
 mod deepseek;
@@ -615,15 +614,40 @@ pub async fn list_models(provider: &str) -> Result<Vec<ModelInfo>, String> {
         // whole catalog like every other harness.
         let selected = crate::provider_settings::opencode_model_ids()?;
         if !selected.is_empty() {
-            // Keep saved choices usable during temporary discovery failures. The
-            // Settings catalog reports the error and allows an explicit refresh.
-            let catalog = list_model_catalog(provider).await.unwrap_or_default();
-            return Ok(selected_opencode_models(catalog, &selected));
+            // Narrowed against the catalog the session actually accepts, so a saved
+            // id this host cannot negotiate is not offered back (PAN-121). A
+            // discovery failure is reported rather than answered with those ids.
+            return Ok(selected_advertised_models(
+                list_model_catalog(provider).await?,
+                &selected,
+            ));
         }
     }
     list_model_catalog(provider).await
 }
 
+/// The picker's OpenCode list: the saved selection narrowed to what this host can
+/// negotiate. A saved id the catalog does not advertise is dropped rather than
+/// invented (PAN-121); the provider card's `selected_opencode_models` still names
+/// every stored id, because it describes settings instead of offering a choice.
+fn selected_advertised_models(catalog: Vec<ModelInfo>, selected: &[String]) -> Vec<ModelInfo> {
+    let mut available: HashMap<_, _> = catalog
+        .into_iter()
+        .map(|model| (model.id.clone(), model))
+        .collect();
+    let mut models = vec![ModelInfo::default_choice()];
+    for id in selected {
+        if let Some(model) = available.remove(id) {
+            models.push(model);
+        }
+    }
+    models
+}
+
+/// The provider card's OpenCode models: every stored Settings id, described as the
+/// catalog knows it. This describes settings rather than offering a choice, so an id
+/// discovery has not confirmed is still named here; the picker path
+/// (`selected_advertised_models`) never offers one (PAN-121).
 fn selected_opencode_models(catalog: Vec<ModelInfo>, selected: &[String]) -> Vec<ModelInfo> {
     let mut available: HashMap<_, _> = catalog
         .into_iter()
@@ -677,7 +701,7 @@ pub(crate) async fn list_model_catalog(provider: &str) -> Result<Vec<ModelInfo>,
         "claude" => claude_models(&path).await,
         "codex" => codex_models(&path).await,
         "kimi" => kimi_models::list(&path).await,
-        "opencode" => extra_models::opencode(&path).await,
+        "opencode" => acp::opencode_models(&path).await,
         "glm" => Ok(glm::models()),
         "antigravity" => acp::models(&path).await,
         "grok" => acp::grok_models(&path).await,
@@ -2988,6 +3012,72 @@ async fn run_process_with_tools(
 
 #[cfg(test)]
 mod tests {
+    /// The invariant, by effect, on the installed CLI: nothing `list_provider_models`
+    /// returns may be refused at negotiation. This is the test that would have caught
+    /// PAN-121 — with the CLI's catalog as the source it returns 431 ids and the
+    /// session accepts nine.
+    #[tokio::test]
+    #[ignore = "Needs installed OpenCode; metadata only, never sends a prompt"]
+    async fn installed_opencode_catalog_is_a_subset_of_what_the_session_accepts() {
+        let path = super::executable("opencode").expect("Install OpenCode first");
+        // A set read directly from the session, not through the catalog under test.
+        let mut command = super::command(&path).unwrap();
+        command.arg("acp");
+        command.env("OPENCODE_CONFIG_CONTENT", super::acp::configuration("auto"));
+        let (metadata, _) = super::acp::inspect(command, &std::env::temp_dir(), false)
+            .await
+            .expect("OpenCode did not create a session");
+        let accepted: std::collections::HashSet<String> = super::acp::parse_models(&metadata)
+            .into_iter()
+            .map(|model| model.id)
+            .collect();
+        assert!(
+            accepted.len() > 1,
+            "the session advertised no models, so this test proves nothing"
+        );
+        let catalog = super::list_model_catalog("opencode")
+            .await
+            .expect("OpenCode catalog discovery failed");
+        let refused: Vec<_> = catalog
+            .iter()
+            .map(|model| model.id.as_str())
+            .filter(|id| *id != "default" && !accepted.contains(*id))
+            .collect();
+        assert!(
+            refused.is_empty(),
+            "advertised but refused at negotiation: {refused:?} (session accepts {accepted:?})"
+        );
+        println!(
+            "opencode advertises {} models, all accepted by the session",
+            catalog.len() - 1
+        );
+    }
+
+    #[test]
+    fn a_saved_model_the_session_does_not_advertise_is_not_offered() {
+        let offered = super::ModelInfo {
+            id: "opencode/big-pickle".into(),
+            name: "Big Pickle".into(),
+            description: "free".into(),
+            reasoning_efforts: Vec::new(),
+            default_reasoning_effort: None,
+            context_window: Some(128_000),
+        };
+        let picker = super::selected_advertised_models(
+            vec![offered.clone()],
+            &["opencode-go/deepseek-v4.1-flash".into(), offered.id.clone()],
+        );
+        assert_eq!(
+            picker.iter().map(|model| model.id.as_str()).collect::<Vec<_>>(),
+            ["default", "opencode/big-pickle"]
+        );
+        assert_eq!(picker[1], offered);
+        assert_eq!(
+            super::selected_advertised_models(Vec::new(), &["vendor/paid".into()]),
+            [super::ModelInfo::default_choice()]
+        );
+    }
+
     #[test]
     fn opencode_choices_keep_only_saved_models_and_retain_unavailable_ids() {
         let model = super::ModelInfo {
