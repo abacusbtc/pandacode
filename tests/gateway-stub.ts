@@ -27,6 +27,11 @@ export type Stub = {
   sockets: () => number;
   /** The query string of every /events socket opened, oldest first. */
   socketUrls: string[];
+  /**
+   * The `x-pandacode-client` header of every /rpc request, in order — `null` when the
+   * client named itself not at all (PAN-142).
+   */
+  rpcClients: (string | null)[];
   /** Pushes one numbered `{seq, event, payload}` frame to every open socket, as the real gateway does. */
   emit: (event: string, payload?: unknown) => void;
   /** The same, addressed to one terminal: only its filtered socket (and unfiltered ones) receive it. */
@@ -75,6 +80,7 @@ export async function startGateway(replies: Replies, options: StubOptions = {}):
   const requests: { command: string; args: Record<string, unknown> }[] = [];
   const opens: Open[] = [];
   const socketUrls: string[] = [];
+  const rpcClients: (string | null)[] = [];
   const uploads: { name: string; kind: string; bytes: number }[] = [];
   /** The ring, so a reconnect can be answered with the frames it missed (PAN-105). */
   const sent: Sent[] = [];
@@ -89,7 +95,9 @@ export async function startGateway(replies: Replies, options: StubOptions = {}):
     const allow: Record<string, string> = {
       'Access-Control-Allow-Origin': request.headers.origin ?? '*',
       'Access-Control-Allow-Methods': 'GET, POST',
-      'Access-Control-Allow-Headers': 'authorization, content-type',
+      // `x-pandacode-client` is on the list for the same reason the real gateway
+      // allows it: the app names its client on every command (PAN-142).
+      'Access-Control-Allow-Headers': 'authorization, content-type, x-pandacode-client',
       'Access-Control-Max-Age': '600',
       Vary: 'Origin',
     };
@@ -123,6 +131,8 @@ export async function startGateway(replies: Replies, options: StubOptions = {}):
       }
       const frame = JSON.parse(Buffer.concat(chunks).toString() || '{}');
       calls.push(frame.command);
+      const named = request.headers['x-pandacode-client'];
+      rpcClients.push(typeof named === 'string' && named ? named : null);
       requests.push({ command: frame.command, args: frame.args ?? {} });
       const reply = replies[frame.command];
       const footer = { ...allow, 'Content-Type': 'application/json' };
@@ -191,6 +201,7 @@ export async function startGateway(replies: Replies, options: StubOptions = {}):
     requests,
     sockets: () => opens.length,
     socketUrls,
+    rpcClients,
     emit: (event, payload = null) => send(event, payload),
     emitTerminal: (terminalId, event, payload = null) => send(event, payload, terminalId),
     announceHole: (fromSeq, toSeq) => {
