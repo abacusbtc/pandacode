@@ -734,6 +734,9 @@ fn valid_model_id(id: &str) -> bool {
 /// accepted.
 ///
 /// Pure on purpose: the decision table is unit-tested without a CLI, a runtime or a network.
+// The only caller is the gateway's dispatch, so a build without that feature has no use
+// for it — the same reason `RunContext`'s gateway-only accessors carry this attribute.
+#[cfg_attr(not(feature = "gateway"), allow(dead_code))]
 pub(crate) fn model_refusal(provider: &str, model: &str, narrowed: &[String]) -> Option<String> {
     if !valid_model_id(model) {
         return Some("A model id is 1 to 200 characters with no control characters.".into());
