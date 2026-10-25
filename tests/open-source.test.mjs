@@ -32,7 +32,15 @@ test('no app source references the paid PandaCode service or the old support por
 
 test('updates come only from signed GitHub Releases, and nothing reads license keys', async () => {
   const config = JSON.parse(await readFile(join(root, 'src-tauri', 'tauri.conf.json'), 'utf8'));
-  assert.deepEqual(config.plugins?.updater?.endpoints, ['https://github.com/aicodeking/pandacode/releases/latest/download/latest.json']);
+  // The feed must be a GitHub Releases manifest, and never the upstream project's: a fork
+  // build carrying upstream's key would verify an upstream release and install it over
+  // itself (PAN-151). Which fork it is, is pinned in tests/tauri-config.test.mjs.
+  const endpoints = config.plugins?.updater?.endpoints;
+  assert.ok(Array.isArray(endpoints) && endpoints.length > 0, 'the updater names a feed');
+  for (const endpoint of endpoints) {
+    assert.match(endpoint, /^https:\/\/github\.com\/[^/]+\/[^/]+\/releases\/latest\/download\/latest\.json$/, `a GitHub Releases manifest: ${endpoint}`);
+    assert.doesNotMatch(endpoint, /(?:^|\/)aicodeking\//, `never the upstream feed, which a fork build would accept: ${endpoint}`);
+  }
   assert.match(config.plugins.updater.pubkey, /^[A-Za-z0-9+/=]{40,}$/, 'a public key verifies every update');
   // Update files are produced only by builds that hold the signing key (scripts/release/build.mjs).
   assert.equal(config.bundle.createUpdaterArtifacts, undefined);
