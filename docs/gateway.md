@@ -37,6 +37,15 @@ for PDFs (`pdftotext`). DOCX, ODT and EPUB are read in-process; without
 poppler-utils a PDF is refused with a message naming the package rather than
 failing vaguely.
 
+The **desktop app** reaches a gateway over TLS — `https://` for `/rpc` and `wss://`
+for `/events` — or over plain HTTP on this computer (`localhost`, `127.0.0.1`).
+Its webview permits no other cleartext host, so a gateway on the LAN has to be
+behind a TLS proxy (which is "Behind a reverse proxy" below anyway). A plain
+`http://192.168.…` address fails *inside* the app, and Settings can only say it got
+no answer: a refused-by-policy call is indistinguishable from an unreachable host.
+A browser client is not subject to that policy at all — served by the gateway it is
+same-origin, and from another origin it needs `--allow-origin` instead.
+
 Which formats a Linux gateway reads, so nobody has to guess: plain text and
 Markdown; PDF through `pdftotext`; DOCX, ODT and EPUB in-process. Legacy binary
 formats — `.doc`, `.rtf`, `.pages`, `.pptx`, `.xlsx` — are refused on any host that

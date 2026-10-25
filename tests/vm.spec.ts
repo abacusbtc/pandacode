@@ -25,7 +25,11 @@ async function open(page: Page): Promise<void> {
     async function invokePreview(command, args) {`) });
   });
   // The desktop app's Content Security Policy, so the panel is tested under the same rules.
-  const csp = JSON.parse(readFileSync('src-tauri/tauri.conf.json', 'utf8')).app.security.csp.replace("connect-src ipc: http://ipc.localhost", "connect-src 'self' ws: ipc: http://ipc.localhost");
+  // It is used exactly as it ships: since PAN-150 that policy already admits the dev
+  // server's own origin and HMR socket, so there is nothing left to patch here. A policy
+  // that stops admitting them shows up as a violation in the assertion below, not as a
+  // silently weakened one in this file.
+  const csp = JSON.parse(readFileSync('src-tauri/tauri.conf.json', 'utf8')).app.security.csp;
   await page.route(url => new URL(url).pathname === '/', async route => {
     const response = await route.fetch();
     await route.fulfill({ response, body: (await response.text()).replace('<head>', `<head><meta http-equiv="Content-Security-Policy" content="${csp}">`) });
