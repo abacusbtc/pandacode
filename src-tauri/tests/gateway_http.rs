@@ -3241,3 +3241,147 @@ async fn an_unreferenced_upload_is_swept_a_queued_one_survives_and_the_cap_still
     assert!(!upload_dir(dir.path(), &queued_id).exists());
     handle.stop().await;
 }
+
+// ---- M3 task 3: delete_session and get_terminal_preferences (PAN-124, PAN-125) ------
+
+/// A remote delete reaches the same code the desktop's command does, and the uploads a
+/// task owned go with it before the answer — not on the next sweep (PAN-124).
+#[tokio::test]
+async fn a_remote_delete_removes_the_task_and_the_uploads_it_owned() {
+    install_crypto_provider();
+    fake_harness();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = start(dir.path()).await;
+    let session = fake_session(&handle, dir.path(), "fake:stream:50:0:10").await;
+
+    // The task uses one upload in a real turn: that binds it to the task.
+    let (status, uploaded) = upload(&handle, "shot.png", "image", one_pixel_png()).await;
+    assert_eq!(status, 200, "{uploaded}");
+    let id = uploaded["id"].as_str().unwrap().to_owned();
+    call(
+        &handle,
+        "send_message",
+        json!({ "sessionId": session, "text": "look", "uploadIds": [id] }),
+    )
+    .await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    while tokio::time::Instant::now() < deadline {
+        if call(&handle, "gateway_live_tasks", json!({})).await.as_array().is_some_and(|tasks| tasks.is_empty()) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(upload_dir(dir.path(), &id).exists(), "the upload is on disk before the delete");
+
+    let deleted = call(&handle, "delete_session", json!({ "sessionId": session })).await;
+    assert_eq!(deleted["deletedSessionIds"], json!([session]));
+    assert!(
+        !upload_dir(dir.path(), &id).exists(),
+        "the delete removes what the task owned, not what a sweep would find later"
+    );
+    let sessions = call(&handle, "list_sessions", json!({})).await;
+    assert!(
+        !sessions.as_array().unwrap().iter().any(|task| task["id"] == session),
+        "the task is gone: {sessions}"
+    );
+    handle.stop().await;
+}
+
+/// A queued message's upload is owned too, and the delete takes it as well.
+#[tokio::test]
+async fn a_remote_delete_removes_an_upload_only_a_queued_message_referred_to() {
+    install_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = start(dir.path()).await;
+    let (_project, session) = a_task(&handle, dir.path()).await;
+    let (status, uploaded) = upload(&handle, "notes.txt", "document", b"queued".to_vec()).await;
+    assert_eq!(status, 200, "{uploaded}");
+    let id = uploaded["id"].as_str().unwrap().to_owned();
+    call(
+        &handle,
+        "queue_add",
+        json!({
+            "sessionId": session,
+            "text": "later",
+            "attachments": [{ "kind": "document", "id": id }],
+        }),
+    )
+    .await;
+    assert!(upload_dir(dir.path(), &id).exists());
+
+    call(&handle, "delete_session", json!({ "sessionId": session })).await;
+    assert!(
+        !upload_dir(dir.path(), &id).exists(),
+        "a queued reference is ownership for the delete as well"
+    );
+    handle.stop().await;
+}
+
+/// The design decision, proved: a task this gateway is driving is refused, with the one
+/// instruction that makes the delete possible, and the row survives (PAN-124).
+#[tokio::test]
+async fn deleting_a_task_the_gateway_is_driving_is_refused_with_a_reason() {
+    install_crypto_provider();
+    fake_harness();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = start(dir.path()).await;
+    let session = fake_session(&handle, dir.path(), "fake:hold").await;
+    call(&handle, "start_task", json!({ "sessionId": session })).await;
+    // Wait until the gateway itself says it is driving this turn.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    while tokio::time::Instant::now() < deadline {
+        let live = call(&handle, "gateway_live_tasks", json!({})).await;
+        if live.as_array().is_some_and(|tasks| tasks.iter().any(|task| task["sessionId"] == session)) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    let refused = rpc(&handle, "delete_session", json!({ "sessionId": session })).await;
+    assert_eq!(refused["ok"], false, "{refused}");
+    assert_eq!(
+        refused["error"],
+        "This task is running on the gateway. Stop it before deleting it."
+    );
+    let sessions = call(&handle, "list_sessions", json!({})).await;
+    assert!(
+        sessions.as_array().unwrap().iter().any(|task| task["id"] == session),
+        "a refused delete does not touch the row: {sessions}"
+    );
+
+    // Stop it, and the same request is accepted.
+    call(&handle, "stop_session", json!({ "sessionId": session })).await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    while tokio::time::Instant::now() < deadline {
+        if call(&handle, "gateway_live_tasks", json!({})).await.as_array().is_some_and(|tasks| tasks.is_empty()) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let deleted = call(&handle, "delete_session", json!({ "sessionId": session })).await;
+    assert_eq!(deleted["deletedSessionIds"], json!([session]));
+    handle.stop().await;
+}
+
+/// The terminal surface's preferences are served, and they are the owner's own values —
+/// the same ones the desktop's command reports (PAN-125).
+#[tokio::test]
+async fn terminal_preferences_are_served_and_only_this_command_carries_them() {
+    install_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = start(dir.path()).await;
+
+    let preferences = call(&handle, "get_terminal_preferences", json!({})).await;
+    // The desktop's own reader, on the same host. Not a gateway-side default and not a
+    // second store: the same answer the app would show.
+    let desktop = serde_json::to_value(pandacode_lib::terminal_preferences::discover()).unwrap();
+    assert_eq!(preferences, desktop);
+
+    // Nothing else carries them implicitly: a client that does not ask gets no
+    // preference payload on another command's answer.
+    let status = call(&handle, "gateway_status", json!({})).await;
+    for key in ["fontFamily", "lineHeight", "cursorStyle", "cursorBlink", "theme", "source"] {
+        assert!(status.get(key).is_none(), "gateway_status leaked {key}: {status}");
+    }
+    handle.stop().await;
+}

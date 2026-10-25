@@ -225,13 +225,39 @@ which is how a client hides a surface instead of discovering it by hanging.
 
 | Group | Commands |
 | --- | --- |
-| Projects and sessions | `list_projects`, `add_project`, `remove_project`, `list_sessions`, `create_session`, `get_messages` |
+| Projects and sessions | `list_projects`, `add_project`, `remove_project`, `list_sessions`, `create_session`, `delete_session`, `get_messages` |
 | Remote folder picker | `gateway_list_dirs` |
 | Catalog | `gateway_status`, `list_providers`, `list_provider_models` |
 | Turns | `send_message`, `start_task`, `stop_session`, `respond_approval`, `respond_user_input`, `steer_task`, `resolve_agent_ui_action` |
 | The queue | `queue_list`, `queue_add`, `queue_update`, `queue_remove`, `queue_reorder`, `queue_take`, `queue_restore` |
 | Which turns this gateway runs | `gateway_live_tasks` |
-| Terminal | `start_terminal`, `start_harness_terminal`, `write_terminal`, `resize_terminal`, `close_terminal`, `get_terminal_activity` |
+| Terminal | `start_terminal`, `start_harness_terminal`, `write_terminal`, `resize_terminal`, `close_terminal`, `get_terminal_activity`, `get_terminal_preferences` |
+
+### `delete_session` and a task the gateway is running
+
+`delete_session` removes the task, its owned worker conversations, and the uploads it
+owned — sent ones, and ones only a queued message still referred to — before it
+answers, rather than waiting for the hourly sweep. The seven-day upload cap still
+applies to everything else.
+
+**A task this gateway is currently driving is refused**, with
+`This task is running on the gateway. Stop it before deleting it.` The alternative —
+stopping the turn as part of a delete — would kill work the person did not ask to kill,
+on a single destructive request, and the reason would be visible only in a process the
+row no longer names. A refusal is reversible and names the command that unblocks it:
+`stop_session`, then delete. The same rule covers the other live holders the store
+already knows about (a waiting agent, an open harness console, an active Jev run); each
+refusal names what to stop.
+
+### `get_terminal_preferences`
+
+The gateway runs as the owner, so this reads the same terminal configs the desktop's
+command does (`ghostty`, `kitty`, `alacritty`, `wezterm`, Windows Terminal, most
+recently modified wins) — there is no gateway-side default and no second store. Only
+the terminal's name leaves native code (`source`), never a path or a file's contents;
+the values are appearance only (font, line height, cursor, theme colours), and the
+client renders its own terminal with them. Nothing else carries them implicitly: a
+client that does not ask for them never receives a preference payload.
 
 `features` is `["projects", "sessions", "turns", "terminal"]`. The app asks a
 connected gateway only for what this list names, and hides what it does not serve —
