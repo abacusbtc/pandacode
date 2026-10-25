@@ -235,7 +235,7 @@ const UNAVAILABLE: { reason: keyof typeof REASONS; commands: string[] }[] = [
   {
     reason: "NOT_SERVED",
     commands: [
-      "agent_ui_request_active", "configure_session", "create_board_task", "discard_draft", "export_task",
+      "agent_ui_request_active", "create_board_task", "discard_draft", "export_task",
       "fork_session_at_message", "get_message_content", "get_task", "pin_session", "project_icon",
       "reorder_sessions", "set_reasoning_effort", "set_resume_at_reset", "set_task_link", "set_task_preference",
       "set_task_stage", "task_goal", "turn_change_diff", "turn_change_summary", "update_session",
@@ -250,7 +250,7 @@ const UNAVAILABLE: { reason: keyof typeof REASONS; commands: string[] }[] = [
  * gateway must be marked here, and one removed must be reclassified.
  */
 export const SERVED: string[] = [
-  "add_project", "agent_usage", "close_terminal", "create_session",
+  "add_project", "agent_usage", "close_terminal", "configure_session", "create_session",
   "delete_session", "gateway_list_dirs", "gateway_live_tasks", "gateway_status",
   "get_messages", "get_terminal_activity", "get_terminal_preferences", "list_projects",
   "list_provider_models", "list_providers", "list_sessions", "queue_add",
