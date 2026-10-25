@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readdir, readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
-import { DYNAMIC_CALLS, OTHER_TRANSPORTS, REMOTE_COMMANDS, SERVED } from '../src/gateway-commands.ts';
+import { DYNAMIC_CALLS, REMOTE_COMMANDS, SERVED, TRANSPORTS } from '../src/gateway-commands.ts';
 
 /* PAN-160: the served-command gap, closed by assertion rather than by tripping over it.
  *
@@ -19,7 +19,9 @@ import { DYNAMIC_CALLS, OTHER_TRANSPORTS, REMOTE_COMMANDS, SERVED } from '../src
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 const sources = async () => {
-  const names = (await readdir(`${root}src`)).filter(name => name.endsWith('.ts')).sort();
+  // The classification table itself is documentation: it names `call(...)` in prose (the
+  // alias it cannot see, for one), so it is not a source of call sites.
+  const names = (await readdir(`${root}src`)).filter(name => name.endsWith('.ts') && name !== 'gateway-commands.ts').sort();
   return Promise.all(names.map(async name => ({ name: `src/${name}`, text: await readFile(`${root}src/${name}`, 'utf8') })));
 };
 
@@ -114,29 +116,60 @@ test('the DOM gate rows are classified, so the two tables cannot disagree', asyn
   }
 });
 
-test('every command on the two local transports is declared, and none of them pretends to be gateway-served', async () => {
+/**
+ * The transports, discovered rather than named (PAN-160's weak joint): every function that
+ * reaches Tauri's `invoke` is an IPC surface, found by reading the sources. `preview.ts` and
+ * `preview-bots.ts` are the browser preview's own stand-in for `invoke` — test plumbing, not a
+ * transport the app routes through — and are the only exclusions.
+ */
+async function discoveredTransports() {
+  const files = await sources();
+  const found = new Set();
+  for (const { name, text } of files) {
+    if (name === 'src/preview.ts' || name === 'src/preview-bots.ts') continue;
+    for (const match of text.matchAll(/\.invoke(?:<[^>]*>)?\(/g)) {
+      const before = text.slice(0, match.index);
+      const pattern = /(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)|(?:export\s+)?const\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:<[^>]*>\s*)?\(/g;
+      let enclosing = null;
+      for (const declaration of before.matchAll(pattern)) enclosing = declaration[1] ?? declaration[2];
+      if (enclosing) found.add(enclosing);
+    }
+  }
+  return found;
+}
+
+test('a transport is discovered from the code, so a new wrapper cannot go unscanned', async () => {
+  const discovered = [...await discoveredTransports()].sort();
+  const registered = TRANSPORTS.filter(entry => entry.kind === 'ipc').map(entry => entry.name).sort();
+  assert.deepEqual(discovered, registered,
+    'a function that reaches invoke must be registered in TRANSPORTS — otherwise its commands are never scanned, which certifies a completeness that is false');
+  const routers = TRANSPORTS.filter(entry => entry.kind === 'router').map(entry => entry.name);
+  assert.deepEqual(routers, ['call'], 'the router is the one place that chooses between this computer and a gateway');
+  for (const entry of TRANSPORTS) assert.ok(entry.why.trim().length > 40, `${entry.name}: needs a reason, not a label`);
+});
+
+test('every command on a local transport is declared, and none pretends to be gateway-served', async () => {
   const files = await sources();
   const literals = transport => {
     const found = new Set();
     for (const { text } of files) for (const match of text.matchAll(new RegExp(`${transport}(?:<[^>]*>)?\\('([a-z][a-z0-9_]*)'`, 'g'))) found.add(match[1]);
     return found;
   };
-  for (const entry of OTHER_TRANSPORTS) {
-    assert.ok(entry.why.trim().length > 40, `${entry.transport}: needs a reason, not a label`);
-    assert.deepEqual([...literals(entry.transport)].sort(), [...entry.commands].sort(),
-      `${entry.transport}: its declared commands must equal the ones the sources call`);
+  for (const entry of TRANSPORTS.filter(transport => !transport.routes && transport.kind === 'ipc')) {
+    assert.deepEqual([...literals(entry.name)].sort(), [...entry.commands].sort(),
+      `${entry.name}: its declared commands must equal the ones the sources call`);
   }
   // callShell is answered on this computer in every mode, so a gateway can never serve one.
-  const shell = new Set(OTHER_TRANSPORTS.find(entry => entry.transport === 'callShell').commands);
+  const shell = new Set(TRANSPORTS.find(entry => entry.name === 'callShell').commands);
   for (const command of shell) assert.notEqual(REMOTE_COMMANDS[command]?.state, 'served', `${command} is local-only by construction`);
-  console.log(`\n  other transports: ${OTHER_TRANSPORTS.map(entry => `${entry.transport} ${entry.commands.length}`).join(', ')}\n`);
+  console.log(`\n  transports: ${TRANSPORTS.map(entry => `${entry.name}(${entry.kind}${entry.routes ? ', routes' : ''}) ${entry.commands.length}`).join(', ')}\n`);
 });
 
 test('the table has no entry for a command nobody can call', async () => {
   const files = await sources();
   const gating = await readFile(`${root}src/gateway-gating.ts`, 'utf8');
   const gateRows = [...gating.split('export const GATED')[1].split('];')[0].matchAll(/{ command: '([a-z_]+)'/g)].map(match => match[1]);
-  const callable = new Set([...literalSites(files), ...DYNAMIC_CALLS.flatMap(entry => entry.commands), ...SERVED, ...gateRows, ...OTHER_TRANSPORTS.flatMap(entry => entry.commands)]);
+  const callable = new Set([...literalSites(files), ...DYNAMIC_CALLS.flatMap(entry => entry.commands), ...SERVED, ...gateRows, ...TRANSPORTS.flatMap(entry => entry.commands)]);
   const dead = Object.keys(REMOTE_COMMANDS).filter(command => !callable.has(command)).sort();
   assert.deepEqual(dead, [], 'a state for a command that is neither called nor served is a typo or a leftover');
 });
