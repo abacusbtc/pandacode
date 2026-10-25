@@ -1,13 +1,20 @@
 # The standalone gateway as a systemd service: one data directory, one writer, one
-# port. See docs/gateway.md for the flags, the token and the reverse proxy.
+# port, running AS YOU. See docs/gateway.md for the flags, the token, the audit lines
+# and the reverse proxy.
 #
-# Install:
+# Install (as the owner, then one privileged step):
+#   cargo build --release --manifest-path src-tauri/Cargo.toml --features gateway --bin pandacode-gateway
 #   sudo install -m 0755 src-tauri/target/release/pandacode-gateway /usr/local/bin/
-#   sudo install -d /srv/pandacode/dist
+#   sudo install -d /srv/pandacode/dist && sudo cp -r dist/. /srv/pandacode/dist/
 #   sudo install -m 0644 scripts/gateway/pandacode-gateway.service /etc/systemd/system/
 #   sudo systemctl daemon-reload && sudo systemctl enable --now pandacode-gateway
-#   sudo cat /var/lib/pandacode/gateway-token     # paste into Settings → Remote gateway
-# /var/lib/pandacode is created by this unit (StateDirectory=), never by hand.
+#   cat ~/.local/share/ai.pandacode.desktop/gateway-token   # paste into Settings → Remote gateway
+#
+# Nothing creates the data directory but the gateway itself: on first run, as you, it
+# makes ~/.local/share/ai.pandacode.desktop (0700 where it holds the token) and writes
+# the token there 0600. Do not create it as root, and do not point this unit at a
+# second directory: the desktop app and the gateway must open the same database for
+# remote mode to show the projects that are already there.
 
 [Unit]
 Description=PandaCode gateway
@@ -15,42 +22,53 @@ Documentation=https://github.com/abacusbtc/pandacode/blob/master/docs/gateway.md
 # The listener is loopback-only, so it needs no network to be up; whatever proxies
 # to it retries on its own schedule. Do not add After=network-online.target here and
 # start ordering an offline-capable service on DHCP.
+#
+# A system unit with User= needs no `loginctl enable-linger`; that is only for --user
+# units.
 
 [Service]
 Type=simple
-# Loopback only, so the generated token in the data directory is enough; a network
-# bind would need --host and an explicit --token-file (docs/gateway.md).
-ExecStart=/usr/local/bin/pandacode-gateway --data-dir /var/lib/pandacode --static-dir /srv/pandacode/dist --port 47399
+# The whole point of the owner-user decision (M2, 2026-10-24): the gateway runs as the
+# person, with their credentials, git config, provider CLIs, ~/projects and app data
+# directory — a turn started over the gateway is indistinguishable from one started at
+# the desk. An ephemeral user (the M1 DynamicUser=) has none of that and cannot read a
+# single project.
+User=abacus
+Group=abacus
+# Loopback only, so the token this unit's own data directory generates is enough; a
+# network bind would need --host and an explicit --token-file (docs/gateway.md).
+# No --data-dir: the default IS the owner's app data directory, and a second one would
+# be a second, empty install that sees none of the desktop's projects.
+ExecStart=/usr/local/bin/pandacode-gateway --static-dir /srv/pandacode/dist --port 47399
 Restart=always
 # A restart loop that hammers the database is worse than a slow one.
 RestartSec=2
 
-# An ephemeral user, because the gateway needs no identity of its own: the token is
-# what authorises, and the database is the only state. StateDirectory= is what makes
-# that work: systemd creates /var/lib/pandacode for this service, owns it as the
-# ephemeral user (the real directory lives in /var/lib/private with a symlink here so
-# other users cannot read it), and adds it to the writable paths itself. Do NOT
-# pre-create /var/lib/pandacode as root: a real root-owned directory in the way stops
-# the ephemeral user from writing the lock and the database (docs/gateway.md).
-#
-# ReadWritePaths is therefore deliberately absent: it only opens the mount namespace
-# and never grants ownership, which is the trap this unit used to fall into.
-DynamicUser=yes
-StateDirectory=pandacode
-# Nobody else reads the database, and the token is written 0600 in any case; the
-# default umask would leave the SQLite file world-readable inside the directory.
-StateDirectoryMode=0700
-UMask=0077
+# One line per RPC command, approval decision, auto-deny, upload and auth failure goes
+# to stdout (docs/gateway.md, "Audit"); the journal is the copy the gateway's own
+# processes cannot rewrite. Keep this: an audit written to a file the agent can edit is
+# not an audit.
+StandardOutput=journal
+StandardError=journal
 
-# The database and the token are the whole attack surface: nothing outside /var/lib
-# is writable, and the process gains no privilege it did not start with.
-ProtectSystem=strict
-PrivateTmp=yes
+# The database and the token are the owner's own files; the token is written 0600 in
+# any case, and this keeps anything else the process creates private too.
+UMask=0077
+# The process gains no privilege it did not start with. Kept from M1.
 NoNewPrivileges=yes
-# Deliberately absent: ProtectHome=yes. gateway_list_dirs is the point of the remote
-# folder picker, and projects often live under a home directory; hiding /home would
-# leave the picker listing an empty root. The process already runs unprivileged, so it
-# reads what any other user can read and nothing more.
+
+# Isolation is GONE BY DECISION, not by oversight (M2 spec §2.2, owner decision
+# 2026-10-24: "as if I were on the host machine"). ProtectSystem=strict and
+# PrivateTmp=yes were removed on purpose: a turn's build must be able to write ~/.cargo,
+# /tmp and the project folders, which a read-only system view and a private /tmp make
+# impossible. Do not re-tighten them "for safety" and then wonder why a build cannot
+# write its own target directory — the sandbox that remains is the owner's privileges
+# and nothing more.
+#
+# ProtectHome= is deliberately absent and is now load-bearing: credentials, projects and
+# the data directory all live under /home. Adding ProtectHome=yes would leave the
+# remote folder picker listing an empty root and every turn unable to read its own
+# configuration.
 
 [Install]
 WantedBy=multi-user.target
