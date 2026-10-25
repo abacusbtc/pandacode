@@ -16,6 +16,42 @@ import { capabilityEnabled } from './gateway-settings';
 /** Panels that live elsewhere and are embedded here: each mounts into a host and returns its cleanup. */
 type Embed = (host: HTMLElement) => Promise<() => void>;
 
+/**
+ * What a surface needs from the backend, and what a person reads when it is absent.
+ *
+ * A gateway answers only for what it serves; asking for the rest would put
+ * `unsupported_command` in front of the person, so the surface is replaced by a
+ * sentence in their terms instead (PAN-101). The local transports serve everything, so
+ * nothing here fires on a desktop.
+ */
+const NEEDS: Record<string, { command: string; whenMissing: string }> = {
+  providerConnections: {
+    command: 'provider_configuration',
+    whenMissing: 'This backend does not serve provider settings. Configure provider CLIs on the machine running the gateway.',
+  },
+  openCodeModels: {
+    command: 'list_opencode_models',
+    whenMissing: 'This backend does not serve OpenCode model selection.',
+  },
+  teams: {
+    command: 'architect_profiles',
+    whenMissing: 'This backend does not serve named agent teams.',
+  },
+  cloud: {
+    command: 'cloud_connections',
+    whenMissing: 'This backend does not serve cloud sandboxes.',
+  },
+  resources: {
+    command: 'get_metrics',
+    whenMissing: 'This backend does not report resource usage.',
+  },
+};
+
+/** The sentence a surface shows when the backend cannot serve it. */
+function unserved(need: { whenMissing: string }): string {
+  return `<p class="settings-embed-unserved" role="status">${need.whenMissing}</p>`;
+}
+
 export type SettingsSection = 'general' | 'appearance' | 'agents' | 'providers' | 'teams' | 'tools' | 'cloud' | 'github' | 'about';
 
 interface SettingsOptions {
@@ -165,16 +201,33 @@ export function mountSettings(host: HTMLElement, options: SettingsOptions): Sett
       if (options.gateway) cleanups.push(options.gateway(panel.querySelector<HTMLElement>('#gateway-settings')!));
     }
     if (id === 'github' && options.github) cleanups.push(options.github(panel.querySelector<HTMLElement>('#github-settings')!));
-    if (id === 'teams' && options.teams) cleanups.push(mountAgentTeams(panel.querySelector<HTMLElement>('#agent-teams-settings')!, { ...options.teams, providers: options.providers }));
-    if (id === 'cloud' && options.cloud) cleanups.push(mountCloudSettings(panel.querySelector<HTMLElement>('#cloud-settings')!, options.cloud));
+    if (id === 'teams' && options.teams) {
+      const slot = panel.querySelector<HTMLElement>('#agent-teams-settings')!;
+      if (capabilityEnabled(NEEDS.teams.command)) cleanups.push(mountAgentTeams(slot, { ...options.teams, providers: options.providers }));
+      else slot.innerHTML = unserved(NEEDS.teams);
+    }
+    if (id === 'cloud' && options.cloud) {
+      const slot = panel.querySelector<HTMLElement>('#cloud-settings')!;
+      if (capabilityEnabled(NEEDS.cloud.command)) cleanups.push(mountCloudSettings(slot, options.cloud));
+      else slot.innerHTML = unserved(NEEDS.cloud);
+    }
     if (id === 'about') {
       cleanups.push(mountSupportDetails(panel.querySelector<HTMLDetailsElement>('.support-details')!));
       cleanups.push(mountAboutSettings(panel.querySelector<HTMLElement>('.settings-about')!));
-      cleanups.push(mountResourceUsage(panel.querySelector<HTMLElement>('.settings-resources')!));
+      const resources = panel.querySelector<HTMLElement>('.settings-resources')!;
+      if (capabilityEnabled(NEEDS.resources.command)) cleanups.push(mountResourceUsage(resources));
+      // The block is about this process's memory; a backend that cannot report it says
+      // so in place of the numbers rather than leaving a Refresh that only fails.
+      else resources.innerHTML = `<div class="setting-row"><div><strong>Resource usage</strong><small>${NEEDS.resources.whenMissing}</small></div></div>`;
     }
     if (id === 'agents' && !discovered) void refresh();
     for (const slot of panel.querySelectorAll<HTMLElement>('[data-embed]')) {
       const embed = options.embed[slot.dataset.embed as keyof SettingsOptions['embed']];
+      const need = NEEDS[slot.dataset.embed ?? ''];
+      if (need && !capabilityEnabled(need.command)) {
+        slot.innerHTML = unserved(need);
+        continue;
+      }
       slot.innerHTML = '<p class="dialog-loading">Loading…</p>';
       embed(slot).then(cleanup => { if (disposed) cleanup(); else cleanups.push(cleanup); })
         .catch(() => { if (!disposed) slot.innerHTML = '<p class="settings-embed-error" role="alert">This section couldn’t load. Close Settings and try again.</p>'; });

@@ -2,6 +2,7 @@ import './opencode-model-settings.css';
 import { call } from './bridge';
 import { icon } from './dom';
 import { tokenCount } from './model-catalog';
+import { capabilityEnabled } from './gateway-settings';
 import type { ProviderModel } from './types';
 
 interface Catalog {
@@ -86,6 +87,12 @@ export function mountOpenCodeModels(host: HTMLElement, saved: () => void): () =>
   }
   async function refresh(): Promise<void> {
     if (disposed || loading || saving) return;
+    // The catalog is a command; a backend that does not serve it has nothing to list,
+    // and the person reads why instead of a transport error (PAN-101).
+    if (!capabilityEnabled('list_opencode_models')) {
+      message('This backend does not serve OpenCode model selection.', false);
+      return;
+    }
     loading = true; controls();
     message('Loading models from OpenCode…');
     if (!models.length) render();

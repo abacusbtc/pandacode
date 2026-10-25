@@ -52,6 +52,11 @@ export function startAppUpdates(host: UpdatesHost): AppUpdates {
   }
 
   async function run(): Promise<void> {
+    // Remote mode deliberately changes nothing here. An update is this client app's own
+    // release — its version and its channel — not the gateway's, so the backend this
+    // window is connected to must not be able to gate, delay or fake the update the
+    // person installs (PAN-101). Only the browser preview never checks, because it has
+    // no updater at all.
     if (preview || state.kind === 'downloading' || state.kind === 'ready' || state.kind === 'installing') return;
     lastCheck = Date.now();
     set({ kind: 'checking' });

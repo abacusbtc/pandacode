@@ -22,7 +22,7 @@ import { renderTurnChanges, changeRequest, captureChangeCards, restoreChangeCard
 import { mountWallpapers } from './wallpapers';
 import type { AgentEvent, BrowserAttachment, ContextUsage, FileEntry, GitStatus, Message, MessagePage, Mode, Project, Provider, ProviderId, ProviderModel, Session, TaskLink, ToolActivity, TurnChanges } from './types';
 import type { BrowserPanel } from './browser';
-import { call, chooseFolder, currentMode, preview, subscribe } from './bridge';
+import { call, callShell, chooseFolder, currentMode, preview, subscribe } from './bridge';
 import { $, button, escape, icon, markdown, morph } from './dom';
 import { bindMessageActions, messageActionsHtml } from './message-actions';
 import { providerLogo } from './provider-logos';
@@ -190,6 +190,9 @@ async function loadTeam(id: string): Promise<TeamSnapshot | null> {
 }
 async function showArchitectSetup(anchor: HTMLElement): Promise<void> {
   if (architectSetupCleanup) { architectSetupCleanup(); return; }
+  // The setup saves through `architect_configure` and reads the team library; a backend
+  // that serves neither cannot open it honestly, so it says so instead (PAN-101).
+  if (!capabilityEnabled('architect_profiles')) { notify('This backend does not serve named agent teams.'); return; }
   const task = session(); if (!task) return;
   closeMenus();
   const request = ++architectSetupRequest;
@@ -249,8 +252,8 @@ async function toggleTeam(): Promise<void> {
     const team = teams.get(task.id) ?? await loadTeam(task.id);
     let config: TeamConfig | null = null;
     if (!team) {
-      const [library, workers] = await Promise.all([call<TeamLibrary>('architect_profiles'), autoRoster()]);
-      const limits = library.lastSetup?.config;
+      const [library, workers] = await Promise.all([capabilityEnabled('architect_profiles') ? call<TeamLibrary>('architect_profiles') : Promise.resolve(null), autoRoster()]);
+      const limits = library?.lastSetup?.config;
       config = { auto: true, workers, maxParallel: limits?.maxParallel ?? 0, maxRounds: limits?.maxRounds ?? 8, maxAssignments: limits?.maxAssignments ?? 24, workspace: 'shared', summaryLimit: limits?.summaryLimit ?? 3072 };
     }
     if (task.id !== state.sessionId) return;
@@ -808,7 +811,10 @@ function loadModels(id: ProviderId): Promise<ProviderModel[]> {
   const cached = modelCatalogs.get(id);
   if (cached && cached.expires > Date.now()) return cached.pending;
   // OpenCode's own listing also says whether Settings saved a selection, which keeps the picker's full list.
-  const request = id === 'opencode'
+  // `list_opencode_models` is the desktop's own Settings listing. A backend that does
+  // not serve it still serves the catalog, which is the list the picker actually needs
+  // (PAN-101).
+  const request = id === 'opencode' && capabilityEnabled('list_opencode_models')
     ? call<OpenCodeModels>('list_opencode_models').then(result => { openCodeSaved = result.selectedModelIds.length > 0; return openCodeChoices(result); })
     : call<ProviderModel[]>('list_provider_models', { provider: id });
   const pending = request.then(models => {
@@ -2883,7 +2889,10 @@ async function showModel(anchor: HTMLElement): Promise<void> {
   closeChoiceMenu();
   const { epoch, release } = beginMenuOpen(anchor);
   const generation = state.generation;
-  const [{ openModelPicker }, library] = await Promise.all([import('./model-picker'), call<TeamLibrary>('architect_profiles').catch(() => null)]).finally(release);
+  const [{ openModelPicker }, library] = await Promise.all([
+    import('./model-picker'),
+    capabilityEnabled('architect_profiles') ? call<TeamLibrary>('architect_profiles').catch(() => null) : Promise.resolve(null),
+  ]).finally(release);
   if (epoch !== menuEpoch || modelPickerCleanup || !anchor.isConnected || selected.id !== state.sessionId || generation !== state.generation || isRunning()) return;
   const named = library ? namedTeams(library) : [];
   modelPickerCleanup = openModelPicker({
@@ -2951,7 +2960,12 @@ async function showModel(anchor: HTMLElement): Promise<void> {
 /** Deploy: pick a connected platform, then a new task in this project ships it end to end. */
 async function showDeploy(anchor: HTMLElement): Promise<void> {
   if (!project()) { notify('Open a project to deploy it.'); return; }
-  const [{ deployItems, deployBrief }, connections] = await Promise.all([import('./deploy'), call<import('./cloud-settings').CloudConnection[]>('cloud_connections').catch(() => [])]);
+  const [{ deployItems, deployBrief }, connections] = await Promise.all([
+    import('./deploy'),
+    capabilityEnabled('cloud_connections')
+      ? call<import('./cloud-settings').CloudConnection[]>('cloud_connections').catch(() => [])
+      : Promise.resolve([] as import('./cloud-settings').CloudConnection[]),
+  ]);
   await showChoices(anchor, { title: 'Deploy', width: 300, actions: true, items: deployItems(connections), onSelect: async id => {
     closeChoiceMenu();
     const projectId = state.projectId;
@@ -3175,7 +3189,10 @@ async function showSettings(section?: import('./settings').SettingsSection): Pro
       teams: { loadModels, call },
       cloud: { call, listen: (name, callback) => subscribe(name, callback) },
       embed: {
-        colors: async target => (await import('./theme-settings')).mountThemeSettings(target, { call, notify, chooseVsix: () => import('./bridge').then(bridge => bridge.chooseVsix()) }),
+        // The theme library is this client's own: it reads the resources bundled with
+        // the app, so a gateway has nothing to say about it. Remote mode keeps it local
+        // rather than dropping a working pane (PAN-101).
+        colors: async target => (await import('./theme-settings')).mountThemeSettings(target, { call: callLocal, notify, chooseVsix: () => import('./bridge').then(bridge => bridge.chooseVsix()) }),
         wallpapers: async target => {
           const cleanup = (await import('./wallpaper-settings')).mountWallpaperSettings(target, wallpapers);
           // Choosing a scene or dragging visibility turns wallpapers on or off; keep the Daily wallpapers switch beside it in step.
@@ -3214,7 +3231,7 @@ async function showColorsSettings(): Promise<void> {
   const { mountThemeSettings } = await import('./theme-settings');
   if (!dialog.open || !host.isConnected) return;
   colorsSettingsCleanup?.();
-  colorsSettingsCleanup = mountThemeSettings(host, { call, notify, chooseVsix: () => import('./bridge').then(bridge => bridge.chooseVsix()) });
+  colorsSettingsCleanup = mountThemeSettings(host, { call: callLocal, notify, chooseVsix: () => import('./bridge').then(bridge => bridge.chooseVsix()) });
   dialog.addEventListener('close', () => { colorsSettingsCleanup?.(); colorsSettingsCleanup = undefined; }, { once: true });
 }
 async function showWallpaperSettings(): Promise<void> {
@@ -3404,6 +3421,16 @@ let botProjects = new Set<string>();
 let botProjectsLoad: Promise<void> | undefined;
 function ensureBotProjects(): Promise<void> { return botProjectsLoad ??= reloadBotProjects(false); }
 async function reloadBotProjects(withProjects = true): Promise<void> {
+  // A gateway that does not serve bots has none to list, and asking would surface an
+  // `unsupported_command` to the person (PAN-101). The sidebar's Bots section is gated
+  // by the same answer.
+  if (!capabilityEnabled('bots_list')) {
+    sidebarBots = [];
+    botProjects = new Set();
+    if (withProjects) state.projects = await call<Project[]>('list_projects').catch(() => state.projects);
+    renderNavigation(); renderHeader();
+    return;
+  }
   sidebarBots = await call<import('./bots').Bot[]>('bots_list').catch(() => sidebarBots);
   botProjects = new Set(sidebarBots.map(bot => bot.projectId));
   // An earlier build could leave the filter on a bot's workspace; send it back to All projects.
@@ -3797,6 +3824,13 @@ async function loadWorkspace(): Promise<void> {
   if (state.view !== 'conversation') { state.boardPanel = false; renderInspector(); renderBoardView(); }
 }
 // PandaCode's own updates: checked on GitHub Releases, installed when no agent is working.
+/**
+ * The client's own business, in every mode: the theme library reads the resources
+ * bundled with this app, so it is asked of the local shell over the same IPC the
+ * Settings row uses, not of whichever backend is connected (PAN-101).
+ */
+const callLocal = <T,>(command: string, args: Record<string, unknown> = {}): Promise<T> => callShell<T>(command, args);
+
 const updates = startAppUpdates({ busy: () => state.sessions.some(task => isRunning(task.id)), notify });
 {
   const pill = $('#update-status');

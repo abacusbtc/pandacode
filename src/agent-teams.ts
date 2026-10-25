@@ -3,6 +3,7 @@
 import './agent-teams.css';
 import type { TeamLibrary, TeamProfile } from './architect-types';
 import { escape, icon } from './dom';
+import { capabilityEnabled } from './gateway-settings';
 import { modelChoices } from './model-catalog';
 import { providerLogo } from './provider-logos';
 import { classicTeamSetup, modelKey, namedTeams, namedTeamSetup, setClassicTeamSetup, teamDetail, TEAM_MODELS_MAX, type TeamModel } from './team-mode';
@@ -46,6 +47,13 @@ export function mountAgentTeams(host: HTMLElement, options: AgentTeamsOptions): 
     list.innerHTML = teams.map(team => `<li class="agent-team-row" data-id="${escape(team.id)}"><span class="provider-small ${team.setup.architect.provider}">${providerLogo(team.setup.architect.provider)}</span><span class="agent-team-name"><strong>${escape(team.name)}</strong><small>${escape(teamDetail(team, harnessName))}</small></span><button type="button" class="secondary-button" data-team-edit aria-label="Edit ${escape(team.name)}">Edit</button><button type="button" class="icon-button" data-team-delete aria-label="Delete ${escape(team.name)}" title="Delete team">${icon('close')}</button></li>`).join('');
   }
   async function refresh(): Promise<void> {
+    // Named teams are the backend's own library; one that does not serve it has none,
+    // which is a sentence in the pane rather than a transport error (PAN-101).
+    if (!capabilityEnabled('architect_profiles')) {
+      if (!disposed) error.textContent = 'This backend does not serve named agent teams.';
+      if (!disposed) error.hidden = false;
+      return;
+    }
     try { library = await options.call<TeamLibrary>('architect_profiles'); if (!disposed) renderList(); }
     catch (cause) { if (!disposed) showError(cause); }
   }
