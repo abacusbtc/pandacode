@@ -31,6 +31,8 @@ pub(crate) const COMMANDS: &[&str] = &[
     "stop_session",
     "respond_approval",
     "respond_user_input",
+    // M3 task 1: a client answers the app action it was shown (PAN-123).
+    "resolve_agent_ui_action",
     "steer_task",
     "queue_list",
     "queue_add",
@@ -84,8 +86,22 @@ pub(crate) struct Ctx {
     pub(crate) watch: Arc<super::terminals::Watch>,
 }
 
-/// The provider a task would run, for the live entry.
-///
+impl Ctx {
+    /// The same gateway, handling one request from a named client (PAN-123).
+    ///
+    /// One process serves many clients, so the identity is per request: the run
+    /// context this hands a turn is where the turn learns where its app actions go.
+    pub(crate) fn for_client(&self, client: Option<&str>) -> Ctx {
+        Ctx {
+            state: self.state.clone(),
+            run: self.run.for_client(client),
+            live: self.live.clone(),
+            watch: self.watch.clone(),
+        }
+    }
+}
+
+/// The provider a task would run, for the live entry.///
 /// One store read on the gateway's own send path. It is deliberately not folded
 /// into `resolve_send`/`resolve_start`: those are shared with the desktop
 /// wrappers, which have no use for it and should not pay for it.
@@ -236,7 +252,7 @@ pub fn handle(command: &str, args: Value, ctx: &Ctx) -> Answer {
                 // before it was listed; the surface clears it when the run ends. A
                 // second send on a live session leaves the running turn's entry
                 // alone, including when its own launch is then refused.
-                let recorded = ctx.live.start(&session_id, &provider)?;
+                let recorded = ctx.live.start(&session_id, &provider, ctx.run.client())?;
                 if let Err(error) = crate::send_message_inner(
                     &ctx.state,
                     ctx.run.clone(),
@@ -270,7 +286,7 @@ pub fn handle(command: &str, args: Value, ctx: &Ctx) -> Answer {
                     return Err(TEAMS_NOT_SERVED.to_owned());
                 }
                 let provider = provider_of(&ctx.state, &args.session_id)?;
-                let recorded = ctx.live.start(&args.session_id, &provider)?;
+                let recorded = ctx.live.start(&args.session_id, &provider, ctx.run.client())?;
                 if let Err(error) = crate::start_task_inner(
                     &ctx.state,
                     ctx.run.clone(),
@@ -344,6 +360,29 @@ pub fn handle(command: &str, args: Value, ctx: &Ctx) -> Answer {
                     args.response,
                 )
                 .await?;
+                Ok(json!(null))
+            })
+        }
+        "resolve_agent_ui_action" => {
+            let ctx = ctx.clone();
+            pending(async move {
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct Args {
+                    request_id: String,
+                    result: Option<Value>,
+                    error: Option<String>,
+                }
+                let args: Args = from_value(args)?;
+                // The caller answers as itself: an action addressed to one client is
+                // refused when another one presents it (PAN-123).
+                crate::agent_tools::resolve_ui_action(
+                    &ctx.state,
+                    ctx.run.client(),
+                    args.request_id,
+                    args.result,
+                    args.error,
+                )?;
                 Ok(json!(null))
             })
         }
@@ -791,7 +830,7 @@ mod tests {
             .unwrap();
 
         // A turn is running: the registry has it and the agent registry agrees.
-        ctx.live.start(&session.id, "claude").unwrap();
+        ctx.live.start(&session.id, "claude", None).unwrap();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         ctx.state.agents.lock().unwrap().insert(
             session.id.clone(),
@@ -925,7 +964,7 @@ mod tests {
     fn the_live_list_carries_what_a_client_needs_to_address_the_task() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = ctx(dir.path());
-        ctx.live.start("s1", "claude").unwrap();
+        ctx.live.start("s1", "claude", None).unwrap();
         let listed = match handle("gateway_live_tasks", json!({}), &ctx) {
             Answer::Ready(result) => result.unwrap(),
             Answer::Pending(_) => panic!("gateway_live_tasks answers immediately"),

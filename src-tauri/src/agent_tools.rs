@@ -813,17 +813,32 @@ impl Drop for UiGuard {
 /// client is there: an app action needs a live client to open a picker or render a
 /// preview, so with none it gives up after five seconds instead of twelve rather
 /// than waiting for somebody who is not listening (PAN-106).
+pub(crate) struct AppAction<'a> {
+    /// The client this action is addressed to, when the asking turn has one. An
+    /// unaddressed action is the desktop's shape (PAN-123).
+    pub client: Option<&'a str>,
+    /// The task whose turn is asking.
+    pub session: &'a str,
+    pub action: &'a str,
+    pub args: Value,
+    pub stopped: Arc<AtomicBool>,
+}
+
 pub(crate) async fn request_ui_on(
     ui: &Arc<crate::run_ctx::UiRequests>,
     emit: impl FnOnce(&str, Value) -> Result<()>,
     attached: bool,
-    sid: &str,
-    action: &str,
-    args: Value,
-    stopped: Arc<AtomicBool>,
+    request: AppAction<'_>,
 ) -> Result<Value> {
+    let AppAction {
+        client,
+        session: sid,
+        action,
+        args,
+        stopped,
+    } = request;
     let id = uuid::Uuid::new_v4().to_string();
-    let rx = ui.register(id.clone(), stopped)?;
+    let rx = ui.register(id.clone(), stopped, client)?;
     let _guard = UiGuard {
         ui: ui.clone(),
         id: id.clone(),
@@ -865,10 +880,14 @@ async fn request_ui(
         // A window is an attached client, so the desktop keeps waiting exactly as
         // it does today.
         true,
-        sid,
-        action,
-        args,
-        stopped,
+        AppAction {
+            // A native turn has no remote identity; its events reach the window.
+            client: None,
+            session: sid,
+            action,
+            args,
+            stopped,
+        },
     )
     .await
 }
@@ -883,9 +902,15 @@ pub(crate) fn ui_request_active(state: &AppState, request_id: &str) -> bool {
 pub fn agent_ui_request_active(state: State<'_, AppState>, request_id: String) -> bool {
     ui_request_active(&state, &request_id)
 }
-#[tauri::command]
-pub fn resolve_agent_ui_action(
-    state: State<'_, AppState>,
+/// The desktop command's own body, answerable from plain state so a gateway can
+/// serve the same thing (PAN-123).
+///
+/// `client` is who is answering: an app action addressed to a remote client can
+/// only be answered by that client, and `None` here is the desktop, which addresses
+/// nothing and answers its own questions.
+pub(crate) fn resolve_ui_action(
+    state: &AppState,
+    client: Option<&str>,
     request_id: String,
     result: Option<Value>,
     error: Option<String>,
@@ -901,7 +926,17 @@ pub fn resolve_agent_ui_action(
             }
         }
     };
-    state.ui.answer(&request_id, result)
+    state.ui.answer(client, &request_id, result)
+}
+
+#[tauri::command]
+pub fn resolve_agent_ui_action(
+    state: State<'_, AppState>,
+    request_id: String,
+    result: Option<Value>,
+    error: Option<String>,
+) -> Result<()> {
+    resolve_ui_action(&state, None, request_id, result, error)
 }
 
 #[cfg(test)]

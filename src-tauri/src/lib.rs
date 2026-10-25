@@ -1498,8 +1498,9 @@ struct DesktopSurface {
 }
 
 impl run_ctx::TurnSurface for DesktopSurface {
-    fn client_attached(&self) -> bool {
+    fn client_attached(&self, _client: Option<&str>) -> bool {
         // A window is the client, and it is attached for as long as the app runs.
+        // It has no remote identity, so an addressed action never reaches here.
         true
     }
 
