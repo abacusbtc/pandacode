@@ -640,6 +640,28 @@ pub(super) async fn models(path: &Path) -> Result<Vec<ModelInfo>, String> {
     super::acp_catalog::store(discovery, &metadata);
     Ok(parse_models(&metadata))
 }
+
+/// OpenCode's catalog, read from the session a turn will negotiate in (PAN-121).
+///
+/// `opencode models` lists what the CLI knows about; a live session advertises only
+/// what it can actually negotiate, and `choice_request` accepts nothing else. Reading
+/// the same `configOptions` every other ACP harness reads makes the advertised set and
+/// the accepted set one answer instead of two.
+pub(super) async fn opencode_models(path: &Path) -> Result<Vec<ModelInfo>, String> {
+    if let Some(models) = super::acp_catalog::get("opencode", path) { return Ok(models); }
+    let _refresh = super::acp_catalog::refresh_lock("opencode", path).await;
+    if let Some(models) = super::acp_catalog::get("opencode", path) { return Ok(models); }
+    let discovery = super::acp_catalog::begin("opencode", path);
+    let mut command = super::command(path)?;
+    // The same inline settings a turn runs with, so what is read here is the session's
+    // own answer rather than a second opinion about it.
+    command.arg("acp");
+    command.env("OPENCODE_CONFIG_CONTENT", configuration("auto"));
+    let (metadata, _) = inspect(command, &std::env::temp_dir(), false).await?;
+    super::acp_catalog::store(discovery, &metadata);
+    Ok(parse_models(&metadata))
+}
+
 pub(crate) fn parse_models(metadata: &Value) -> Vec<ModelInfo> {
     let mut models = vec![ModelInfo::default_choice()];
     if let Some(option) = options(metadata, "model") {
