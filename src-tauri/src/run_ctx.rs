@@ -58,10 +58,12 @@ pub trait TurnSurface: Send + Sync {
     /// while something is listening, which decides whether an app action fails
     /// fast instead of waiting for a picker nobody can open (PAN-106).
     ///
-    /// The first caller is a remote app action (tasks 7 and 10); until then only
-    /// the tests exercise it, which is why it is allowed to be unused.
+    /// `client` is the identity the action will be addressed to, when the turn has
+    /// one. A gateway answers about *that* client's socket, not about any socket:
+    /// the question goes to one client, so another one's presence must not make it
+    /// wait (PAN-123).
     #[allow(dead_code)]
-    fn client_attached(&self) -> bool;
+    fn client_attached(&self, client: Option<&str>) -> bool;
 
     /// The host tools that need a window: the team or agent tool stack, before
     /// per-turn wrappers are added.
@@ -109,7 +111,7 @@ pub trait TurnSurface: Send + Sync {
 pub struct NoSurface;
 
 impl TurnSurface for NoSurface {
-    fn client_attached(&self) -> bool {
+    fn client_attached(&self, _client: Option<&str>) -> bool {
         false
     }
 
@@ -152,6 +154,10 @@ impl TurnSurface for NoSurface {
 struct PendingUi {
     reply: oneshot::Sender<crate::Result<Value>>,
     stopped: Arc<AtomicBool>,
+    /// The client identity this action was addressed to, when it was addressed to
+    /// one. `None` is an unaddressed request, which any caller may still answer as
+    /// it always could (PAN-123).
+    client: Option<String>,
 }
 
 /// The app actions the agent asked for, waiting for a client.
@@ -167,33 +173,57 @@ const MAX_PENDING_UI: usize = 16;
 
 impl UiRequests {
     /// Registers a request and returns the receiver its answer will arrive on.
+    ///
+    /// `client` is the identity the action will be addressed to, when the turn that
+    /// asks has one; the answer must then come from that same identity (PAN-123).
     pub(crate) fn register(
         &self,
         id: String,
         stopped: Arc<AtomicBool>,
+        client: Option<&str>,
     ) -> crate::Result<oneshot::Receiver<crate::Result<Value>>> {
         let (reply, rx) = oneshot::channel();
         let mut pending = self.0.lock().map_err(|e| e.to_string())?;
         if pending.len() >= MAX_PENDING_UI {
             return Err("Too many pending app actions.".into());
         }
-        pending.insert(id, PendingUi { reply, stopped });
+        pending.insert(
+            id,
+            PendingUi {
+                reply,
+                stopped,
+                client: client.map(str::to_owned),
+            },
+        );
         Ok(rx)
     }
 
     /// Answers a pending request. Both the removal and the stopped check happen
     /// here, in that order, so an answer for a finished task fails rather than
     /// waking a request whose turn is gone.
-    pub(crate) fn answer(&self, id: &str, result: crate::Result<Value>) -> crate::Result<()> {
-        let pending = self
-            .0
-            .lock()
-            .map_err(|e| e.to_string())?
-            .remove(id)
-            .ok_or("App action expired.")?;
-        if pending.stopped.load(Ordering::SeqCst) {
-            return Err("Task has stopped.".into());
-        }
+    ///
+    /// `client` is who is answering. An action addressed to a client can only be
+    /// answered by that client: the alternative is a second window answering a
+    /// question it was never shown (PAN-123).
+    pub(crate) fn answer(
+        &self,
+        client: Option<&str>,
+        id: &str,
+        result: crate::Result<Value>,
+    ) -> crate::Result<()> {
+        let pending = {
+            let mut pending = self.0.lock().map_err(|e| e.to_string())?;
+            let entry = pending.get(id).ok_or("App action expired.")?;
+            // An addressed action belongs to one client: a refused answer leaves the
+            // request waiting for its owner rather than consuming it.
+            if entry.client.as_deref().is_some() && entry.client.as_deref() != client {
+                return Err("This app action belongs to another client.".into());
+            }
+            if entry.stopped.load(Ordering::SeqCst) {
+                return Err("Task has stopped.".into());
+            }
+            pending.remove(id).ok_or("App action expired.")?
+        };
         pending
             .reply
             .send(result)
@@ -229,6 +259,9 @@ pub struct RunContext {
     data_dir: PathBuf,
     ui: Arc<UiRequests>,
     surface: Arc<dyn TurnSurface>,
+    /// The client that started this turn, when it arrived over a remote transport.
+    /// `None` for a native turn, which has a window instead (PAN-123).
+    client: Option<String>,
 }
 
 impl RunContext {
@@ -246,7 +279,27 @@ impl RunContext {
             data_dir,
             ui,
             surface,
+            client: None,
         }
+    }
+
+    /// The same context, bound to the client that asked for this turn.
+    ///
+    /// One gateway drives many clients, so identity is per request, not per
+    /// process: the run context a turn holds is where it learns who to answer
+    /// (PAN-123).
+    #[cfg_attr(not(feature = "gateway"), allow(dead_code))]
+    pub fn for_client(&self, client: Option<&str>) -> Self {
+        let mut context = self.clone();
+        context.client = client.map(str::to_owned);
+        context
+    }
+
+    /// The client that started this turn, if any. Only a remote transport has one,
+    /// so a desktop build has no caller.
+    #[cfg_attr(not(feature = "gateway"), allow(dead_code))]
+    pub fn client(&self) -> Option<&str> {
+        self.client.as_deref()
     }
 
     /// A context for a process with no window: the emitter is the sink the process
@@ -334,6 +387,49 @@ impl RunContext {
         &self.surface
     }
 
+    /// Asks a client to perform an app action and waits for its answer.
+    ///
+    /// This is the entry a turn uses; the tool that calls it is the window-scoped
+    /// host stack, which a headless process does not have yet, so the tests are its
+    /// only caller today. Two things make it remote-safe (PAN-123): with a client
+    /// identity the request goes to **that client only**, because the emitter
+    /// addresses the frame instead of broadcasting it, so a second window watching
+    /// the session never sees a question it cannot answer; and the wait is decided
+    /// by whether *that* client has a socket, so a turn whose client went away fails
+    /// at its deadline with a sentence instead of waiting on somebody who is not
+    /// there.
+    #[allow(dead_code)]
+    pub async fn request_app_action(
+        &self,
+        session_id: &str,
+        action: &str,
+        args: Value,
+        stopped: Arc<AtomicBool>,
+    ) -> crate::Result<Value> {
+        let client = self.client.clone();
+        let emitter = self.emitter.clone();
+        let attached = self.surface.client_attached(client.as_deref());
+        crate::agent_tools::request_ui_on(
+            &self.ui,
+            |name, payload| match client.as_deref() {
+                // Addressed: exactly one client, whichever sessions it watches.
+                Some(client) => emitter.emit_to_client(client, name, payload),
+                // Unaddressed: a process with one surface (the desktop) broadcasts,
+                // exactly as it did before there was a client identity.
+                None => emitter.emit(name, payload),
+            },
+            attached,
+            crate::agent_tools::AppAction {
+                client: client.as_deref(),
+                session: session_id,
+                action,
+                args,
+                stopped,
+            },
+        )
+        .await
+    }
+
     /// The host tools that need a window, before per-turn wrappers.
     pub fn tool_host(
         &self,
@@ -419,20 +515,49 @@ mod tests {
     fn answering_an_app_action_twice_fails_the_second_time() {
         let ui = UiRequests::default();
         let rx = ui
-            .register("r1".into(), Arc::new(AtomicBool::new(false)))
+            .register("r1".into(), Arc::new(AtomicBool::new(false)), None)
             .unwrap();
-        ui.answer("r1", Ok(Value::Null)).unwrap();
+        ui.answer(None, "r1", Ok(Value::Null)).unwrap();
         assert!(rx.blocking_recv().unwrap().is_ok());
-        assert_eq!(ui.answer("r1", Ok(Value::Null)), Err("App action expired.".to_string()));
+        assert_eq!(ui.answer(None, "r1", Ok(Value::Null)), Err("App action expired.".to_string()));
     }
 
     #[test]
     fn a_stopped_run_cannot_be_answered() {
         let ui = UiRequests::default();
         let stopped = Arc::new(AtomicBool::new(true));
-        let _rx = ui.register("r1".into(), stopped).unwrap();
+        let _rx = ui.register("r1".into(), stopped, None).unwrap();
         assert!(!ui.active("r1"), "a stopped run's request is not answerable");
-        assert_eq!(ui.answer("r1", Ok(Value::Null)), Err("Task has stopped.".to_string()));
+        assert_eq!(ui.answer(None, "r1", Ok(Value::Null)), Err("Task has stopped.".to_string()));
+    }
+
+    #[test]
+    fn an_addressed_app_action_is_answered_only_by_the_client_it_was_addressed_to() {
+        let ui = UiRequests::default();
+        let _rx = ui
+            .register("r1".into(), Arc::new(AtomicBool::new(false)), Some("alpha"))
+            .unwrap();
+        // Anyone else — another client, or a caller that named nobody — is refused,
+        // and the refusal leaves the request waiting for its owner (PAN-123).
+        for caller in [Some("beta"), None] {
+            assert_eq!(
+                ui.answer(caller, "r1", Ok(Value::Null)),
+                Err("This app action belongs to another client.".to_string())
+            );
+            assert!(ui.active("r1"), "a refused answer does not consume the request");
+        }
+        ui.answer(Some("alpha"), "r1", Ok(Value::Null)).unwrap();
+        assert!(!ui.active("r1"));
+    }
+
+    #[test]
+    fn an_unaddressed_app_action_is_still_answered_by_anyone() {
+        let ui = UiRequests::default();
+        let _rx = ui
+            .register("r1".into(), Arc::new(AtomicBool::new(false)), None)
+            .unwrap();
+        // The desktop's shape: no identity anywhere, so the command answers it.
+        ui.answer(None, "r1", Ok(Value::Null)).unwrap();
     }
 
     #[test]

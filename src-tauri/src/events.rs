@@ -20,6 +20,20 @@ use serde::Serialize;
 pub trait Emitter: Send + Sync {
     fn emit(&self, name: &str, payload: serde_json::Value) -> Result<(), String>;
     fn emit_to(&self, target: &str, name: &str, payload: serde_json::Value) -> Result<(), String>;
+    /// An event addressed to one remote client identity (PAN-123).
+    ///
+    /// A process with no remote clients — the desktop — has no identity to address,
+    /// so this fails explicitly rather than quietly broadcasting. A native turn
+    /// carries no client, so it never reaches this default.
+    #[allow(dead_code)]
+    fn emit_to_client(
+        &self,
+        _client: &str,
+        _name: &str,
+        _payload: serde_json::Value,
+    ) -> Result<(), String> {
+        Err("This process has no client to address events to.".into())
+    }
 }
 
 /// The desktop's own sink: the same calls the app made before this module existed.

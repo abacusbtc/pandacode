@@ -46,13 +46,28 @@ pub struct Filter {
     /// An explicit client target, set by `emit_to`. A subscriber that names one
     /// sees only frames addressed to it (PAN-106: an app action belongs to a
     /// client, never to a window label).
+    ///
+    /// Kept as it was, and deliberately **not** how a client identifies itself: a
+    /// target is a filter, so naming one would also hide the unaddressed frames the
+    /// same socket needs (PAN-123). A socket's own identity is `client`.
     pub target: Option<String>,
+    /// This socket's own identity, from `?client=`. Additive: it decides which
+    /// client-addressed frames reach this socket, and never restricts the
+    /// unaddressed ones a session watcher needs (PAN-123).
+    pub client: Option<String>,
 }
 
 impl Filter {
     /// A frame with no routing key is a process-wide signal, so it reaches every
-    /// socket. Everything else must match every filter that was given.
+    /// socket. Everything else must match every filter that was given — except an
+    /// addressed frame, which belongs to one client and to nobody else.
     fn matches(&self, frame: &Frame) -> bool {
+        if let Some(client) = &frame.client {
+            // The one rule here that is not a filter: an app action raised for a
+            // client reaches that client whichever session it watches, and reaches
+            // no other socket at all (PAN-123).
+            return self.client.as_ref() == Some(client);
+        }
         if frame.session.is_none() && frame.terminal.is_none() && frame.target.is_none() {
             return true;
         }
@@ -108,6 +123,9 @@ pub struct Frame {
     /// An explicit client target, from `emit_to`. On the frame, never inside the
     /// payload.
     target: Option<String>,
+    /// The client identity this frame was addressed to, from `publish_to_client`
+    /// (PAN-123). On the frame, never inside the payload.
+    client: Option<String>,
     /// When it was published, for the ring's age bound. Never serialised.
     at: i64,
     /// What this frame costs in a byte-bounded ring: its payload as it goes on the
@@ -134,6 +152,7 @@ impl Frame {
             terminal: key("terminalId"),
             payload,
             target: None,
+            client: None,
             at: crate::storage::now(),
             bytes,
         }
@@ -146,14 +165,23 @@ impl Frame {
         self
     }
 
+    /// The same frame, addressed to one client identity (PAN-123).
+    fn addressed_to(mut self, client: &str) -> Self {
+        self.client = Some(client.to_owned());
+        self
+    }
+
     /// The bytes a client reads: the number and the name on the frame, and the
     /// payload exactly as the emitting code serialised it. Nothing is re-nested.
-    /// `target` appears only on a frame that has one, so an ordinary event's shape
-    /// is unchanged from task 4.
+    /// `target` and `client` appear only on a frame that has one, so an ordinary
+    /// event's shape is unchanged from task 4.
     pub fn to_json(&self) -> String {
         let mut frame = serde_json::json!({ "seq": self.seq, "event": self.event, "payload": self.payload });
         if let Some(target) = &self.target {
             frame["target"] = serde_json::Value::String(target.clone());
+        }
+        if let Some(client) = &self.client {
+            frame["client"] = serde_json::Value::String(client.clone());
         }
         frame.to_string()
     }
@@ -273,20 +301,37 @@ impl BroadcastSink {
     /// One frame to every socket that wants it. Never awaits and never waits for a
     /// socket: the only wait is this process's own short critical section.
     pub fn publish(&self, name: &str, payload: Value) {
-        self.deliver(name, payload, None);
+        self.deliver(name, payload, None, None);
     }
 
     /// Publishes a frame addressed to one client. The desktop's `emit_to` targets a
     /// window and never comes through here; this is the remote equivalent.
     pub fn publish_to(&self, target: &str, name: &str, payload: Value) {
-        self.deliver(name, payload, Some(target));
+        self.deliver(name, payload, Some(target), None);
     }
 
-    fn deliver(&self, name: &str, payload: Value, target: Option<&str>) {
+    /// Publishes a frame addressed to one client identity (PAN-123). It reaches a
+    /// socket that named that client in `?client=` and no other socket, whatever
+    /// the rest of its filter accepts.
+    #[allow(dead_code)]
+    pub fn publish_to_client(&self, client: &str, name: &str, payload: Value) {
+        self.deliver(name, payload, None, Some(client));
+    }
+
+    fn deliver(
+        &self,
+        name: &str,
+        payload: Value,
+        target: Option<&str>,
+        client: Option<&str>,
+    ) {
         let seq = self.next.fetch_add(1, Ordering::Relaxed) + 1;
         let mut frame = Frame::from_event(seq, name, payload);
         if let Some(target) = target {
             frame = frame.addressed(target);
+        }
+        if let Some(client) = client {
+            frame = frame.addressed_to(client);
         }
         let now = crate::storage::now();
         let mut inner = self.lock();
@@ -303,6 +348,20 @@ impl BroadcastSink {
         let mut inner = self.lock();
         inner.subscribers.retain(|subscriber| !subscriber.tx.is_closed());
         inner.subscribers.len()
+    }
+
+    /// Whether the client with this identity has a live socket right now.
+    ///
+    /// The question an app action asks before it waits: it is addressed to one
+    /// client, so another client's socket is not an answer to it (PAN-123).
+    #[allow(dead_code)]
+    pub fn has_client(&self, client: &str) -> bool {
+        let mut inner = self.lock();
+        inner.subscribers.retain(|subscriber| !subscriber.tx.is_closed());
+        inner
+            .subscribers
+            .iter()
+            .any(|subscriber| subscriber.filter.client.as_deref() == Some(client))
     }
 
     /// When this terminal last printed, for the idle rule. `None` while it has
@@ -410,6 +469,13 @@ impl Emitter for BroadcastSink {
         self.publish_to(target, name, payload);
         Ok(())
     }
+
+    /// An event addressed to one client identity (PAN-123): it reaches that
+    /// client's socket and no other.
+    fn emit_to_client(&self, client: &str, name: &str, payload: Value) -> Result<(), String> {
+        self.publish_to_client(client, name, payload);
+        Ok(())
+    }
 }
 
 /// The hole, as a frame a client reads: it names the range it missed and then the
@@ -469,6 +535,7 @@ mod tests {
                 session: Some("a".into()),
                 terminal: None,
                 target: None,
+                client: None,
             },
             None,
         );
@@ -491,6 +558,7 @@ mod tests {
                 session: None,
                 terminal: Some("t1".into()),
                 target: None,
+                client: None,
             },
             None,
         );
@@ -612,6 +680,7 @@ mod tests {
                 session: None,
                 terminal: Some("t1".into()),
                 target: None,
+                client: None,
             },
             Some(1),
         );
@@ -643,6 +712,7 @@ mod tests {
                 session: Some("s1".into()),
                 terminal: None,
                 target: None,
+                client: None,
             },
             Some(1),
         );
@@ -664,6 +734,7 @@ mod tests {
                 session: None,
                 terminal: Some("t1".into()),
                 target: None,
+                client: None,
             },
             Some(0),
         );

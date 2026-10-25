@@ -87,6 +87,28 @@ impl AuthFailures {
     }
 }
 
+/// The header a client names itself in on `/rpc`, so the gateway knows which client
+/// started a turn without guessing from a socket (PAN-123).
+pub(crate) const CLIENT_HEADER: &str = "x-pandacode-client";
+
+/// The name a client gives itself, from `?client=` or [`CLIENT_HEADER`].
+///
+/// It is a routing identity, not a secret: it decides which addressed frames reach
+/// a socket. Bounded and refused rather than repaired, because it travels on every
+/// frame it addresses (PAN-123).
+pub(crate) fn client_identity(value: &str) -> Result<String, &'static str> {
+    if value.is_empty() || value.len() > 64 {
+        return Err("A client identity must be 1 to 64 characters.");
+    }
+    let ok = value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'));
+    if !ok {
+        return Err("A client identity may only use letters, digits, '-', '_', '.' and ':'.");
+    }
+    Ok(value.to_owned())
+}
+
 /// The connection a request came from, for the audit line and the auth limit.
 ///
 /// Inserted into the request by `authorize`, and read by handlers through the
@@ -392,6 +414,11 @@ fn events_query(uri: &Uri) -> Result<(super::events::Filter, Option<u64>), Strin
             "session" if !value.is_empty() => filter.session = Some(value.to_owned()),
             "terminal" if !value.is_empty() => filter.terminal = Some(value.to_owned()),
             "target" if !value.is_empty() => filter.target = Some(value.to_owned()),
+            // This socket's own identity: what makes a client-addressed frame reach
+            // it, without hiding the session frames it also needs (PAN-123).
+            "client" if !value.is_empty() => {
+                filter.client = Some(client_identity(value).map_err(|error| error.to_string())?)
+            }
             "since" => {
                 since = Some(
                     value

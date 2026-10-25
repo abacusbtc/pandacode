@@ -200,6 +200,14 @@ without a usable token, `429` after ten failed tokens from one address in a
 minute, `413` for a body over 64 MiB (or an upload over `--upload-max`), `405` for
 a write to a client route, `400` for a body that is not JSON.
 
+`POST /rpc` may name the caller in an `x-pandacode-client` header (same identity
+rules as `?client=`; a malformed one is `400`). The identity is what makes a turn
+belong to a client: an app action the turn raises is addressed to that client and
+to no other socket, `gateway_live_tasks` reports it in `client`, and
+`resolve_agent_ui_action` refuses an answer from a different client — including a
+caller that named none. A request without the header still works and owns nothing,
+which is how every M2 client behaves today.
+
 `POST /rpc` is capped at 64 MiB, chosen here rather than inherited: base64
 attachments are the largest thing this surface carries. `/upload` has its own cap
 (`--upload-max`, 200 MiB by default) because a file streams instead of being
@@ -220,7 +228,7 @@ which is how a client hides a surface instead of discovering it by hanging.
 | Projects and sessions | `list_projects`, `add_project`, `remove_project`, `list_sessions`, `create_session`, `get_messages` |
 | Remote folder picker | `gateway_list_dirs` |
 | Catalog | `gateway_status`, `list_providers`, `list_provider_models` |
-| Turns | `send_message`, `start_task`, `stop_session`, `respond_approval`, `respond_user_input`, `steer_task` |
+| Turns | `send_message`, `start_task`, `stop_session`, `respond_approval`, `respond_user_input`, `steer_task`, `resolve_agent_ui_action` |
 | The queue | `queue_list`, `queue_add`, `queue_update`, `queue_remove`, `queue_reorder`, `queue_take`, `queue_restore` |
 | Which turns this gateway runs | `gateway_live_tasks` |
 | Terminal | `start_terminal`, `start_harness_terminal`, `write_terminal`, `resize_terminal`, `close_terminal`, `get_terminal_activity` |
@@ -240,13 +248,23 @@ with the same event names the desktop emits. Every frame is numbered:
 whole guarantee that nothing was missed. A browser cannot send a header on the
 handshake, so this is the one place the token rides in the query string.
 
-Two query parameters choose what a socket receives and where it starts:
+Three query parameters choose what a socket receives and where it starts:
 
 - `?session=<id>` and `?terminal=<id>` filter to one task or one shell. A frame
   with no routing key is a process-wide signal and reaches every socket.
+- `?client=<id>` names **this socket's own client identity** (1–64 characters:
+  letters, digits, `-`, `_`, `.`, `:`). It is not a filter: it decides which
+  frames addressed to that client reach this socket, and it never hides the
+  session or terminal frames the same socket also needs. A socket that names
+  neither sees only unaddressed frames and anything the process broadcasts.
 - `?since=<seq>` replays what the socket missed, exclusively after that number. A
   client that reconnects therefore resumes exactly where it stopped instead of
   starting at "now".
+
+`?target=<name>` still exists as a **filter** and is not how a client identifies
+itself: a socket that names a target receives only frames carrying that target,
+so it loses the unaddressed frames for the session it is watching. Prefer
+`?client=` for identity.
 
 A socket that falls so far behind that its frames have left the ring is **told**,
 never skipped: it receives `{"event": "lagged", "payload": {"fromSeq": 3, "toSeq": 9}}`
@@ -256,6 +274,11 @@ and redraw instead: `{"event": "terminal-reset", ...}`, followed by whatever the
 terminal's 256 KiB ring still holds. Frame numbers come from one process-wide
 counter; the payload is exactly what the emitting code serialised, so a desktop and
 a gateway event are the same shape.
+
+A frame addressed to one client carries that identity beside the payload —
+`{"seq": 42, "event": "agent-ui-action", "client": "alpha", "payload": {...}}` —
+and reaches only the socket that named `/events?client=alpha`. An unaddressed frame
+has no `client` field at all, so an ordinary event's shape is unchanged.
 
 Anything else is the SPA: a real file from `--static-dir` when it exists,
 `index.html` for every other path, and a plain 404 when the gateway was started

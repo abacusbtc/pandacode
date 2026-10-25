@@ -59,8 +59,30 @@ fn approval_decision(command: &str, args: &Value) -> Option<&'static str> {
 pub async fn handle(
     State(state): State<RouterState>,
     Peer(client): Peer,
+    headers: axum::http::HeaderMap,
     body: Result<Json<Request>, JsonRejection>,
 ) -> Response {
+    // Who is asking, when it says so. A malformed identity is refused here rather
+    // than carried into a frame: it is a routing key, and a wrong one silently
+    // addresses the wrong client (PAN-123).
+    let caller = match headers
+        .get(super::server::CLIENT_HEADER)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .to_str()
+                .map_err(|_| "A client identity must be text.".to_owned())
+        })
+    {
+        Some(Ok(value)) => match super::server::client_identity(value) {
+            Ok(client) => Some(client),
+            Err(error) => return (axum::http::StatusCode::BAD_REQUEST, error).into_response(),
+        },
+        Some(Err(error)) => {
+            return (axum::http::StatusCode::BAD_REQUEST, error).into_response()
+        }
+        None => None,
+    };
     let Json(request) = match body {
         Ok(body) => body,
         // The rejection carries the status: a malformed body is a client error
@@ -76,7 +98,7 @@ pub async fn handle(
         .get("requestId")
         .and_then(Value::as_str)
         .map(str::to_owned);
-    let ctx = state.ctx.clone();
+    let ctx = state.ctx.for_client(caller.as_deref());
     // Store work is blocking; keep it off the request's own worker. A turn command
     // hands back a future instead, which is awaited here rather than in that worker.
     // The command string travels a copy, because the audit line needs it too.

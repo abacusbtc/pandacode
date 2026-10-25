@@ -17,6 +17,8 @@ mod static_files;
 mod terminals;
 
 #[cfg(test)]
+mod app_action_remote_tests;
+#[cfg(test)]
 mod recovery_tests;
 
 use std::net::SocketAddr;
