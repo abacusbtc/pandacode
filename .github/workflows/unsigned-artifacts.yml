@@ -1,0 +1,102 @@
+name: Unsigned artifacts
+# Builds the app on demand and uploads the bundles as workflow artifacts, for a
+# tester who wants current binaries without a release. It never tags, never
+# publishes, never touches an existing release, and never signs: the artifacts are
+# unsigned on purpose, and the run summary says what that means for each platform.
+#
+# This is deliberately a separate file from release.yml, so a bad day here cannot
+# break shipping. Pins, toolchain and build steps are copied from release.yml; when
+# those change there, change them here too.
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: 'Which platform to build'
+        type: choice
+        options: [both, macOS, Windows]
+        default: both
+permissions:
+  contents: read
+concurrency:
+  # One build per branch: a second dispatch replaces the first rather than queueing
+  # two twenty-minute jobs on the same commit.
+  group: unsigned-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Read the version
+        id: version
+        run: echo "version=$(node -p "require('./src-tauri/tauri.conf.json').version")" >> "$GITHUB_OUTPUT"
+      - name: Choose the platforms
+        id: matrix
+        env:
+          PLATFORM: ${{ inputs.platform }}
+        run: |
+          mac='{"os":"macos-latest","target":"darwin-aarch64","triple":"aarch64-apple-darwin"}'
+          win='{"os":"windows-2022","target":"windows-x86_64","triple":"x86_64-pc-windows-msvc"}'
+          case "$PLATFORM" in
+            macOS) matrix="[$mac]" ;;
+            Windows) matrix="[$win]" ;;
+            *) matrix="[$mac,$win]" ;;
+          esac
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "Building: $matrix"
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      RELEASE_TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with: { node-version: '22', cache: npm }
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          targets: ${{ matrix.triple }}
+      - run: npm ci
+      - name: Build the app
+        # No signing identity, no updater key, no Apple certificate: the bundle is
+        # produced unsigned, which is the point of this workflow.
+        run: node scripts/release/build.mjs
+      - name: Check the packaged app starts (not GUI behaviour, Windows and Linux only)
+        if: runner.os != 'macOS'
+        timeout-minutes: 4
+        run: node scripts/release/ci-startup-smoke.mjs
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: pandacode-unsigned-${{ needs.prepare.outputs.version }}-${{ matrix.target }}
+          path: release/${{ needs.prepare.outputs.version }}/
+          if-no-files-found: error
+          retention-days: 7
+      - name: What you just downloaded
+        if: always()
+        run: |
+          {
+            echo "### Unsigned ${{ matrix.target }} build"
+            echo ""
+            echo "These files are **unsigned and unnotarised**. That is deliberate: this workflow exists so a tester can run current code without cutting a release."
+            echo ""
+            if [ "${{ runner.os }}" = "macOS" ]; then
+              echo "- **macOS (Apple silicon):** unzip the \`.dmg\`, drag PandaCode to Applications, then either right-click the app and choose **Open**, or run \`xattr -dr com.apple.quarantine /Applications/PandaCode.app\`. Without that, macOS says it cannot check the app for malicious software. That warning is the missing signature, not a problem with the build."
+              echo "- It will not update itself: there is no signed updater file in an unsigned build."
+            else
+              echo "- **Windows x64:** run the setup \`.exe\`. SmartScreen will warn about an unknown publisher — choose **More info > Run anyway**. That warning is the missing signature, not a problem with the build."
+              echo "- It will not update itself: there is no signed updater file in an unsigned build."
+            fi
+            echo ""
+            echo "Keep the download link to this run; artifacts expire after 7 days."
+          } >> "$GITHUB_STEP_SUMMARY"
