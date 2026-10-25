@@ -8,6 +8,11 @@ name: Unsigned artifacts
 # break shipping. Pins, toolchain and build steps are copied from release.yml; when
 # those change there, change them here too.
 on:
+  # A brand-new workflow can only be dispatched once its file is on the default branch,
+  # so the pull request that introduces or changes this file builds it itself: that is
+  # how the file is proved before it merges. Afterwards the dispatch below is the loop.
+  pull_request:
+    paths: ['.github/workflows/unsigned-artifacts.yml']
   workflow_dispatch:
     inputs:
       platform:
@@ -38,7 +43,7 @@ jobs:
       - name: Choose the platforms
         id: matrix
         env:
-          PLATFORM: ${{ inputs.platform }}
+          PLATFORM: ${{ inputs.platform || 'both' }}
         run: |
           mac='{"os":"macos-latest","target":"darwin-aarch64","triple":"aarch64-apple-darwin"}'
           win='{"os":"windows-2022","target":"windows-x86_64","triple":"x86_64-pc-windows-msvc"}'
