@@ -14,6 +14,21 @@
 //   unavailable — a gateway cannot answer it today. The reason says which kind: a mechanism
 //                 that belongs to this machine, or a surface M3 has simply not taken on.
 //
+// WHAT THE TEST CAN AND CANNOT SEE, because a scanner that silently skips a form certifies a
+// completeness that is false:
+//
+//   it sees   every call site on the three transports, and it DISCOVERS the transports from
+//             the code — any function that reaches Tauri's `invoke` must be registered here,
+//             so a fourth IPC surface fails the test rather than being silently unscanned;
+//   it sees   variable dispatch, because each such site must be declared in `DYNAMIC_CALLS`;
+//   it misses an ALIAS of an existing transport: `const relay = (c, a) => call(c, a)` makes
+//             `relay('a_command')` invisible, because no static rule distinguishes an alias
+//             from every other function that takes a command parameter. A brace-matched scan
+//             for forwarders was tried and rejected: it flagged `createGatewayClient` and a
+//             local `call` in `terminal.ts` while missing real ones, and a rule that guesses
+//             is worse than a rule that states its boundary. Creating an alias is the one way
+//             to slip past this table, and it requires someone to write the alias on purpose.
+//
 // A command can be served *and* carry a row in `GATED` (see `start_terminal`): that row
 // describes an older gateway that serves turns but not terminals. Today's fate is `served`,
 // which is what this table records.
@@ -260,24 +275,45 @@ export const REMOTE_COMMANDS: Record<string, RemoteCommand> = (() => {
  * test finds those sites by reading the sources and requires each one here, so a new dynamic
  * dispatch cannot slip past the table the way a literal is counted.
  */
-export const OTHER_TRANSPORTS: { transport: string; commands: string[]; why: string }[] = [
+/**
+ * The IPC surfaces. The test DISCOVERS these from the sources — every function that reaches
+ * Tauri's `invoke` must be here, and so must every function that routes a command to one — so a
+ * fourth wrapper fails the test until it is registered rather than being silently unscanned.
+ * `preview.ts` and `preview-bots.ts` are the browser preview's own stand-in for `invoke`, not
+ * transports the app routes through, and they are the only exclusions.
+ */
+export const TRANSPORTS: {
+  name: string;
+  kind: 'router' | 'ipc';
+  /** True when a command on this surface can reach a gateway. */
+  routes: boolean;
+  why: string;
+  /** The string literals this surface carries; empty for the router, which forwards. */
+  commands: string[];
+}[] = [
   {
-    transport: 'callShell',
-    commands: ["gateway_config", "gateway_connect", "gateway_disconnect"],
-    why: 'Answered by this computer in every mode by construction: the gateway address itself and native dialogs. A gateway cannot be asked to save the address it is reached at, and a native dialog belongs to the window that opened it.',
+    name: 'call',
+    kind: 'router',
+    routes: true,
+    why: 'The transport the app calls: it decides between this computer (callShell) and the gateway client, so every command in the table below reaches a gateway through it.',
+    commands: [],
   },
   {
-    transport: 'overlayCall',
-    commands: ["fork_session_at_message", "get_message_content", "list_provider_models", "list_providers", "overlay_hide", "overlay_launch", "overlay_open_task", "overlay_preferences", "overlay_recording", "overlay_save_preferences", "overlay_select_model", "overlay_snapshot", "overlay_sync_context", "overlay_thread", "overlay_toggle", "search_files"],
+    name: 'callShell',
+    kind: 'ipc',
+    routes: false,
+    why: 'Answered by this computer in every mode by construction: the gateway address itself and native dialogs. A gateway cannot be asked to save the address it is reached at.',
+    commands: ["gateway_config", "gateway_connect", "gateway_disconnect"],
+  },
+  {
+    name: 'overlayCall',
+    kind: 'ipc',
+    routes: false,
     why: "The launcher window's own IPC (overlay_*), a separate local backend that also names a few commands the main window routes through a gateway. The launcher is local-only, so its transport is not the gateway transport.",
+    commands: ["fork_session_at_message", "get_message_content", "list_provider_models", "list_providers", "overlay_hide", "overlay_launch", "overlay_open_task", "overlay_preferences", "overlay_recording", "overlay_save_preferences", "overlay_select_model", "overlay_snapshot", "overlay_sync_context", "overlay_thread", "overlay_toggle", "search_files"],
   },
 ];
 
-/**
- * Call sites that name their command in a variable, with the commands handed to them. The
- * test finds those sites by reading the sources and requires each one here, so a new dynamic
- * dispatch cannot slip past the table the way a literal is counted.
- */
 export const DYNAMIC_CALLS: { site: string; commands: string[]; why: string }[] = [
   {
     site: 'src/github-hub.ts',
