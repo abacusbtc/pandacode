@@ -613,6 +613,13 @@ fn cors(origins: &[String]) -> CorsLayer {
     CorsLayer::new()
         .allow_origin(AllowOrigin::list(allowed))
         .allow_methods([Method::GET, Method::POST])
-        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+        // `x-pandacode-client` is the identity a browser sends on every command, so a
+        // cross-origin client's preflight must allow it. Without this, every /rpc from
+        // another origin fails before it is sent (PAN-142).
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            axum::http::HeaderName::from_static(CLIENT_HEADER),
+        ])
         .max_age(Duration::from_secs(600))
 }

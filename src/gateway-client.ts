@@ -22,6 +22,11 @@ export type GatewaySocketImpl = new (url: string) => GatewaySocket;
 export type GatewayOptions = {
   url: string;
   token: string;
+  /**
+   * This client's identity on the wire. Defaults to the app instance's own id, which is
+   * what the app wants; a test may pass its own to run two clients in one process.
+   */
+  clientId?: string;
   fetchImpl?: typeof fetch;
   WebSocketImpl?: GatewaySocketImpl;
   /** Uploads report progress, which needs `XMLHttpRequest`; tests inject a stub. */
@@ -75,6 +80,35 @@ export type GatewayClient = {
 /** One frame as it arrives, or `null` for something that is not a frame at all. */
 type Frame = { seq?: number; event: string; payload: any };
 
+/**
+ * This app instance's identity on the wire (PAN-142).
+ *
+ * One per app instance, not per connection and never derived from the gateway URL: two
+ * windows against one gateway are two clients, and a reconnect must not look like a new
+ * client, or an app action the running turn is waiting on becomes unanswerable because
+ * the only socket that could carry it now claims a different name.
+ *
+ * `crypto.randomUUID` where the webview has it, sixteen random bytes hex otherwise. The
+ * gateway accepts letters, digits, `-`, `_`, `.` and `:` in an identity, and both shapes
+ * fit inside its 64-character bound.
+ */
+function instanceIdentity(): string {
+  const crypto = (globalThis as { crypto?: { randomUUID?: () => string; getRandomValues?: (bytes: Uint8Array) => void } }).crypto;
+  const uuid = crypto?.randomUUID?.();
+  if (uuid) return uuid;
+  const bytes = new Uint8Array(16);
+  if (crypto?.getRandomValues) crypto.getRandomValues(bytes);
+  else for (let index = 0; index < bytes.length; index += 1) bytes[index] = Math.floor(Math.random() * 256);
+  return Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
+const INSTANCE_ID = instanceIdentity();
+
+/** The identity every client in this app instance sends; a test asserts a reconnect keeps it. */
+export function clientIdentity(): string {
+  return INSTANCE_ID;
+}
+
 export function createGatewayClient(options: GatewayOptions): GatewayClient {
   // A saved URL may carry a trailing slash; every path below is joined onto it.
   const base = options.url.replace(/\/+$/, '');
@@ -91,8 +125,11 @@ export function createGatewayClient(options: GatewayOptions): GatewayClient {
   /** Console sockets, so close() stops their reconnect timers too. */
   const consoleSockets = new Set<() => void>();
 
+  // The identity rides on every socket: the gateway addresses an app action to a client,
+  // and the socket that has to carry it is whichever this window has open (PAN-142).
+  const client = options.clientId ?? INSTANCE_ID;
   const socketUrl = (query: string): string =>
-    `${base.replace(/^http/, 'ws')}/events?token=${encodeURIComponent(token)}${query}`;
+    `${base.replace(/^http/, 'ws')}/events?token=${encodeURIComponent(token)}&client=${encodeURIComponent(client)}${query}`;
   const socketImpl = (): GatewaySocketImpl => options.WebSocketImpl ?? (WebSocket as unknown as GatewaySocketImpl);
 
   /**
@@ -158,7 +195,14 @@ export function createGatewayClient(options: GatewayOptions): GatewayClient {
       try {
         response = await doFetch(`${base}/rpc`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+            // Which client is asking: the gateway ties a turn to the client that started
+            // it, so this header is what makes that turn's app actions addressable
+            // (PAN-142).
+            'x-pandacode-client': client,
+          },
           body: JSON.stringify({ id: String(++seq), command, args }),
         });
       } catch (error) {
