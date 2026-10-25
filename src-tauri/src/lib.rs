@@ -748,12 +748,26 @@ async fn configure_session(
     if agents.contains_key(&session_id) {
         return Err("Stop the agent before changing its project, provider, or model.".into());
     }
-    state.store.lock().map_err(|e| e.to_string())?.configure(
-        &session_id,
-        &provider,
-        &model,
-        project_id.as_deref(),
-    )
+    configure_session_inner(&state, &session_id, &provider, &model, project_id.as_deref())
+}
+
+/// The store write behind `configure_session`, shared with the gateway (PAN-159).
+///
+/// The running check stays with each caller, because "running" is per process and each
+/// process knows its own answer: the desktop asks its `agents` map, a gateway asks the
+/// runs it is driving (`Live`). Neither may mutate the model of a turn already in flight.
+pub(crate) fn configure_session_inner(
+    state: &AppState,
+    session_id: &str,
+    provider: &str,
+    model: &str,
+    project_id: Option<&str>,
+) -> Result<Session> {
+    state
+        .store
+        .lock()
+        .map_err(|e| e.to_string())?
+        .configure(session_id, provider, model, project_id)
 }
 #[tauri::command]
 async fn set_reasoning_effort(

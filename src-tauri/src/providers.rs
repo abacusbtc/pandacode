@@ -716,6 +716,36 @@ fn valid_model_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 200 && !id.chars().any(char::is_control)
 }
 
+/// Why a session cannot be configured with this model, or `None` when it can.
+///
+/// Shared by the gateway's `configure_session` (PAN-159), where a model that cannot work has
+/// to be a sentence at configure time rather than a turn that dies at negotiation. The
+/// desktop command keeps the app's older behaviour — it writes what it is given — because
+/// this rule describes what a *gateway client* may ask for, and the picker's custom-model row
+/// means any well-formed id is a legitimate choice everywhere except where the app holds an
+/// authoritative set of its own.
+///
+/// An unknown *provider* is not checked here: `Store::configure` already refuses one, and a
+/// second list of agent ids beside that one is a list that can drift out of step with it.
+///
+/// `narrowed` is the authoritative set: the OpenCode models saved in Settings, exactly what
+/// an OpenCode session on this host will negotiate (PAN-121). An empty list means no
+/// narrowing is configured, so the catalogue is unfiltered and any well-formed id is
+/// accepted.
+///
+/// Pure on purpose: the decision table is unit-tested without a CLI, a runtime or a network.
+pub(crate) fn model_refusal(provider: &str, model: &str, narrowed: &[String]) -> Option<String> {
+    if !valid_model_id(model) {
+        return Some("A model id is 1 to 200 characters with no control characters.".into());
+    }
+    if provider == "opencode" && !narrowed.is_empty() && model != "default" && !narrowed.iter().any(|id| id == model) {
+        return Some(format!(
+            "The OpenCode session on this host negotiates only the models selected in Settings, and {model} is not one of them. Pick a model the list offers."
+        ));
+    }
+    None
+}
+
 fn model_text(value: Option<&str>, fallback: &str, limit: usize) -> String {
     let text: String = value
         .unwrap_or_default()
@@ -4408,5 +4438,55 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod model_gate_tests {
+    use super::model_refusal;
+
+    /// PAN-159: the decide-at-configure-time table, as a pure function. The gateway asks
+    /// this before writing a session, so every branch here is a sentence a remote client
+    /// can see instead of a turn that dies later.
+    #[test]
+    fn an_unknown_agent_is_left_to_the_store_that_already_refuses_it() {
+        // Not this function's job: `Store::configure` answers "Unknown provider." and a
+        // second list of agent ids beside it is a list that can drift. Asserted so nobody
+        // adds one back by accident.
+        assert_eq!(model_refusal("not-an-agent", "default", &[]), None);
+    }
+
+    #[test]
+    fn a_model_id_has_to_be_a_model_id() {
+        assert!(model_refusal("claude", "", &[]).is_some_and(|why| why.contains("1 to 200 characters")));
+        assert!(model_refusal("claude", "sonnet\nrm -rf /", &[]).is_some_and(|why| why.contains("control characters")));
+        assert!(model_refusal("claude", &"m".repeat(201), &[]).is_some_and(|why| why.contains("1 to 200 characters")));
+        assert_eq!(model_refusal("claude", &"m".repeat(200), &[]), None);
+    }
+
+    /// The picker offers a custom model id for every provider — typing something the
+    /// catalogue does not list is a shipped workflow, so an unadvertised id is only refused
+    /// where the app holds an authoritative set of its own.
+    #[test]
+    fn a_custom_model_is_accepted_where_the_catalogue_is_only_a_suggestion() {
+        let narrowed = vec!["vendor/paid".to_string()];
+        assert_eq!(model_refusal("claude", "claude-sonnet-9-unreleased", &narrowed), None);
+        assert_eq!(model_refusal("claude", "claude-sonnet-9-unreleased", &[]), None);
+        assert_eq!(model_refusal("codex", "gpt-7-custom", &[]), None);
+    }
+
+    /// OpenCode is the one provider whose session negotiates a set this app already holds:
+    /// the models saved in Settings (PAN-121). Anything else dies at negotiation, so it is
+    /// refused here — but only when a narrowing is configured, and never for `default`.
+    #[test]
+    fn an_opencode_model_the_session_will_not_negotiate_is_refused_where_the_set_is_known() {
+        let narrowed = vec!["vendor/paid".to_string()];
+        assert_eq!(model_refusal("opencode", "default", &narrowed), None);
+        assert_eq!(model_refusal("opencode", "vendor/paid", &narrowed), None);
+        let refusal = model_refusal("opencode", "vendor/other", &narrowed).expect("refused");
+        assert!(refusal.contains("vendor/other"), "{refusal}");
+        assert!(refusal.contains("Settings"), "{refusal}");
+        // No narrowing configured means the catalogue is unfiltered, so nothing to check.
+        assert_eq!(model_refusal("opencode", "vendor/other", &[]), None);
     }
 }

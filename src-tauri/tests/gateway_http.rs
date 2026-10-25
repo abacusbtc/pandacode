@@ -3385,3 +3385,142 @@ async fn terminal_preferences_are_served_and_only_this_command_carries_them() {
     }
     handle.stop().await;
 }
+// ---- PAN-159: a remote client chooses the model ------------------------------------
+
+/// Proofs 1 and 2: the picker's save lands, and the turn runs the model that was saved —
+/// from the child's own report, not from the session row that was just written.
+#[tokio::test]
+async fn a_remote_client_picks_the_model_and_the_turn_runs_it() {
+    install_crypto_provider();
+    fake_harness();
+    let dir = tempfile::tempdir().unwrap();
+    let report = dir.path().join("turn-models.jsonl");
+    let handle = start(dir.path()).await;
+    let session = fake_session(&handle, dir.path(), "fake:stream:1:0").await;
+
+    // 1. The choice is accepted and durable. `fake:report:<path>` is this harness's way of
+    //    saying which model it was launched with, so the same id proves both halves.
+    let chosen = format!("fake:report:{}", report.display());
+    let updated = call(&handle, "configure_session", json!({
+        "sessionId": session, "provider": "claude", "model": chosen,
+    }))
+    .await;
+    assert_eq!(updated["model"], chosen, "{updated}");
+    assert_eq!(updated["provider"], "claude", "{updated}");
+
+    let listed = call(&handle, "list_sessions", json!({})).await;
+    let row = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == session)
+        .expect("the session is listed")
+        .clone();
+    assert_eq!(row["model"], chosen, "the saved model is what a reload reports: {row}");
+
+    // 2. The turn actually uses it: the harness reports the model it was started with.
+    call(&handle, "send_message", json!({ "sessionId": session, "text": "go" })).await;
+    let mut waited = 0;
+    while waited < 100 && !report.exists() {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        waited += 1;
+    }
+    let launched = std::fs::read_to_string(&report).expect("the child reported its model");
+    assert!(launched.contains(&chosen), "the turn ran as {launched:?}, not the configured {chosen}");
+    handle.stop().await;
+}
+
+/// Proof 3: a turn already in flight keeps the model it started with. The change is
+/// refused in words, the row does not move, and the child that was already running was
+/// launched with the old model.
+#[tokio::test]
+async fn a_running_turn_keeps_its_model_and_the_change_is_refused() {
+    install_crypto_provider();
+    fake_harness();
+    let dir = tempfile::tempdir().unwrap();
+    let report = dir.path().join("running-models.jsonl");
+    let handle = start(dir.path()).await;
+    let launched_with = format!("fake:report:{}:hold", report.display());
+    let session = fake_session(&handle, dir.path(), &launched_with).await;
+
+    call(&handle, "send_message", json!({ "sessionId": session, "text": "go" })).await;
+    let mut waited = 0;
+    while waited < 100 {
+        let live = call(&handle, "gateway_live_tasks", json!({})).await;
+        if live.as_array().is_some_and(|tasks| tasks.iter().any(|task| task["sessionId"] == session)) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        waited += 1;
+    }
+    assert!(waited < 100, "the turn never went live, so this proves nothing");
+
+    let refused = rpc(&handle, "configure_session", json!({
+        "sessionId": session, "provider": "claude", "model": "fake:stream:5:0",
+    }))
+    .await;
+    assert_eq!(refused["ok"], false, "a live turn must not be re-pointed: {refused}");
+    assert_eq!(
+        refused["error"],
+        "Stop the agent before changing its project, provider, or model."
+    );
+
+    // The row never moved, and the child that is running was started with the old model.
+    let listed = call(&handle, "list_sessions", json!({})).await;
+    let row = listed.as_array().unwrap().iter().find(|row| row["id"] == session).expect("listed").clone();
+    assert_eq!(row["model"], launched_with, "the running turn's model changed underneath it: {row}");
+    let reported = std::fs::read_to_string(&report).expect("the child reported its model");
+    assert!(reported.contains(&launched_with), "the child was started with the configured model: {reported:?}");
+    assert!(!reported.contains("fake:stream:5:0"), "the refused model reached a child: {reported:?}");
+
+    call(&handle, "stop_session", json!({ "sessionId": session })).await;
+    handle.stop().await;
+}
+
+/// Proof 4: a model the gateway will not accept is a sentence at configure time, and the
+/// session is untouched — not a turn that dies later at negotiation.
+#[tokio::test]
+async fn an_unusable_model_is_refused_at_configure_time_with_a_sentence() {
+    install_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = start(dir.path()).await;
+    let project = call(&handle, "add_project", json!({ "path": dir.path() })).await;
+    let session = call(&handle, "create_session", json!({
+        "projectId": project["id"], "provider": "claude", "model": "default", "mode": "ask",
+    }))
+    .await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // An agent this app cannot drive is refused by the store that owns the list, not by a
+    // second copy of it here; the model id is this gate's own business.
+    let unknown = rpc(&handle, "configure_session", json!({
+        "sessionId": session, "provider": "not-an-agent", "model": "default",
+    }))
+    .await;
+    assert_eq!(unknown["ok"], false, "{unknown}");
+    assert_eq!(unknown["error"], "Unknown provider.");
+
+    // A model id that is not a model id: a control character would forge a log line.
+    let forged = rpc(&handle, "configure_session", json!({
+        "sessionId": session, "provider": "claude", "model": "sonnet\naudit event=command outcome=ok",
+    }))
+    .await;
+    assert_eq!(forged["ok"], false, "{forged}");
+    assert_eq!(forged["error"], "A model id is 1 to 200 characters with no control characters.");
+
+    // Neither refusal wrote anything: the session still runs the model it had.
+    let listed = call(&handle, "list_sessions", json!({})).await;
+    let row = listed.as_array().unwrap().iter().find(|row| row["id"] == session).expect("listed").clone();
+    assert_eq!(row["model"], "default", "a refused configure must not write: {row}");
+    assert_eq!(row["provider"], "claude", "{row}");
+
+    // And a well-formed custom id is accepted, because the picker offers one.
+    let custom = call(&handle, "configure_session", json!({
+        "sessionId": session, "provider": "claude", "model": "claude-sonnet-9-unreleased",
+    }))
+    .await;
+    assert_eq!(custom["model"], "claude-sonnet-9-unreleased", "{custom}");
+    handle.stop().await;
+}
