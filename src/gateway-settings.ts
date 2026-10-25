@@ -7,7 +7,7 @@
 // transport, because in remote mode that transport is the gateway itself.
 
 import { createGatewayClient, type GatewayClient } from './gateway-client';
-import { GATED, featureServed, serves, terminalServed, turnServed } from './gateway-gating';
+import { GATED, featureServed, serves, terminalServed, turnServed, usageServed } from './gateway-gating';
 import { callShell, currentMode, preview, setMode, type Mode } from './bridge';
 import { escape } from './dom';
 
@@ -47,6 +47,16 @@ export function terminalEnabled(): boolean {
   return terminalServed(connection ? connection.commands : null, connection ? connection.features : null);
 }
 
+/**
+ * Whether this backend can show the usage panel. One predicate for all three places that
+ * decide it — the inspector button, the Go-to-anything entry, and the guard that opens the
+ * panel — because a gateway serving only one of the panel's two reads must not offer it
+ * from the menu while hiding the button (PAN-138).
+ */
+export function usageEnabled(): boolean {
+  return usageServed(connection ? connection.commands : null, connection ? connection.features : null);
+}
+
 export function gatewayHost(url: string): string {
   try {
     return new URL(url).host || url;
@@ -64,6 +74,9 @@ function paint(root: ParentNode, commands: string[] | null, features: string[] |
   // A capability can be narrower than its commands: a terminal needs both the
   // `terminal` feature and the PTY commands behind it.
   for (const element of root.querySelectorAll<HTMLElement>('#terminal-toggle')) element.toggleAttribute('data-gateway-hidden', !terminalServed(commands, features));
+  // The usage panel needs two commands and a capability; the command-only entry above
+  // cannot express that (PAN-138).
+  for (const element of root.querySelectorAll<HTMLElement>('#agent-usage-button')) element.toggleAttribute('data-gateway-hidden', !usageServed(commands, features));
 }
 
 /**

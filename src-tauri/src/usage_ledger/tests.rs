@@ -173,3 +173,32 @@ fn live_local_logs() {
     let ledger_bytes = serde_json::to_vec(&ledger).unwrap().len();
     println!("first scan {first:?}, rescan {again:?}, rows {}, cache {cache_bytes} B, payload {ledger_bytes} B, unpriced {unpriced:?}", ledger.rows.len());
 }
+
+/// PAN-138: the ledger's cache is keyed by the directory it was built for, so the key has to
+/// be the directory — one name per directory, and never one name for two. A symlinked or
+/// dot-suffixed spelling is the same entry (a second entry would be a duplicate, not a wrong
+/// answer, but it would also be a second scan of the same logs); two real directories must
+/// never collide, because that is the original defect coming back.
+#[test]
+fn one_data_directory_is_one_cache_key_however_it_is_named() {
+    let base = std::env::temp_dir().join(format!("pandacode-ledger-key-{}", std::process::id()));
+    let dir = base.join("data");
+    let other = base.join("other");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(&other).unwrap();
+    let canonical = cache_key(&dir);
+
+    assert_eq!(cache_key(&dir.join("")), canonical, "a trailing slash is the same directory");
+    assert_eq!(cache_key(&dir.join(".")), canonical, "a dot component is the same directory");
+    assert_ne!(cache_key(&other), canonical, "two directories never share a key");
+
+    #[cfg(unix)]
+    {
+        let alias = base.join("alias");
+        let _ = std::fs::remove_file(&alias);
+        std::os::unix::fs::symlink(&dir, &alias).unwrap();
+        assert_eq!(cache_key(&alias), canonical, "a symlinked name is the same directory");
+        assert_ne!(cache_key(&alias), cache_key(&other), "an alias never collides with a different directory");
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}

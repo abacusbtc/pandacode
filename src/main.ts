@@ -65,7 +65,7 @@ import { teamActive, type TeamSnapshot, type TeamEvent, type TeamLibrary, type T
 import type { ArchitectView } from './architect';
 import { syncOverlayContext } from './overlay-client';
 import { initializeAgentUpdates } from './agent-updates';
-import { capabilityEnabled, connectGateway, gatewayStatus, mountGatewaySettings, startGatewaySession, terminalEnabled, turnEnabled } from './gateway-settings';
+import { capabilityEnabled, connectGateway, gatewayStatus, mountGatewaySettings, startGatewaySession, terminalEnabled, turnEnabled, usageEnabled } from './gateway-settings';
 import type { MissedFrames } from './gateway-client';
 import { pickRemoteFolder } from './remote-files';
 
@@ -3481,10 +3481,11 @@ async function openBot(botId: string): Promise<void> {
   await selectSession(id, true);
 }
 async function showAgentUsage(): Promise<void> {
-  // Usage is read from this machine's own ledger and harness files; a gateway process
-  // has neither (agent_usage.rs:524-526, usage_ledger.rs:334-336), so it is not served
-  // there and saying so is better than an empty panel that looks like zero usage.
-  if (!capabilityEnabled('agent_usage')) { notify('This gateway does not report agent usage. Disconnect in Settings to read it from this computer.'); return; }
+  // The panel is two reads over whichever backend this window uses: this machine's own
+  // credentials and data directory, or a gateway's (PAN-138). A backend that does not
+  // serve both is not offered the surface — saying so is better than an empty panel that
+  // would look like zero usage.
+  if (!usageEnabled()) { notify('This gateway does not report agent usage. Disconnect in Settings to read it from this computer.'); return; }
   const dialog = modal('Agent usage', '<div id="agent-usage-host"><p role="status">Loading usage panel…</p></div>', 'agent-usage-dialog');
   const host = dialog.querySelector<HTMLElement>('#agent-usage-host')!;
   try {
@@ -3502,7 +3503,7 @@ function showCommands(): void {
   modal('Go to anything', `<div class="command-search">${icon('search')}<input id="command-query" aria-label="Search tasks and commands" placeholder="Search tasks and commands…" autocomplete="off"></div><div id="command-results" class="command-results"></div><div class="command-footer"><span>↑ ↓ to navigate</span><span>↵ to open</span><span>esc to close</span></div>`, 'command-dialog'); renderCommands('');
 }
 function renderCommands(query: string): void {
-  const commands = [{ action: 'new-task', label: 'New task', icon: 'plus', shortcut: shortcut('N') }, { action: 'add-project', label: 'Open project', icon: 'folder', shortcut: '' }, { action: 'browser', label: 'Open browser', icon: 'globe', shortcut: '' }, ...(terminalEnabled() ? [{ action: 'terminal', label: 'Toggle terminal', icon: 'terminal', shortcut: shortcut('J') }] : []), { action: 'settings', label: 'Settings', icon: 'settings', shortcut: shortcut(',') }, ...(capabilityEnabled('agent_usage') ? [{ action: 'agent-usage', label: 'Agent usage', icon: 'activity', shortcut: '' }] : []), { action: 'bots', label: 'Bots', icon: 'bot', shortcut: '' }, { action: 'import-conversations', label: 'Import conversations', icon: 'download', shortcut: '' }, { action: 'worktree', label: 'Create worktree', icon: 'branch', shortcut: '' }, ...(githubEnabled() ? [{ action: 'github-view', label: 'GitHub', icon: 'github', shortcut: '' }] : [])].filter(c => c.label.toLowerCase().includes(query.toLowerCase()));
+  const commands = [{ action: 'new-task', label: 'New task', icon: 'plus', shortcut: shortcut('N') }, { action: 'add-project', label: 'Open project', icon: 'folder', shortcut: '' }, { action: 'browser', label: 'Open browser', icon: 'globe', shortcut: '' }, ...(terminalEnabled() ? [{ action: 'terminal', label: 'Toggle terminal', icon: 'terminal', shortcut: shortcut('J') }] : []), { action: 'settings', label: 'Settings', icon: 'settings', shortcut: shortcut(',') }, ...(usageEnabled() ? [{ action: 'agent-usage', label: 'Agent usage', icon: 'activity', shortcut: '' }] : []), { action: 'bots', label: 'Bots', icon: 'bot', shortcut: '' }, { action: 'import-conversations', label: 'Import conversations', icon: 'download', shortcut: '' }, { action: 'worktree', label: 'Create worktree', icon: 'branch', shortcut: '' }, ...(githubEnabled() ? [{ action: 'github-view', label: 'GitHub', icon: 'github', shortcut: '' }] : [])].filter(c => c.label.toLowerCase().includes(query.toLowerCase()));
   const tasks = listedSessions().filter(s => s.title.toLowerCase().includes(query.toLowerCase())).slice(0, 12);
   $('#command-results').innerHTML = `${commands.length ? '<div class="command-section">Commands</div>' : ''}${commands.map(c => `<button data-action="${c.action}" data-command="true">${icon(c.icon)}<span>${c.label}</span><kbd>${c.shortcut}</kbd></button>`).join('')}${tasks.length ? '<div class="command-section">Tasks</div>' : ''}${tasks.map(s => `<button data-action="select-task" data-id="${escape(s.id)}" data-command="true">${providerLogo(s.provider)}<span>${escape(s.title)}<small>${escape(state.projects.find(p => p.id === s.projectId)?.name)} · ${shortProvider(s.provider)}</small></span></button>`).join('')}${!commands.length && !tasks.length ? '<div class="inspector-empty">No matching tasks or commands.</div>' : ''}`;
   $('#command-results').querySelector('button')?.classList.add('command-selected');

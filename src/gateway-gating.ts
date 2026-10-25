@@ -13,10 +13,9 @@ export const GATED: { command: string; selector: string }[] = [
   { command: 'theme_import', selector: '[data-colors="import"]' },
   { command: 'github_status', selector: '[data-action="github-view"]' },
   { command: 'get_run_script', selector: '[data-action="run-project"]' },
-  // Usage is read off this machine's own ledger and harness files, which a gateway
-  // process has no window for (`agent_usage.rs:524-526`, `usage_ledger.rs:334-336`),
-  // so the command is not served and the button must not offer it.
-  { command: 'agent_usage', selector: '#agent-usage-button' },
+  // Usage has no row here on purpose: the panel needs the `usage` capability *and* both of
+  // its commands, which a command-only row cannot express. `usageServed` below decides it,
+  // so `#agent-usage-button` is hidden by one rule rather than two (PAN-138).
   // A terminal is a PTY on whichever machine runs it; a gateway that does not serve
   // `start_terminal` cannot open one, and a drawer that opens nothing is worse than
   // no drawer.
@@ -69,4 +68,14 @@ export function turnServed(commands: string[] | null, features: string[] | null)
 /** Whether a backend can open a terminal: the `terminal` feature (PAN-110) and its commands. */
 export function terminalServed(commands: string[] | null, features: string[] | null): boolean {
   return featureServed(features, 'terminal') && serves(commands, 'start_terminal');
+}
+
+/**
+ * Whether a backend can show the usage panel: the `usage` capability (PAN-138) plus both
+ * commands the panel reads. The feature is what a client gates the surface on; the
+ * commands are what it will actually call, so a backend that answers one without the
+ * other is not a panel worth opening — it would show limits with no costs, or the reverse.
+ */
+export function usageServed(commands: string[] | null, features: string[] | null): boolean {
+  return featureServed(features, 'usage') && serves(commands, 'agent_usage') && serves(commands, 'usage_ledger');
 }

@@ -3385,3 +3385,100 @@ async fn terminal_preferences_are_served_and_only_this_command_carries_them() {
     }
     handle.stop().await;
 }
+
+// ---- PAN-138: the usage panel's two reads over the wire ----------------------------
+
+/// The subscription limits are served, and a missing credential is a sentence rather than
+/// an empty panel.
+#[tokio::test]
+async fn usage_limits_are_served_and_absence_is_stated_not_empty() {
+    install_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = start(dir.path()).await;
+
+    // An unknown agent is refused as such, not answered with zero usage.
+    let unknown = rpc(&handle, "agent_usage", json!({ "provider": "nobody", "refresh": false })).await;
+    assert_eq!(unknown["ok"], false, "{unknown}");
+    assert_eq!(unknown["error"], "Unknown agent.");
+
+    // Whatever this host holds, the answer is honest about it. This test runs on a CI
+    // runner with no provider credentials at all, so it asserts the invariant rather than
+    // the owner's numbers: a ready answer carries windows and a source, and anything that
+    // is not ready carries the sentence saying why. What must never come back is a
+    // well-formed answer with no windows — that is the empty panel this row exists to
+    // prevent (PAN-138).
+    for provider in ["claude", "codex", "kimi"] {
+        let usage = call(&handle, "agent_usage", json!({ "provider": provider, "refresh": false })).await;
+        assert_eq!(usage["provider"], provider, "{usage}");
+        let status = usage["status"].as_str().unwrap_or_default();
+        // The client's own union (`src/agent-usage.ts`): ready, unavailable, signedOut,
+        // error, unsupported. A new status the client cannot render is a bug here, not a
+        // reason to widen the list.
+        assert!(
+            ["ready", "unavailable", "signedOut", "error", "unsupported"].contains(&status),
+            "{provider} answered a status the client cannot render: {usage}"
+        );
+        assert_eq!(usage["stale"], false, "a fresh read is not labelled stale: {usage}");
+        if status == "ready" {
+            assert_ne!(usage["windows"], json!([]), "{provider} said ready with no windows: {usage}");
+            assert!(usage["source"].as_str().is_some_and(|source| !source.is_empty()), "{provider} ready without a source: {usage}");
+        } else {
+            assert_eq!(usage["windows"], json!([]), "{provider} is {status} but still carries windows: {usage}");
+            assert!(
+                usage["message"].as_str().is_some_and(|message| !message.trim().is_empty()),
+                "{provider} is {status} with nothing to tell the person: {usage}"
+            );
+        }
+    }
+
+    // A provider that exposes nothing through this agent says that, too — and it says it
+    // on every host, because the sentence is not about a missing credential.
+    let grok = call(&handle, "agent_usage", json!({ "provider": "grok", "refresh": false })).await;
+    assert_eq!(grok["status"], "unsupported", "{grok}");
+    assert_eq!(grok["windows"], json!([]), "{grok}");
+    assert!(grok["message"].as_str().is_some_and(|message| message.contains("dashboard")), "{grok}");
+
+    handle.stop().await;
+}
+
+/// The ledger is built from the gateway's own data directory, and `refresh` keeps its
+/// meaning: a saved price book in that directory is the one the answer names.
+#[tokio::test]
+async fn the_usage_ledger_reads_the_gateways_own_data_directory() {
+    install_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    // A price book saved by this gateway (the shape `usage_ledger/pricing.rs` writes),
+    // fresh enough to be used instead of a download: the test stays offline, and the
+    // answer can only name "saved" if it read *this* directory.
+    // The timestamp is a sentinel, not "now": the answer must carry *this* value back, so
+    // reading another directory's price book (or downloading a fresh one) is a failure
+    // rather than a coincidence. It stays inside the 24-hour reuse window, so a passing
+    // test never reaches the network.
+    let sentinel = now_ms() - 1_000;
+    std::fs::write(
+        dir.path().join("usage-prices.json"),
+        json!({
+            "fetchedAt": sentinel,
+            "prices": { "claude-sonnet-5": { "input": 3.0, "output": 15.0 } },
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let handle = start(dir.path()).await;
+
+    let ledger = call(&handle, "usage_ledger", json!({ "refresh": false })).await;
+    assert!(ledger["scannedAt"].as_i64().is_some_and(|at| at > 0), "{ledger}");
+    assert_eq!(ledger["pricing"]["source"], "saved", "the gateway's own price book: {ledger}");
+    assert_eq!(ledger["pricing"]["fetchedAt"], sentinel, "the price book it read is the one in its data directory: {ledger}");
+    assert!(ledger["rows"].is_array());
+    assert!(ledger["models"].is_array());
+
+    // A second read with `refresh` re-scans rather than answering from the TTL.
+    let first = ledger["scannedAt"].as_i64().unwrap();
+    let again = call(&handle, "usage_ledger", json!({ "refresh": true })).await;
+    assert!(
+        again["scannedAt"].as_i64().is_some_and(|at| at >= first),
+        "refresh scans again: {again}"
+    );
+    handle.stop().await;
+}

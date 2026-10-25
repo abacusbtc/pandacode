@@ -46,6 +46,10 @@ pub(crate) const COMMANDS: &[&str] = &[
     "queue_restore",
     // M2 task 3: which tasks this gateway is driving (PAN-104).
     "gateway_live_tasks",
+    // M3: the usage panel's two reads, from the gateway's own credentials and data
+    // directory (PAN-138).
+    "agent_usage",
+    "usage_ledger",
     // M2 task 6: the catalog a client picks from (PAN-107).
     "list_providers",
     "list_provider_models",
@@ -68,7 +72,7 @@ pub(crate) const COMMANDS: &[&str] = &[
 /// `turns` is the one that changes what a client offers: a gateway that answers the
 /// turn commands advertises it, and a client that does not see it must not show a
 /// remote turn surface at all (PAN-107).
-pub(crate) const FEATURES: &[&str] = &["projects", "sessions", "turns", "terminal"];
+pub(crate) const FEATURES: &[&str] = &["projects", "sessions", "turns", "terminal", "usage"];
 
 /// A team is N runs driven by the architect, which a window owns; M2 does not
 /// serve teams (spec section 8, rows 2 and 6). Saying so is better than starting
@@ -545,6 +549,30 @@ pub fn handle(command: &str, args: Value, ctx: &Ctx) -> Answer {
         // A shell is a PTY write and a process spawn: the work is blocking, so it
         // runs on the blocking pool and the answer comes back as a future, exactly
         // like the turn commands.
+        "agent_usage" => pending(async move {
+            #[derive(serde::Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct Args {
+                provider: String,
+                #[serde(default)]
+                refresh: bool,
+            }
+            let args: Args = from_value(args)?;
+            to_value(crate::agent_usage::usage(args.provider, args.refresh).await?)
+        }),
+        "usage_ledger" => {
+            let ctx = ctx.clone();
+            pending(async move {
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct Args {
+                    #[serde(default)]
+                    refresh: bool,
+                }
+                let args: Args = from_value(args)?;
+                to_value(crate::usage_ledger::ledger(ctx.run.data_dir().to_path_buf(), args.refresh).await?)
+            })
+        }
         "start_terminal" => {
             let ctx = ctx.clone();
             pending(async move {
