@@ -4,7 +4,7 @@
 // tests/gateway-e2e.spec.ts; this pins the rule itself.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { GATED, featureServed, serves, terminalServed, turnServed } from '../src/gateway-gating.ts';
+import { GATED, featureServed, serves, terminalServed, turnServed, usageServed } from '../src/gateway-gating.ts';
 
 // The M1 table in src-tauri/src/gateway/dispatch.rs. A name added there is not gated
 // here until someone says which surface it makes real, which is the point of the list.
@@ -70,6 +70,19 @@ test('the turn surface needs the capability and the command it would use', () =>
   assert.equal(turnServed(M1, ['projects', 'sessions']), false);
   assert.equal(turnServed(M2, ['projects', 'sessions']), false, 'turns not advertised');
   assert.equal(turnServed(M1, ['projects', 'sessions', 'turns']), false, 'send_message not served');
+});
+
+test('the usage panel needs its capability and both of its commands', () => {
+  const usage = [...M1, 'agent_usage', 'usage_ledger'];
+  assert.equal(usageServed(null, null), true, 'this computer serves everything');
+  assert.equal(usageServed(usage, ['projects', 'sessions', 'usage']), true);
+  // PAN-138: one command without the other is not a panel — the ledger would answer
+  // while the limits failed, or the reverse.
+  assert.equal(usageServed([...M1, 'agent_usage'], ['projects', 'sessions', 'usage']), false);
+  assert.equal(usageServed([...M1, 'usage_ledger'], ['projects', 'sessions', 'usage']), false);
+  // A gateway that serves the commands but never named the capability is an older one:
+  // it may have its own reasons, and the panel is not offered on a guess.
+  assert.equal(usageServed(usage, ['projects', 'sessions']), false);
 });
 
 test('a terminal needs its capability and its PTY commands', () => {

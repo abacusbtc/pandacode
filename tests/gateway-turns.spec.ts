@@ -23,6 +23,8 @@ const TURNS = [
 ];
 /** PAN-110 adds the six terminal commands and the capability a client gates on. */
 const TERMINAL = [...TURNS, 'start_terminal', 'write_terminal', 'resize_terminal', 'close_terminal', 'get_terminal_activity', 'get_terminal_preferences'];
+/** PAN-138 adds the usage panel's two reads, under a `usage` capability of its own. */
+const USAGE = [...TERMINAL, 'agent_usage', 'usage_ledger'];
 /** M1, for the honest old-gateway case. */
 const M1 = ['add_project', 'list_projects', 'remove_project', 'list_sessions', 'create_session', 'get_messages', 'gateway_status'];
 
@@ -329,7 +331,9 @@ test('a gateway without `turns` is not offered a composer, a terminal, or usage'
     // Not a disabled prompt that fails on Enter: no prompt, and the reason on screen.
     await expect(page.locator('#prompt')).toHaveCount(0);
     await expect(page.locator('#composer-area')).toContainText('cannot run agent turns');
-    // The surfaces whose commands need this machine's own window stay hidden too.
+    // The surfaces this gateway never advertised stay hidden too: no `usage` capability,
+    // no `terminal` capability, so neither a usage panel nor a terminal drawer is offered
+    // (PAN-138/PAN-110) — an empty one would look like zero usage and a dead shell.
     await expect(page.locator('#agent-usage-button')).toBeHidden();
     await expect(page.locator('#terminal-toggle')).toBeHidden();
   } finally {
@@ -338,7 +342,7 @@ test('a gateway without `turns` is not offered a composer, a terminal, or usage'
 });
 
 test('a gateway advertising `turns` and its commands is offered the whole turn surface', async ({ page }) => {
-  const gateway = await startGateway(seeded([...TERMINAL, 'agent_usage'], features('turns', 'terminal')));
+  const gateway = await startGateway(seeded(USAGE, features('turns', 'terminal', 'usage')));
   try {
     await openApp(page);
     await waitForBoot(page);

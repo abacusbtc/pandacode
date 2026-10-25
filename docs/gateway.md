@@ -237,6 +237,7 @@ which is how a client hides a surface instead of discovering it by hanging.
 | Projects and sessions | `list_projects`, `add_project`, `remove_project`, `list_sessions`, `create_session`, `delete_session`, `get_messages` |
 | Remote folder picker | `gateway_list_dirs` |
 | Catalog | `gateway_status`, `list_providers`, `list_provider_models` |
+| Usage | `agent_usage`, `usage_ledger` |
 | Turns | `send_message`, `start_task`, `stop_session`, `respond_approval`, `respond_user_input`, `steer_task`, `resolve_agent_ui_action` |
 | The queue | `queue_list`, `queue_add`, `queue_update`, `queue_remove`, `queue_reorder`, `queue_take`, `queue_restore` |
 | Which turns this gateway runs | `gateway_live_tasks` |
@@ -258,6 +259,30 @@ row no longer names. A refusal is reversible and names the command that unblocks
 already knows about (a waiting agent, an open harness console, an active Jev run); each
 refusal names what to stop.
 
+### Usage: `agent_usage` and `usage_ledger`
+
+Both read what the gateway process can see, for the owner it runs as. `agent_usage` takes
+a provider and answers that provider's subscription limits from its own credentials;
+`usage_ledger` answers the estimated-cost ledger, built from the provider logs on the
+gateway host and cached in the gateway's data directory (`usage-ledger-cache.json`,
+`usage-prices.json`).
+
+**A missing credential is a sentence, not an empty panel.** When the gateway cannot read
+a provider's login, the answer is `{"status": "unavailable", "message": "No readable
+Claude login was found. …"}` with no windows — a client shows that sentence. A provider
+that exposes nothing to this host answers `"unsupported"` with its own sentence. Neither
+is `"ok"` with zero windows, which is what an empty panel looks like.
+
+**`refresh` keeps its meaning.** `usage_ledger` answers from its last scan inside a
+60-second result TTL and scans again with `refresh: true`; the answer always carries
+`scannedAt`, so a client can say when the number was read rather than implying "now".
+`agent_usage` reuses a provider's previous snapshot only when a refresh *fails*, and
+marks that answer `"stale": true` — the panel shows it as "Saved snapshot · Last success
+HH:MM", never as a live reading.
+
+The gateway reports *its own* machine's limits and costs. That is the point — it is the
+machine running the turns — but it is worth knowing when you read it from a laptop.
+
 ### `get_terminal_preferences`
 
 The gateway runs as the owner, so this reads the same terminal configs the desktop's
@@ -268,7 +293,7 @@ the values are appearance only (font, line height, cursor, theme colours), and t
 client renders its own terminal with them. Nothing else carries them implicitly: a
 client that does not ask for them never receives a preference payload.
 
-`features` is `["projects", "sessions", "turns", "terminal"]`. The app asks a
+`features` is `["projects", "sessions", "turns", "terminal", "usage"]`. The app asks a
 connected gateway only for what this list names, and hides what it does not serve —
 the browser toggle, the VM and simulator tabs, the quick launcher, the GitHub view,
 the Run button, the `.vsix` import, the usage panel, and (without `turns`) the

@@ -516,14 +516,18 @@ fn claude_service(config: Option<&str>, secure: Option<&str>) -> String {
 }
 
 #[tauri::command]
-pub(crate) async fn agent_usage(
-    window: tauri::WebviewWindow,
-    provider: String,
-    refresh: bool,
-) -> crate::Result<Usage> {
-    if window.label() != "main" {
-        return Err("Usage limits are available only in the main application window.".into());
-    }
+pub(crate) async fn agent_usage(provider: String, refresh: bool) -> crate::Result<Usage> {
+    usage(provider, refresh).await
+}
+
+/// One provider's subscription limits, from this process's own credentials.
+///
+/// The window guard this used to carry was UI-shaped, not a data dependency: the query
+/// reads the provider CLIs' own files on whichever host runs it, so a gateway can answer
+/// it for the same owner (PAN-138). An absent or unusable credential does not come back
+/// as zero usage — it comes back as `status: "unavailable"` with the sentence that says
+/// what is missing, which is what a client shows instead of an empty panel.
+pub(crate) async fn usage(provider: String, refresh: bool) -> crate::Result<Usage> {
     query_usage(provider, refresh).await
 }
 
