@@ -3,6 +3,7 @@ import { call, preview } from './bridge';
 import { escape, icon } from './dom';
 import { providerLogo } from './provider-logos';
 import { infoMark } from './tooltip';
+import { capabilityEnabled } from './gateway-settings';
 
 type ClaudeMode = 'inherit' | 'subscription';
 interface ClaudeStatus { mode: ClaudeMode; source: string; environmentVariables: string[]; endpoint: string | null; savedLogin: 'signedIn' | 'notSignedIn' | 'otherCredentials' | 'unknown'; conflict: boolean; }
@@ -202,6 +203,13 @@ export function mountProviderSettings(host: HTMLElement, saved: () => Promise<un
     void perform(() => call('provider_set_mimo_endpoint', { endpoint: chosen }), 'MiMo endpoint saved.').finally(() => { endpointEdited = false; });
   };
   host.addEventListener('submit', submit); host.addEventListener('click', click); host.addEventListener('input', input); host.addEventListener('change', change);
+  // Provider settings are read from this machine's own CLIs and keychain. A backend that
+  // does not serve them says so once, in the pane, instead of failing every control
+  // individually (PAN-101).
+  if (!capabilityEnabled('provider_configuration')) {
+    message('This backend does not serve provider settings. Configure provider CLIs on the machine running the gateway.', true);
+    return () => { disposed = true; host.removeEventListener('submit', submit); host.removeEventListener('click', click); host.removeEventListener('input', input); host.removeEventListener('change', change); };
+  }
   void call<Configuration>('provider_configuration').then(config => { if (!disposed && configurationRevision === 0) render(config); }).catch(error => { if (!disposed && configurationRevision === 0) message(String(error), true); });
   void checkClaude();
   return () => { disposed = true; for (const input of keyInputs) input.value = ''; editedPaths.clear(); host.removeEventListener('submit', submit); host.removeEventListener('click', click); host.removeEventListener('input', input); host.removeEventListener('change', change); };

@@ -1,5 +1,6 @@
 import { call, preview } from './bridge';
 import { escape, icon } from './dom';
+import { capabilityEnabled } from './gateway-settings';
 import type { Metrics } from './types';
 
 const megabytes = (value: number) => `${(value / 1048576).toFixed(1)} MB`;
@@ -25,6 +26,13 @@ export function mountResourceUsage(host: HTMLElement): () => void {
   const cells = [...host.querySelectorAll<HTMLElement>('[data-metric]')];
   let disposed = false;
   const refresh = async () => {
+    // A backend that does not report its own resources has no numbers to show, and a
+    // Refresh that only ever fails is worse than the sentence (PAN-101).
+    if (!capabilityEnabled('get_metrics')) {
+      for (const cell of cells) cell.innerHTML = '<span>Not served by this backend</span>';
+      button.disabled = true;
+      return;
+    }
     button.disabled = true;
     try {
       const metrics = await call<Metrics>('get_metrics');

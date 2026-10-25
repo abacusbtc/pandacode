@@ -3,6 +3,7 @@
  * this view never reads them back. */
 import './cloud-settings.css';
 import { escape } from './dom';
+import { capabilityEnabled } from './gateway-settings';
 
 export type CloudConnection = { provider: 'daytona' | 'cloudflare' | 'aws' | 'vercel' | 'railway' | 'gcloud'; connected: boolean; detail: string | null; sandboxes?: boolean };
 export type CloudSettingsHost = {
@@ -84,6 +85,12 @@ export function mountCloudSettings(host: HTMLElement, options: CloudSettingsHost
     }
   }
   async function load(): Promise<void> {
+    // The connections are held by the backend that would run the sandboxes. One that
+    // does not serve them has none to show, and every control here would fail (PAN-101).
+    if (!capabilityEnabled('cloud_connections')) {
+      if (!disposed) host.innerHTML = '<p class="cloud-unserved" role="status">This backend does not serve cloud sandboxes.</p>';
+      return;
+    }
     try { connections = await options.call<CloudConnection[]>('cloud_connections'); } catch { connections = []; }
     if (!disposed) render();
   }

@@ -21,6 +21,17 @@ export const GATED: { command: string; selector: string }[] = [
   // `start_terminal` cannot open one, and a drawer that opens nothing is worse than
   // no drawer.
   { command: 'start_terminal', selector: '#terminal-toggle' },
+  // Bots live in the gateway's own database, but this gateway does not serve them yet:
+  // boot must not ask for a list it cannot have, and the sidebar section that would show
+  // an empty one is hidden rather than left looking broken (PAN-101).
+  { command: 'bots_list', selector: '#sidebar-bots, #sidebar-bots-panel' },
+  // Settings controls whose command the backend does not serve. Each one can only
+  // produce `unsupported_command` for the person, so the control is hidden and the
+  // decision is visible here rather than as an error dialog (PAN-101).
+  { command: 'check_agent_updates', selector: '[data-action="agent-updates"]' },
+  { command: 'list_agent_integrations', selector: '[data-action="agent-integrations"]' },
+  { command: 'jev_configuration', selector: '[data-action="jev-settings"]' },
+  { command: 'open_support', selector: '[data-action="support"]' },
 ];
 
 /**
