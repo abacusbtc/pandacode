@@ -2572,3 +2572,672 @@ async fn eleven_bad_tokens_from_one_address_are_limited_while_the_owner_is_not()
 
     handle.stop().await;
 }
+
+// ---- PAN-113: the real turn (held until the owner chose a provider) ----------------
+
+/// The one real turn, released 2026-10-25 on the owner's choice of `opencode`
+/// (DeepSeek V4.1 Flash). `#[ignore]` so no suite can spend a model quota by accident:
+///
+/// ```text
+/// PANDACODE_E2E_MODEL=opencode-go/deepseek-v4.1-flash \
+/// cargo test --manifest-path src-tauri/Cargo.toml --features gateway \
+///   --test gateway_http real_turn_end_to_end -- --ignored --nocapture
+/// ```
+///
+/// It starts the real gateway on a temporary data directory, asks the gateway's own
+/// catalog which models the provider serves, creates a project and a session with one of
+/// them, streams a single short prompt over a real `/events` socket, and reads the
+/// transcript back through `get_messages`. The prompt asks for a fixed sentence and
+/// nothing else, so the turn writes no code and touches nothing of the owner's.
+///
+/// It prints the model, the event kinds it saw, whatever usage the harness reported (or
+/// says it reported none — the cost is never estimated here), and the saved text.
+#[tokio::test]
+#[ignore = "spends a model quota: released once by the owner, run by hand"]
+async fn real_turn_end_to_end() {
+    install_crypto_provider();
+    let provider = std::env::var("PANDACODE_E2E_PROVIDER").unwrap_or_else(|_| "opencode".into());
+    let model = std::env::var("PANDACODE_E2E_MODEL")
+        .unwrap_or_else(|_| "opencode-go/deepseek-v4.1-flash".into());
+    let sentence = "The gateway turn works.";
+
+    let data = tempfile::tempdir().unwrap();
+    let handle = start(data.path()).await;
+    let base = format!("http://{}", handle.addr);
+
+    // The catalog is the authority for a model id: a made-up one is stored and then
+    // fails inside the harness, which is a worse failure than this check.
+    let models = call(&handle, "list_provider_models", json!({ "provider": provider })).await;
+    let served: Vec<String> = models
+        .as_array()
+        .map(|models| {
+            models
+                .iter()
+                .filter_map(|model| model["id"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    println!("provider {provider} serves {} models", served.len());
+    assert!(
+        served.contains(&model),
+        "{model} is not in the gateway's catalog for {provider}"
+    );
+
+    // A project the turn can be started in. The prompt asks for no file access, so this
+    // directory only has to exist.
+    let project = call(&handle, "add_project", json!({ "path": data.path() })).await;
+    let session = call(
+        &handle,
+        "create_session",
+        json!({ "projectId": project["id"], "provider": provider, "model": model, "mode": "ask" }),
+    )
+    .await;
+    let session_id = session["id"].as_str().unwrap().to_owned();
+
+    // The socket before the prompt, so nothing the turn emits can be missed.
+    let mut socket = events_socket(handle.addr, &format!("&session={session_id}")).await;
+    call(
+        &handle,
+        "send_message",
+        json!({
+            "sessionId": session_id,
+            "text": format!("Reply with exactly this sentence and nothing else: {sentence}"),
+        }),
+    )
+    .await;
+
+    let mut kinds: Vec<String> = Vec::new();
+    let mut text = String::new();
+    let mut usage: Option<Value> = None;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(180);
+    loop {
+        let next = tokio::time::timeout_at(deadline, socket.next()).await;
+        let frame = match next {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => text.to_string(),
+            Ok(Some(Ok(_))) => continue,
+            Ok(Some(Err(error))) => panic!("the socket failed mid-turn: {error}"),
+            Ok(None) => break,
+            Err(_) => panic!("the turn did not finish in 180 s; kinds so far: {kinds:?}"),
+        };
+        let frame: Value = serde_json::from_str(&frame).unwrap();
+        let event = frame["event"].as_str().unwrap_or("?");
+        let payload = &frame["payload"];
+        // Terminal frames and process-wide signals are not this turn's business.
+        if event != "agent-event" || payload["sessionId"] != session_id.as_str() {
+            continue;
+        }
+        let kind = payload["kind"].as_str().unwrap_or("?");
+        kinds.push(kind.to_owned());
+        if kind == "text" {
+            text.push_str(payload["text"].as_str().unwrap_or(""));
+        }
+        if kind == "usage" {
+            usage = Some(payload["data"].clone());
+        }
+        if kind == "error" {
+            println!("ERROR EVENT: {:?}", payload["text"].as_str().unwrap_or(""));
+        }
+        if kind == "status" {
+            println!("status: {:?}", payload["text"].as_str().unwrap_or(""));
+        }
+        if kind == "done" {
+            break;
+        }
+    }
+
+    println!("event kinds: {kinds:?}");
+    println!("streamed text: {text:?}");
+    match &usage {
+        Some(usage) => println!("usage the harness reported: {usage}"),
+        None => println!("usage: the harness reported no token counts for this turn"),
+    }
+
+    // The turn is over: what it said is in the store, and it said the sentence.
+    let saved = call(&handle, "get_messages", json!({ "sessionId": session_id })).await;
+    let assistant: Vec<&str> = saved["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "assistant")
+        .filter_map(|message| message["content"].as_str())
+        .collect();
+    println!("saved assistant rows: {assistant:?}");
+    assert!(
+        kinds.iter().any(|kind| kind == "done"),
+        "the turn never finished: {kinds:?}"
+    );
+    assert!(
+        assistant.iter().any(|content| content.contains(sentence)),
+        "the saved transcript does not contain the sentence: {assistant:?}"
+    );
+    // And the turn is not left live, which is what a client's Stop or a crash must not
+    // have to clean up after.
+    assert_eq!(call(&handle, "gateway_live_tasks", json!({})).await, json!([]));
+    println!("gateway {} served this turn on {provider}/{model}", base);
+    handle.stop().await;
+}
+
+// ---- PAN-113: the turn machinery, driven by a stand-in harness ----------------------
+//
+// The gateway spawns a provider CLI and speaks the protocol on its pipes; everything
+// above that (turn lifecycle, live registry, ring, approvals, transcript, audit) is the
+// gateway's own code. `tests/fixtures/fake-harness.py` replaces only the child, so these
+// proofs use the real binary, a real socket and a real SIGKILL with no model spend. What
+// that does NOT prove is the paid provider path — the real turn below covers that, once,
+// on the owner's released provider.
+
+/// A `claude` executable on PATH that runs the stand-in harness. One directory for the
+/// whole test process, so parallel tests cannot fight over PATH; the behaviour comes from
+/// the session's `--model` id instead.
+fn fake_harness() {
+    use std::os::unix::fs::PermissionsExt;
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let dir = std::env::temp_dir().join("pandacode-fake-harness");
+        std::fs::create_dir_all(&dir).unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-harness.py");
+        let wrapper = dir.join("claude");
+        std::fs::write(
+            &wrapper,
+            format!("#!/bin/sh\nexec python3 {} \"$@\"\n", fixture.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{path}", dir.display()));
+    });
+}
+
+fn test_config_with(data_dir: &Path, bind: &str, approval_ttl: Option<std::time::Duration>) -> GatewayConfig {
+    GatewayConfig {
+        approval_ttl,
+        ..test_config(data_dir, bind)
+    }
+}
+
+async fn start_with(data_dir: &Path, approval_ttl: Option<std::time::Duration>) -> GatewayHandle {
+    spawn(test_config_with(data_dir, "127.0.0.1:0", approval_ttl)).await.unwrap()
+}
+
+/// A project and a session whose provider is the stand-in harness, in `model`'s mode.
+async fn fake_session(handle: &GatewayHandle, dir: &Path, model: &str) -> String {
+    let project = call(handle, "add_project", json!({ "path": dir })).await;
+    let session = call(
+        handle,
+        "create_session",
+        json!({ "projectId": project["id"], "provider": "claude", "model": model, "mode": "ask" }),
+    )
+    .await;
+    session["id"].as_str().unwrap().to_owned()
+}
+
+/// Reads frames until `stop` says so, the socket closes, or the deadline passes.
+async fn read_frames(
+    socket: &mut Socket,
+    seconds: u64,
+    mut stop: impl FnMut(&Value) -> bool,
+) -> Vec<Value> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(seconds);
+    let mut frames = Vec::new();
+    loop {
+        match tokio::time::timeout_at(deadline, socket.next()).await {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
+                let frame: Value = serde_json::from_str(&text).unwrap();
+                let done = stop(&frame);
+                frames.push(frame);
+                if done {
+                    break;
+                }
+            }
+            Ok(Some(Ok(_))) => continue,
+            Ok(Some(Err(error))) => panic!("the socket failed: {error}"),
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    frames
+}
+
+fn agent_seqs(frames: &[Value], session: &str) -> Vec<u64> {
+    frames
+        .iter()
+        .filter(|frame| frame["event"] == "agent-event" && frame["payload"]["sessionId"] == session)
+        .filter_map(|frame| frame["seq"].as_u64())
+        .collect()
+}
+
+/// Proof 2: the client dies, the turn does not. Nothing is bound to a socket, the events
+/// go to the ring, and a client that comes back resumes from `since` with no gap.
+#[tokio::test]
+async fn a_client_killed_mid_turn_does_not_stop_the_turn_and_a_reconnect_resumes() {
+    install_crypto_provider();
+    fake_harness();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = start(dir.path()).await;
+    // Ten deltas, 200 ms apart: long enough to kill a client in the middle of it.
+    let session = fake_session(&handle, dir.path(), "fake:stream:10:200").await;
+
+    let mut first = events_socket(handle.addr, &format!("&session={session}")).await;
+    call(&handle, "send_message", json!({ "sessionId": session, "text": "go" })).await;
+    let seen = read_frames(&mut first, 20, |frame| {
+        frame["event"] == "agent-event" && frame["payload"]["kind"] == "text"
+    })
+    .await;
+    let seen_seqs = agent_seqs(&seen, &session);
+    assert!(!seen_seqs.is_empty(), "the turn streamed before the client died");
+    let last = *seen_seqs.last().unwrap();
+
+    // The CLIENT goes away. The gateway keeps the turn: it is not tied to a socket.
+    let _ = first.close(None).await;
+    tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+    let live = call(&handle, "gateway_live_tasks", json!({})).await;
+    assert_eq!(
+        live[0]["sessionId"], session,
+        "the turn must still be running with no client attached: {live}"
+    );
+
+    // A client that reconnects resumes exactly after the last frame it saw.
+    let mut second = events_socket(handle.addr, &format!("&session={session}&since={last}")).await;
+    let rest = read_frames(&mut second, 20, |frame| {
+        frame["event"] == "agent-event" && frame["payload"]["kind"] == "done"
+    })
+    .await;
+    let rest_seqs = agent_seqs(&rest, &session);
+    assert!(!rest_seqs.is_empty(), "the reconnect was told nothing");
+    assert_eq!(
+        rest_seqs[0],
+        last + 1,
+        "the replay starts at the next frame, not later: {rest_seqs:?}"
+    );
+    assert!(
+        rest_seqs.windows(2).all(|pair| pair[1] == pair[0] + 1),
+        "no gap and no duplicate in the resumed stream: {rest_seqs:?}"
+    );
+
+    // And the turn finished on its own, with all ten deltas in the transcript.
+    let saved = call(&handle, "get_messages", json!({ "sessionId": session })).await;
+    let assistant: String = saved["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "assistant")
+        .filter_map(|message| message["content"].as_str())
+        .collect();
+    assert!(assistant.contains("[10]"), "the whole turn was saved: {assistant:?}");
+    handle.stop().await;
+}
+
+/// Proof 3: an approval raised with nobody attached is denied at its deadline, the run
+/// hears the refusal and continues, the denial is a durable row, and a client that
+/// connects afterwards replays it from the ring.
+#[tokio::test]
+async fn an_approval_with_no_client_is_denied_at_its_deadline_and_survives() {
+    install_crypto_provider();
+    fake_harness();
+    let dir = tempfile::tempdir().unwrap();
+    // A one-second TTL: the wait is the real deadline, not a test hook.
+    let handle = start_with(dir.path(), Some(std::time::Duration::from_secs(1))).await;
+    let decision_log = dir.path().join("approval-decision.jsonl");
+    let session = fake_session(
+        &handle,
+        dir.path(),
+        &format!("fake:approval:{}", decision_log.display()),
+    )
+    .await;
+
+    // No socket is open: no client is attached, which is the whole premise.
+    call(&handle, "send_message", json!({ "sessionId": session, "text": "go" })).await;
+
+    // The harness records what it was told, which is the run's own view of the decision.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut decided = String::new();
+    while std::time::Instant::now() < deadline {
+        if let Ok(text) = std::fs::read_to_string(&decision_log) {
+            if !text.trim().is_empty() {
+                decided = text;
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        decided.contains("\"behavior\": \"deny\""),
+        "the run must receive a denial, not silence: {decided:?}"
+    );
+
+    // Durable: the denial is a row, and the turn carried on after it.
+    let saved = call(&handle, "get_messages", json!({ "sessionId": session })).await;
+    let rows: Vec<(&str, &str)> = saved["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|message| {
+            Some((
+                message["role"].as_str()?,
+                message["content"].as_str().unwrap_or_default(),
+            ))
+        })
+        .collect();
+    let denied = rows
+        .iter()
+        .find(|(role, _)| *role == "approval_denied")
+        .unwrap_or_else(|| panic!("no durable denial row: {rows:?}"));
+    assert!(
+        denied.1.contains("denied"),
+        "the row says what happened: {denied:?}"
+    );
+    assert!(
+        rows.iter().any(|(role, content)| *role == "assistant" && content.contains("Declined")),
+        "the run continued after the denial: {rows:?}"
+    );
+
+    // And a client that was not there replays it: the frame is on the ring.
+    let mut late = events_socket(handle.addr, &format!("&session={session}&since=0")).await;
+    let replayed = read_frames(&mut late, 10, |frame| {
+        frame["event"] == "agent-event" && frame["payload"]["kind"] == "done"
+    })
+    .await;
+    let kinds: Vec<&str> = replayed
+        .iter()
+        .filter(|frame| frame["event"] == "agent-event" && frame["payload"]["sessionId"] == session.as_str())
+        .filter_map(|frame| frame["payload"]["kind"].as_str())
+        .collect();
+    assert!(
+        kinds.contains(&"approval") && kinds.contains(&"approval_denied"),
+        "the replay carries the question and its denial: {kinds:?}"
+    );
+    handle.stop().await;
+}
+
+/// Proof 4: a reader that falls behind is told the range it missed, and resuming from the
+/// frame before that range yields exactly those frames — no hole, no duplicate, in order.
+#[tokio::test]
+async fn a_lagged_reader_is_told_what_it_missed_and_resuming_yields_exactly_that_range() {
+    install_crypto_provider();
+    fake_harness();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = start(dir.path()).await;
+    // 2000 frames of ~8 KiB each, with no delay: about 16 MB. The subscriber queue holds
+    // 512 frames, so the volume has to beat what the kernel buffers (loopback autotunes
+    // to a few megabytes) for the queue to drop anything. Measured: 700 small frames were
+    // absorbed whole and no `lagged` was announced, which is exactly the "synthetic hole"
+    // this proof must not be.
+    let session = fake_session(&handle, dir.path(), "fake:stream:2000:0:8000").await;
+
+    let mut slow = events_socket(handle.addr, &format!("&session={session}")).await;
+    call(&handle, "send_message", json!({ "sessionId": session, "text": "go" })).await;
+    // Not reading is the whole instrument. Wait for the turn to *finish* rather than for a
+    // fixed number of seconds: by then every frame has been published while this socket
+    // read none of them, which is what makes the overflow a fact instead of a race.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while std::time::Instant::now() < deadline {
+        let saved = call(&handle, "get_messages", json!({ "sessionId": session })).await;
+        let finished = saved["messages"].as_array().is_some_and(|messages| {
+            messages
+                .iter()
+                .any(|message| message["role"] == "assistant" && message["content"].as_str().is_some_and(|text| text.contains("[2000]")))
+        });
+        if finished {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    let frames = read_frames(&mut slow, 20, |frame| {
+        frame["event"] == "agent-event" && frame["payload"]["kind"] == "done"
+    })
+    .await;
+    let lagged = frames
+        .iter()
+        .find(|frame| frame["event"] == "lagged")
+        .unwrap_or_else(|| panic!("a reader that fell behind was not told: {}", frames.len()));
+    let from = lagged["payload"]["fromSeq"].as_u64().unwrap();
+    let to = lagged["payload"]["toSeq"].as_u64().unwrap();
+    assert!(from >= 1 && to > from, "the announced range is a real range: {from}..{to}");
+    let before: Vec<u64> = agent_seqs(&frames, &session);
+    assert!(
+        before.contains(&(from - 1)),
+        "the frames before the hole were delivered: {before:?}"
+    );
+    assert!(
+        before.iter().all(|seq| *seq < from || *seq > to),
+        "nothing inside the announced hole was delivered: {before:?}"
+    );
+
+    // Resuming from the frame before the hole must produce the hole and then the rest,
+    // in order, once each.
+    let mut resume = events_socket(handle.addr, &format!("&session={session}&since={}", from - 1)).await;
+    let replayed = read_frames(&mut resume, 20, |frame| {
+        frame["event"] == "agent-event" && frame["payload"]["kind"] == "done"
+    })
+    .await;
+    let seqs = agent_seqs(&replayed, &session);
+    assert_eq!(*seqs.first().unwrap(), from, "the replay starts inside the hole: {seqs:?}");
+    assert!(seqs.contains(&to), "and covers the far side of it: {seqs:?}");
+    assert!(
+        seqs.windows(2).all(|pair| pair[1] == pair[0] + 1),
+        "contiguous, so no hole and no duplicate: {seqs:?}"
+    );
+
+    // The union of what the slow reader got and what the resume gave covers the turn
+    // exactly once, which is the guarantee the numbers exist for.
+    let mut union: Vec<u64> = before.iter().chain(seqs.iter()).copied().collect();
+    union.sort_unstable();
+    let duplicates = union.windows(2).filter(|pair| pair[0] == pair[1]).count();
+    assert_eq!(duplicates, 0, "no frame was delivered twice: {union:?}");
+    let first = *union.first().unwrap();
+    assert_eq!(
+        union.last().unwrap() - first + 1,
+        union.len() as u64,
+        "the union has no gap: {union:?}"
+    );
+    handle.stop().await;
+}
+
+/// Proof 5: the real binary is SIGKILLed with a turn in flight. The kernel releases the
+/// data-directory lock, the next start settles every running row, and the database is read
+/// back with `sqlite3` rather than the app's own code — so opening the store is not what
+/// makes the assertion true.
+#[tokio::test]
+async fn the_real_gateway_sigkilled_mid_turn_leaves_a_resumable_row_and_releases_the_lock() {
+    install_crypto_provider();
+    fake_harness();
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+
+    // A free port, taken and released: the child binds it a moment later.
+    let port = {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        probe.local_addr().unwrap().port()
+    };
+    let binary = std::env::var("PANDACODE_GATEWAY_BIN")
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_pandacode-gateway").to_string());
+    let mut child = std::process::Command::new(binary)
+        .args([
+            "--data-dir",
+            data.to_str().unwrap(),
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &port.to_string(),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("the gateway binary starts");
+
+    let base = format!("http://127.0.0.1:{port}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while std::time::Instant::now() < deadline {
+        if let Ok(response) = reqwest::get(format!("{base}/healthz")).await {
+            if response.status().is_success() {
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let token = std::fs::read_to_string(data.join("gateway-token")).unwrap().trim().to_owned();
+    let client = reqwest::Client::new();
+    let rpc_to = |command: &str, args: Value| {
+        let client = client.clone();
+        let base = base.clone();
+        let token = token.clone();
+        let command = command.to_string();
+        async move {
+            let body: Value = client
+                .post(format!("{base}/rpc"))
+                .header("Authorization", format!("Bearer {token}"))
+                .json(&json!({ "id": "1", "command": command, "args": args }))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(body["ok"], true, "{command} failed: {body}");
+            body["result"].clone()
+        }
+    };
+
+    let project = rpc_to("add_project", json!({ "path": repo })).await;
+    let session = rpc_to(
+        "create_session",
+        json!({ "projectId": project["id"], "provider": "claude", "model": "fake:hold", "mode": "ask" }),
+    )
+    .await;
+    let session_id = session["id"].as_str().unwrap().to_owned();
+    rpc_to("send_message", json!({ "sessionId": session_id, "text": "go" })).await;
+
+    // The turn is genuinely in flight: the live registry says so, and the stand-in harness
+    // is sitting on its stdin waiting for a frame that never comes.
+    let mut live = json!([]);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        live = rpc_to("gateway_live_tasks", json!({})).await;
+        if live.as_array().is_some_and(|tasks| !tasks.is_empty()) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(live[0]["sessionId"], session_id, "a turn is running before the kill: {live}");
+
+    // A subagent and its tool mid-flight, seeded the way a person would read them later:
+    // straight into the database, because a SIGKILLed process cannot write them itself.
+    let db = data.join("kingcode.sqlite3");
+    let seeded = format!(
+        "INSERT INTO subagents(session_id,id,content,updated_at) VALUES ('{session_id}','worker-a','{}',0);",
+        serde_json::json!({"id":"worker-a","status":"running","tools":[{"name":"t","status":"running"}],"updatedAt":0})
+            .to_string()
+            .replace('\'', "''")
+    );
+    let seeded = std::process::Command::new("sqlite3").arg(&db).arg(&seeded).output().unwrap();
+    assert!(seeded.status.success(), "seeding the subagent row failed: {seeded:?}");
+
+    // SIGKILL: no shutdown, no flush, no chance to clean up.
+    child.kill().expect("the gateway is killed");
+    child.wait().expect("the gateway is gone");
+
+    // The lock is the kernel's, so it is free the moment the process is. A second gateway
+    // on the same directory starting at all is the proof.
+    let restarted = start(&data).await;
+    let after = call(&restarted, "gateway_live_tasks", json!({})).await;
+    assert_eq!(after, json!([]), "a dead process leaves no live task");
+
+    // Read the database the way a person would, with sqlite3, not through the store.
+    let query = |sql: &str| -> String {
+        let output = std::process::Command::new("sqlite3")
+            .arg(&db)
+            .arg(sql)
+            .output()
+            .expect("sqlite3 reads the database");
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    };
+    assert_eq!(
+        query(&format!(
+            "SELECT status || '|' || task_stage || '|' || COALESCE(completed_at,'NULL') FROM sessions WHERE id='{session_id}'"
+        )),
+        "interrupted|in_progress|NULL",
+        "the killed turn is resumable, not still running"
+    );
+    assert_eq!(
+        query("SELECT COUNT(*) FROM sessions WHERE status='running'"),
+        "0",
+        "no row may claim to be running after a cold start"
+    );
+    let subagent = query(&format!("SELECT content FROM subagents WHERE session_id='{session_id}'"));
+    let subagent: Value = serde_json::from_str(&subagent).unwrap();
+    assert_eq!(subagent["status"], "stopped", "the dead run's subagent is stopped");
+    assert_eq!(subagent["tools"][0]["status"], "failed", "and its unfinished tool is failed");
+    restarted.stop().await;
+}
+
+/// Proof 6: an unreferenced upload is swept, one a queued message names survives, and the
+/// hard cap wins even for a referenced one. The clock is the seam task 7 built for exactly
+/// this (`sweep_uploads(now)`), so nothing waits a day; the delete path is a separate
+/// store-level function with its own test, and the gateway serves no `delete_session`.
+#[tokio::test]
+async fn an_unreferenced_upload_is_swept_a_queued_one_survives_and_the_cap_still_wins() {
+    install_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = start(dir.path()).await;
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let project = call(&handle, "add_project", json!({ "path": repo })).await;
+    let session = call(
+        &handle,
+        "create_session",
+        json!({ "projectId": project["id"], "provider": "claude", "model": "sonnet" }),
+    )
+    .await;
+    let session_id = session["id"].as_str().unwrap().to_owned();
+
+    let (status, loose) = upload(&handle, "loose.txt", "document", b"nobody wants this".to_vec()).await;
+    assert_eq!(status, 200, "{loose}");
+    let (status, queued) = upload(&handle, "queued.txt", "document", b"a message names this".to_vec()).await;
+    assert_eq!(status, 200, "{queued}");
+    let loose_id = loose["id"].as_str().unwrap().to_owned();
+    let queued_id = queued["id"].as_str().unwrap().to_owned();
+    // The queued message is the only thing holding `queued_id`: it is not bound to a task
+    // until a send resolves it.
+    call(
+        &handle,
+        "queue_add",
+        json!({
+            "sessionId": session_id,
+            "text": "send this later",
+            // The composer stores the receipt's id under both `id` and `upload`; the
+            // sweep counts the `id`, which is what a queued message really carries.
+            "attachments": [{ "kind": "document", "id": queued_id, "upload": queued_id }],
+        }),
+    )
+    .await;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    // A day and an hour: past the unreferenced window, inside the hard cap.
+    let (removed, kept) = handle
+        .sweep_uploads(now + 25 * 60 * 60 * 1000)
+        .expect("the sweep runs");
+    assert_eq!((removed, kept), (1, 1), "one goes, the queued one stays");
+    assert!(
+        !upload_dir(dir.path(), &loose_id).exists(),
+        "an upload nothing refers to is swept"
+    );
+    assert!(
+        upload_dir(dir.path(), &queued_id).exists(),
+        "an upload a queued message names survives"
+    );
+
+    // The cap is not a reference: eight days on, even the queued one goes.
+    let (removed, _) = handle
+        .sweep_uploads(now + 8 * 24 * 60 * 60 * 1000)
+        .expect("the sweep runs");
+    assert_eq!(removed, 1, "the hard cap wins over a reference");
+    assert!(!upload_dir(dir.path(), &queued_id).exists());
+    handle.stop().await;
+}
