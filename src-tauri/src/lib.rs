@@ -596,26 +596,34 @@ async fn prompt_activity(state: State<'_, AppState>) -> Result<Vec<(i64, String,
 }
 #[tauri::command]
 async fn pin_session(app: tauri::AppHandle, state: State<'_, AppState>, session_id: String, pinned: bool) -> Result<Session> {
-    let task = state.store.lock().map_err(|e| e.to_string())?.pin_session(&session_id, pinned)?;
+    let task = pin_session_inner(&state, &session_id, pinned)?;
     let _ = crate::events::emit(&app, "sessions-changed", ());
     Ok(task)
+}
+/// The store write, shared with the gateway (PAN-161). Each caller announces
+/// `sessions-changed` on its own sink, so this stays free of any app handle.
+pub(crate) fn pin_session_inner(state: &AppState, session_id: &str, pinned: bool) -> Result<Session> {
+    state.store.lock().map_err(|e| e.to_string())?.pin_session(session_id, pinned)
 }
 #[tauri::command]
 async fn reorder_sessions(app: tauri::AppHandle, state: State<'_, AppState>, session_ids: Vec<String>) -> Result<Vec<Session>> {
     let store = state.store.clone();
-    let tasks = blocking(move || store.lock().map_err(|e| e.to_string())?.reorder_sessions(&session_ids)).await?;
+    let tasks = blocking(move || reorder_sessions_inner(&store, &session_ids)).await?;
     let _ = crate::events::emit(&app, "sessions-changed", ());
     Ok(tasks)
 }
+pub(crate) fn reorder_sessions_inner(store: &Mutex<Store>, session_ids: &[String]) -> Result<Vec<Session>> {
+    store.lock().map_err(|e| e.to_string())?.reorder_sessions(session_ids)
+}
 #[tauri::command]
 async fn get_task(state: State<'_, AppState>, session_id: String) -> Result<Session> {
+    get_task_inner(&state, &session_id)
+}
+/// One task, settled the way `list_sessions_inner` settles every row (PAN-161).
+pub(crate) fn get_task_inner(state: &AppState, session_id: &str) -> Result<Session> {
     let agents = state.agents.lock().map_err(|e| e.to_string())?;
     let store = state.store.lock().map_err(|e| e.to_string())?;
-    Ok(reconcile_inactive_task(
-        &store,
-        &agents,
-        store.session(&session_id)?,
-    ))
+    Ok(reconcile_inactive_task(&store, &agents, store.session(session_id)?))
 }
 #[tauri::command]
 async fn configure_window_appearance(

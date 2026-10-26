@@ -182,6 +182,6 @@ test('the gap is counted, not just described', async () => {
     .map(([command]) => command)
     .sort();
   assert.ok(notServed.length > 0);
-  assert.ok(notServed.length <= 21, `the not-yet-served list grew to ${notServed.length}: ${notServed.join(', ')}`);
+  assert.ok(notServed.length <= 17, `the not-yet-served list grew to ${notServed.length}: ${notServed.join(', ')}`);
   console.log(`\n  not served yet (${notServed.length}): ${notServed.join(', ')}\n`);
 });
