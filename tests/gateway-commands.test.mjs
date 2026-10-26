@@ -2,14 +2,14 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readdir, readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
-import { DYNAMIC_CALLS, REMOTE_COMMANDS, SERVED, TRANSPORTS } from '../src/gateway-commands.ts';
+import { REMOTE_COMMANDS, SERVED, TRANSPORTS } from '../src/gateway-commands.ts';
 
 /* PAN-160: the served-command gap, closed by assertion rather than by tripping over it.
  *
  * The owner found `configure_session` missing by selecting a model and getting
  * `unsupported_command` — the third such surprise in two days (PAN-124, PAN-125, PAN-159),
  * each discovered by a person using the app. The measured shape: the frontend can call 207
- * literal commands plus three that are dispatched through a variable, the gateway serves 35,
+ * literal commands plus three that were dispatched through a variable, the gateway served 35,
  * and nothing said which of the rest were deliberately unavailable.
  *
  * This file reads the sources, so the classification cannot go stale in either direction:
@@ -35,14 +35,14 @@ function literalSites(files) {
 }
 
 /**
- * Call sites whose first argument is a variable. Declarations (`call<T>(command: string)`)
- * and `Function.prototype.call` are not call sites and are excluded by shape: an argument
- * is a variable when an identifier is followed by `,` or `)`, not by `:`.
+ * Call sites on any transport whose first argument is a variable. Declarations
+ * (`call<T>(command: string)`) and `Function.prototype.call` are not call sites and are excluded
+ * by shape: an argument is a variable when an identifier is followed by `,` or `)`, not by `:`.
  */
 function dynamicSites(files) {
   const found = [];
   for (const { name, text } of files) {
-    for (const match of text.matchAll(/(?:\.)?\bcall(?:<[^>]*>)?\(/g)) {
+    for (const match of text.matchAll(/(?:\.)?\b(?:call|callShell|overlayCall)(?:<[^>]*>)?\(/g)) {
       const rest = text.slice(match.index + match[0].length);
       if (rest.startsWith("'") || rest.startsWith('"')) continue;
       if (!/^[A-Za-z_$][\w$]*\s*[,)]/.test(rest)) continue;
@@ -71,17 +71,12 @@ test('every command the frontend can call has exactly one state', async () => {
   }
 });
 
-test('a call site that names its command in a variable is declared', async () => {
+test('no call site names its command in a variable', async () => {
   const files = await sources();
+  // bridge.ts is the router handing a command on to the gateway client; dom.ts and motion.ts call
+  // Function.prototype.call. Neither is a call site for an app command.
   const dynamic = dynamicSites(files).filter(site => !site.includes('src/bridge.ts') && !site.includes('src/dom.ts') && !site.includes('src/motion.ts'));
-  // bridge.ts forwards to the transport, dom.ts and motion.ts call Function.prototype.call.
-  const declared = new Set(DYNAMIC_CALLS.map(entry => entry.site.split(':')[0]));
-  const undeclared = dynamic.filter(site => !declared.has(site.split(':')[0]));
-  assert.deepEqual(undeclared, [], 'dynamic call sites must be declared in DYNAMIC_CALLS with the commands they pass');
-  for (const entry of DYNAMIC_CALLS) {
-    assert.ok(entry.why.trim().length > 20, `${entry.site}: a declaration needs a reason someone could disagree with`);
-    assert.deepEqual(unclassified(entry.commands), [], `${entry.site}: its commands must be classified`);
-  }
+  assert.deepEqual(dynamic, [], 'every call site must name its command as a string literal, so the table can see it');
 });
 
 test('the table says served exactly when the gateway serves it', async () => {
@@ -169,7 +164,7 @@ test('the table has no entry for a command nobody can call', async () => {
   const files = await sources();
   const gating = await readFile(`${root}src/gateway-gating.ts`, 'utf8');
   const gateRows = [...gating.split('export const GATED')[1].split('];')[0].matchAll(/{ command: '([a-z_]+)'/g)].map(match => match[1]);
-  const callable = new Set([...literalSites(files), ...DYNAMIC_CALLS.flatMap(entry => entry.commands), ...SERVED, ...gateRows, ...TRANSPORTS.flatMap(entry => entry.commands)]);
+  const callable = new Set([...literalSites(files), ...SERVED, ...gateRows, ...TRANSPORTS.flatMap(entry => entry.commands)]);
   const dead = Object.keys(REMOTE_COMMANDS).filter(command => !callable.has(command)).sort();
   assert.deepEqual(dead, [], 'a state for a command that is neither called nor served is a typo or a leftover');
 });

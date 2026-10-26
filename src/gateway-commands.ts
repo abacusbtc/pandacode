@@ -20,14 +20,13 @@
 //   it sees   every call site on the three transports, and it DISCOVERS the transports from
 //             the code — any function that reaches Tauri's `invoke` must be registered here,
 //             so a fourth IPC surface fails the test rather than being silently unscanned;
-//   it sees   variable dispatch, because each such site must be declared in `DYNAMIC_CALLS`;
-//   it misses an ALIAS of an existing transport: `const relay = (c, a) => call(c, a)` makes
-//             `relay('a_command')` invisible, because no static rule distinguishes an alias
-//             from every other function that takes a command parameter. A brace-matched scan
-//             for forwarders was tried and rejected: it flagged `createGatewayClient` and a
-//             local `call` in `terminal.ts` while missing real ones, and a rule that guesses
-//             is worse than a rule that states its boundary. Creating an alias is the one way
-//             to slip past this table, and it requires someone to write the alias on purpose.
+//   it sees   variable dispatch: no call site on any transport may pass a command that is not a
+//             string literal, so there is no list of exceptions to keep. A forwarding wrapper
+//             (`const relay = (c, a) => call(c, a)`) fails the test at the line that forwards, which
+//             is how the old alias gap closed;
+//   it misses a bare reference to a transport (`const relay = call; relay('a_command')`): a rule
+//             that finds it also finds every prose mention and import, and one that guesses is
+//             worse than one that states its boundary. It needs someone to write it on purpose.
 //
 // A command can be served *and* carry a row in `GATED` (see `start_terminal`): that row
 // describes an older gateway that serves turns but not terminals. Today's fate is `served`,
@@ -271,11 +270,6 @@ export const REMOTE_COMMANDS: Record<string, RemoteCommand> = (() => {
 })();
 
 /**
- * Call sites that name their command in a variable, with the commands handed to them. The
- * test finds those sites by reading the sources and requires each one here, so a new dynamic
- * dispatch cannot slip past the table the way a literal is counted.
- */
-/**
  * The IPC surfaces. The test DISCOVERS these from the sources — every function that reaches
  * Tauri's `invoke` must be here, and so must every function that routes a command to one — so a
  * fourth wrapper fails the test until it is registered rather than being silently unscanned.
@@ -311,24 +305,6 @@ export const TRANSPORTS: {
     routes: false,
     why: "The launcher window's own IPC (overlay_*), a separate local backend that also names a few commands the main window routes through a gateway. The launcher is local-only, so its transport is not the gateway transport.",
     commands: ["fork_session_at_message", "get_message_content", "list_provider_models", "list_providers", "overlay_hide", "overlay_launch", "overlay_open_task", "overlay_preferences", "overlay_recording", "overlay_save_preferences", "overlay_select_model", "overlay_snapshot", "overlay_sync_context", "overlay_thread", "overlay_toggle", "search_files"],
-  },
-];
-
-export const DYNAMIC_CALLS: { site: string; commands: string[]; why: string }[] = [
-  {
-    site: 'src/github-hub.ts',
-    commands: ['github_repo_pulls', 'github_repo_issues', 'github_repo_runs'],
-    why: 'one fetch helper serves three caches, chosen by which map it is called with',
-  },
-  {
-    site: 'src/jev.ts',
-    commands: ['jev_doctor', 'jev_install_runtime'],
-    why: 'a typed union, because the doctor and its installer share one code path',
-  },
-  {
-    site: 'src/simulator.ts',
-    commands: [],
-    why: 'a local wrapper around the host call; every command it passes is a literal in the same file, already counted',
   },
 ];
 

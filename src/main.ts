@@ -3190,7 +3190,7 @@ async function showSettings(section?: import('./settings').SettingsSection): Pro
         // The theme library is this client's own: it reads the resources bundled with
         // the app, so a gateway has nothing to say about it. Remote mode keeps it local
         // rather than dropping a working pane (PAN-101).
-        colors: async target => (await import('./theme-settings')).mountThemeSettings(target, { call: callLocal, notify, chooseVsix: () => import('./bridge').then(bridge => bridge.chooseVsix()) }),
+        colors: async target => (await import('./theme-settings')).mountThemeSettings(target, { call: callShell, notify, chooseVsix: () => import('./bridge').then(bridge => bridge.chooseVsix()) }),
         wallpapers: async target => {
           const cleanup = (await import('./wallpaper-settings')).mountWallpaperSettings(target, wallpapers);
           // Choosing a scene or dragging visibility turns wallpapers on or off; keep the Daily wallpapers switch beside it in step.
@@ -3229,7 +3229,7 @@ async function showColorsSettings(): Promise<void> {
   const { mountThemeSettings } = await import('./theme-settings');
   if (!dialog.open || !host.isConnected) return;
   colorsSettingsCleanup?.();
-  colorsSettingsCleanup = mountThemeSettings(host, { call: callLocal, notify, chooseVsix: () => import('./bridge').then(bridge => bridge.chooseVsix()) });
+  colorsSettingsCleanup = mountThemeSettings(host, { call: callShell, notify, chooseVsix: () => import('./bridge').then(bridge => bridge.chooseVsix()) });
   dialog.addEventListener('close', () => { colorsSettingsCleanup?.(); colorsSettingsCleanup = undefined; }, { once: true });
 }
 async function showWallpaperSettings(): Promise<void> {
@@ -3823,13 +3823,8 @@ async function loadWorkspace(): Promise<void> {
   if (state.view !== 'conversation') { state.boardPanel = false; renderInspector(); renderBoardView(); }
 }
 // PandaCode's own updates: checked on GitHub Releases, installed when no agent is working.
-/**
- * The client's own business, in every mode: the theme library reads the resources
- * bundled with this app, so it is asked of the local shell over the same IPC the
- * Settings row uses, not of whichever backend is connected (PAN-101).
- */
-const callLocal = <T,>(command: string, args: Record<string, unknown> = {}): Promise<T> => callShell<T>(command, args);
-
+// The theme library reads the resources bundled with this app, so it is asked of the local shell
+// in every mode, not of whichever backend is connected (PAN-101): `callShell`, handed over directly.
 const updates = startAppUpdates({ busy: () => state.sessions.some(task => isRunning(task.id)), notify });
 {
   const pill = $('#update-status');
