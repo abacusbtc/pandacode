@@ -3623,3 +3623,65 @@ async fn an_unusable_model_is_refused_at_configure_time_with_a_sentence() {
     assert_eq!(custom["model"], "claude-sonnet-9-unreleased", "{custom}");
     handle.stop().await;
 }
+// ---- PAN-161: the daily loop over the gateway --------------------------------------
+
+/// Open a task, pin it, reorder the list: each answers with the store's row, the order
+/// survives a reload, and the other window is told (`sessions-changed`).
+#[tokio::test]
+async fn a_remote_client_opens_pins_and_reorders_tasks() {
+    install_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = start(dir.path()).await;
+    let (project, first) = a_task(&handle, dir.path()).await;
+    let second = call(&handle, "create_session", json!({
+        "projectId": project, "provider": "claude", "model": "sonnet",
+    }))
+    .await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut socket = events_socket(handle.addr, "").await;
+
+    let opened = call(&handle, "get_task", json!({ "sessionId": first })).await;
+    assert_eq!(opened["id"], first, "{opened}");
+
+    let pinned = call(&handle, "pin_session", json!({ "sessionId": second, "pinned": true })).await;
+    assert_eq!(pinned["pinned"], true, "{pinned}");
+    assert_eq!(next_frame(&mut socket).await["event"], "sessions-changed");
+
+    // Both are pinned now, so the order between them is the client's to choose.
+    call(&handle, "pin_session", json!({ "sessionId": first, "pinned": true })).await;
+    assert_eq!(next_frame(&mut socket).await["event"], "sessions-changed");
+    let order = |rows: &Value| -> Vec<String> {
+        rows.as_array().unwrap().iter().map(|row| row["id"].as_str().unwrap().to_owned()).collect()
+    };
+    let before = order(&call(&handle, "list_sessions", json!({})).await);
+    let wanted: Vec<String> = before.iter().rev().cloned().collect();
+    let saved = call(&handle, "reorder_sessions", json!({ "sessionIds": wanted })).await;
+    assert_eq!(order(&saved), wanted, "{saved}");
+    assert_eq!(next_frame(&mut socket).await["event"], "sessions-changed");
+    assert_eq!(order(&call(&handle, "list_sessions", json!({})).await), wanted, "the order is durable");
+    handle.stop().await;
+}
+
+/// The store's own refusals reach the client as sentences, and a refused write tells
+/// nobody anything changed.
+#[tokio::test]
+async fn the_daily_loop_commands_refuse_what_the_desktop_refuses() {
+    install_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = start(dir.path()).await;
+    let (_project, session) = a_task(&handle, dir.path()).await;
+
+    for (command, args) in [
+        ("get_task", json!({ "sessionId": "missing" })),
+        ("pin_session", json!({ "sessionId": "missing", "pinned": true })),
+        ("reorder_sessions", json!({ "sessionIds": [] })),
+        ("reorder_sessions", json!({ "sessionIds": [session.clone(), session.clone()] })),
+        ("reorder_sessions", json!({ "sessionIds": ["missing"] })),
+    ] {
+        let refused = rpc(&handle, command, args.clone()).await;
+        assert_eq!(refused["ok"], false, "{command} {args} must be refused: {refused}");
+    }
+    handle.stop().await;
+}

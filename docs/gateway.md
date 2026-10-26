@@ -234,7 +234,7 @@ which is how a client hides a surface instead of discovering it by hanging.
 
 | Group | Commands |
 | --- | --- |
-| Projects and sessions | `list_projects`, `add_project`, `remove_project`, `list_sessions`, `create_session`, `configure_session`, `delete_session`, `get_messages` |
+| Projects and sessions | `list_projects`, `add_project`, `remove_project`, `list_sessions`, `create_session`, `configure_session`, `delete_session`, `get_task`, `pin_session`, `reorder_sessions`, `get_messages` |
 | Remote folder picker | `gateway_list_dirs` |
 | Catalog | `gateway_status`, `list_providers`, `list_provider_models` |
 | Usage | `agent_usage`, `usage_ledger` |
@@ -283,6 +283,16 @@ HH:MM", never as a live reading.
 
 The gateway reports *its own* machine's limits and costs. That is the point — it is the
 machine running the turns — but it is worth knowing when you read it from a laptop.
+
+### `get_task`, `pin_session`, `reorder_sessions`: the daily loop
+
+`get_task` `{sessionId}` returns one task, settled the way `list_sessions` settles each row
+(a row claiming to run with no live agent is corrected before it is shown). `pin_session`
+`{sessionId, pinned}` returns the updated task; `reorder_sessions` `{sessionIds}` returns the
+tasks in their new order. All three call the same function the desktop command does, and the
+two writes announce `sessions-changed` so another window reloads. The store's refusals
+(unknown task, a team worker, a duplicated or empty id list, more than 500) arrive as the
+error sentence unchanged.
 
 ### `configure_session`: which model a session runs
 

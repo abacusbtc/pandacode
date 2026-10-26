@@ -1782,7 +1782,7 @@ async function selectSession(id: string, focusComposer = false): Promise<void> {
   let page: MessagePage, details: Session;
   try { [page, details] = await Promise.all([
     latestMessagePage(id),
-    // `get_task` is a desktop command; a remote task keeps the metadata list_sessions gave.
+    // A remote task keeps the metadata list_sessions gave; it is the same settled row get_task returns.
     currentMode() === 'remote' ? Promise.resolve(s) : call<Session>('get_task', { sessionId: id }),
     loadTeam(id),
   ]); }
@@ -1827,10 +1827,8 @@ async function selectProject(id: string): Promise<void> {
 }
 async function reloadSessions(): Promise<void> {
   const selectedId = state.sessionId, generation = state.generation, request = ++sessionsReload, previousDetails = fullTaskDescription;
-  // `get_task` is a desktop command; a gateway does not serve it (D4), and asking would
-  // fail the whole reload with "unsupported_command: get_task". The row `list_sessions`
-  // just returned carries the same fields, so remote mode reads it instead (as
-  // `selectSession` does).
+  // The row `list_sessions` just returned carries the same fields `get_task` would, so remote
+  // mode reads it instead of making a second round trip (as `selectSession` does).
   const savedDetails = selectedId ? session() ?? null : null;
   const [sessions, detailResult] = await Promise.all([call<Session[]>('list_sessions'),
     Promise.allSettled([selectedId && currentMode() !== 'remote' ? call<Session>('get_task', { sessionId: selectedId }) : Promise.resolve(savedDetails)]).then(results => results[0])]);

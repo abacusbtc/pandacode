@@ -26,6 +26,11 @@ pub(crate) const COMMANDS: &[&str] = &[
     // M3 task 3: a remote client can delete a task, and a live turn is refused with a
     // reason instead of being orphaned (PAN-124).
     "delete_session",
+    // M3: the daily loop — open a task, pin it, reorder the list — each the desktop's own
+    // inner, so a gateway row and a desktop row cannot disagree (PAN-161).
+    "get_task",
+    "pin_session",
+    "reorder_sessions",
     "get_messages",
     "gateway_list_dirs",
     "gateway_status",
@@ -236,6 +241,38 @@ pub fn handle(command: &str, args: Value, ctx: &Ctx) -> Answer {
                 &args.model,
                 args.project_id.as_deref(),
             )?)
+        }),
+        "get_task" => ready(|| {
+            #[derive(serde::Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct Args {
+                session_id: String,
+            }
+            let args: Args = from_value(args)?;
+            to_value(crate::get_task_inner(&ctx.state, &args.session_id)?)
+        }),
+        "pin_session" => ready(|| {
+            #[derive(serde::Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct Args {
+                session_id: String,
+                pinned: bool,
+            }
+            let args: Args = from_value(args)?;
+            let saved = crate::pin_session_inner(&ctx.state, &args.session_id, args.pinned)?;
+            let _ = ctx.run.emit("sessions-changed", ());
+            to_value(saved)
+        }),
+        "reorder_sessions" => ready(|| {
+            #[derive(serde::Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct Args {
+                session_ids: Vec<String>,
+            }
+            let args: Args = from_value(args)?;
+            let saved = crate::reorder_sessions_inner(&ctx.state.store, &args.session_ids)?;
+            let _ = ctx.run.emit("sessions-changed", ());
+            to_value(saved)
         }),
         "get_messages" => ready(|| {
             #[derive(serde::Deserialize)]
