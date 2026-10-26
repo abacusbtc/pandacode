@@ -97,15 +97,19 @@ export function mountGithubHub(root: HTMLElement, host: HubHost): HubView {
   }
   async function loadItems(force = false): Promise<void> {
     const name = selected; if (!name) return;
-    const fetch = async <T>(cache: Map<string, Load<T>>, command: string) => {
+    const fetch = async <T>(cache: Map<string, Load<T>>, load: () => Promise<T[]>) => {
       const current = cache.get(name);
       if (current?.loading || (!force && current && Date.now() - current.at < STALE)) return;
       cache.set(name, { ...current, loading: true, at: current?.at ?? 0 });
-      try { cache.set(name, { items: await host.call<T[]>(command, { repo: name }), loading: false, at: Date.now() }); }
+      try { cache.set(name, { items: await load(), loading: false, at: Date.now() }); }
       catch (cause) { cache.set(name, { error: cause instanceof Error ? cause.message : String(cause), loading: false, at: Date.now() }); }
       if (!disposed && name === selected) render();
     };
-    await Promise.all([fetch(pulls, 'github_repo_pulls'), fetch(issues, 'github_repo_issues'), fetch(runs, 'github_repo_runs')]);
+    await Promise.all([
+      fetch(pulls, () => host.call<HubPull[]>('github_repo_pulls', { repo: name })),
+      fetch(issues, () => host.call<HubIssue[]>('github_repo_issues', { repo: name })),
+      fetch(runs, () => host.call<HubRun[]>('github_repo_runs', { repo: name })),
+    ]);
   }
 
   function renderRepos(): void {

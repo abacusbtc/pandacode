@@ -197,10 +197,11 @@ export async function showJevSettings(dialog: HTMLDialogElement): Promise<void> 
     badge.textContent = doctor.ready ? 'Ready' : 'Setup needed'; badge.dataset.ready = String(doctor.ready);
     query('.jev-doctor-details').innerHTML = `${doctor.issues.length ? `<ul>${doctor.issues.map(issue => `<li>${escape(issue)}</li>`).join('')}</ul>` : ''}<p class="jev-hint">${[doctor.pythonVersion, doctor.jevVersion && `Jev ${doctor.jevVersion}`].filter(Boolean).map(escape).join(' · ')}</p>`;
   }
-  async function checkDoctor(command: 'jev_doctor' | 'jev_install_runtime') {
+  const runDoctor = () => call<JevDoctor>('jev_doctor'), runInstall = () => call<JevDoctor>('jev_install_runtime');
+  async function checkDoctor(load: () => Promise<JevDoctor>) {
     const ticket = ++doctorRevision;
     try {
-      const doctor = await call<JevDoctor>(command);
+      const doctor = await load();
       if (view.alive() && ticket === doctorRevision) renderDoctor(doctor);
     } catch (error) { if (view.alive() && ticket === doctorRevision) throw error; }
   }
@@ -225,7 +226,7 @@ export async function showJevSettings(dialog: HTMLDialogElement): Promise<void> 
       window.dispatchEvent(new CustomEvent('pandacode:jev-settings', { detail: saved }));
       if (!view.alive()) return;
       config = saved; removed.clear(); renderKeys(); tell(saved.enabled || saved.decisionsEnabled ? 'Saved. Your enabled Jev features are available for new runs.' : 'Saved. Jev features are disabled.');
-      await checkDoctor('jev_doctor');
+      await checkDoctor(runDoctor);
     });
   });
   query('[data-jev-settings-close]').addEventListener('click', view.close);
@@ -236,9 +237,9 @@ export async function showJevSettings(dialog: HTMLDialogElement): Promise<void> 
   });
   query('[data-jev-install]').addEventListener('click', () => { void operate(async () => {
     installing = true; query('.jev-install-progress').hidden = false; tell('Installing the pinned Jev runtime… You can close this panel while it installs.');
-    await checkDoctor('jev_install_runtime'); tell('Runtime installation finished. Check the setup status above.');
+    await checkDoctor(runInstall); tell('Runtime installation finished. Check the setup status above.');
   }); });
-  query('[data-jev-doctor]').addEventListener('click', () => { void operate(async () => { await checkDoctor('jev_doctor'); tell('Setup checked.'); }); });
+  query('[data-jev-doctor]').addEventListener('click', () => { void operate(async () => { await checkDoctor(runDoctor); tell('Setup checked.'); }); });
   void subscribe('jev-install', event => { if (view.alive() && installing) tell(event.message); }).then(view.cleanup).catch(() => { /* The install command still reports its final result. */ });
   await Promise.allSettled([
     call<JevConfiguration>('jev_configuration').then(configuration => {
@@ -248,7 +249,7 @@ export async function showJevSettings(dialog: HTMLDialogElement): Promise<void> 
       for (const [id, value] of [['python-path', config.pythonPath], ['chrome-path', config.chromePath], ['text-model', config.textModel], ['text-base', config.textBaseUrl]]) input(id).value = value ?? '';
       renderKeys(); tell(''); controls();
     }).catch(error => tell(errorText(error), true)),
-    checkDoctor('jev_doctor').catch(error => {
+    checkDoctor(runDoctor).catch(error => {
       if (!view.alive()) return;
       query('.jev-runtime-badge').textContent = 'Could not check setup'; tell(errorText(error), true);
     }),

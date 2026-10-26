@@ -71,7 +71,7 @@ export function mountSimulator(root: HTMLElement, host: SimulatorHost) {
   let visible = false, disposed = false, pumpGeneration = 0, seq = 0, busy = false, poseBusy = false, poll = 0, polling = false, appearance: 'light' | 'dark' = 'light', warnedAxe = false;
   let typed = '', typeTimer = 0, scroll = { dx: 0, dy: 0, at: { x: 0, y: 0 } }, scrollTimer = 0;
 
-  const call = async (command: string, args?: Record<string, unknown>) => forPlatform(await host.call<SimStatus>(command, args));
+  const settle = async (pending: Promise<SimStatus>) => forPlatform(await pending);
   const current = (): SimDevice | undefined => status?.devices.find(d => d.udid === status?.selected);
   const booted = () => current()?.state === 'Booted';
   const shape = (): DeviceShape => {
@@ -150,9 +150,9 @@ export function mountSimulator(root: HTMLElement, host: SimulatorHost) {
     try {
       // The 3D view loads while the simulator tools answer.
       const view = ensureView();
-      let next = await call('simulator_status');
+      let next = await settle(host.call<SimStatus>('simulator_status'));
       // Show something useful: the first running device, else the newest one.
-      if (!next.selected && next.devices.length) next = await call('simulator_select', { udid: (next.devices.find(d => d.state === 'Booted') ?? next.devices[0]).udid });
+      if (!next.selected && next.devices.length) next = await settle(host.call<SimStatus>('simulator_select', { udid: (next.devices.find(d => d.state === 'Booted') ?? next.devices[0]).udid }));
       if (disposed) return;
       const changed = next.selected !== status?.selected;
       status = next;
@@ -242,7 +242,7 @@ export function mountSimulator(root: HTMLElement, host: SimulatorHost) {
     const on = chosen.state !== 'Booted';
     busy = true; render(); message(on ? 'Booting…' : 'Shutting down…');
     try {
-      status = await call('simulator_power', { udid: chosen.udid, on });
+      status = await settle(host.call<SimStatus>('simulator_power', { udid: chosen.udid, on }));
       seq = 0;
     } catch (error) { host.notify(error instanceof Error ? error.message : String(error)); }
     finally { busy = false; render(); pump(); }
@@ -265,12 +265,12 @@ export function mountSimulator(root: HTMLElement, host: SimulatorHost) {
     host.choose(anchor, 'Devices', items, id => {
       if (id === SETUP) { void setupAndroid(); return; }
       if (id === ADD_DUO) { void addDuo(); return; }
-      void call('simulator_select', { udid: id }).then(next => { status = next; seq = 0; render(); pump(); }).catch(error => host.notify(String(error)));
+      void settle(host.call<SimStatus>('simulator_select', { udid: id })).then(next => { status = next; seq = 0; render(); pump(); }).catch(error => host.notify(String(error)));
     });
   }
   async function addDuo(): Promise<void> {
     say('Adding iPhone Duo…');
-    try { status = await call('simulator_create_duo'); seq = 0; say(''); render(); pump(); }
+    try { status = await settle(host.call<SimStatus>('simulator_create_duo')); seq = 0; say(''); render(); pump(); }
     catch (error) { say(''); host.notify(error instanceof Error ? error.message : String(error)); }
   }
   /** The hinge moves on click; the simulator follows in the background, and the new
@@ -282,7 +282,7 @@ export function mountSimulator(root: HTMLElement, host: SimulatorHost) {
     status = { ...status, pose };
     device?.setPose(pose, true); render(); loading();
     try {
-      const next = await call('simulator_pose', { udid, pose });
+      const next = await settle(host.call<SimStatus>('simulator_pose', { udid, pose }));
       if (disposed || next.selected !== status?.selected) return;
       status = next; device?.setPose(next.pose ?? pose, true);
     } catch (error) {
@@ -299,7 +299,7 @@ export function mountSimulator(root: HTMLElement, host: SimulatorHost) {
       if (polling || poseBusy || !visible || disposed || !current()?.duo || !booted()) return;
       polling = true;
       try {
-        const next = await call('simulator_status');
+        const next = await settle(host.call<SimStatus>('simulator_status'));
         if (disposed || poseBusy || next.selected !== status?.selected || !next.pose || next.pose === device?.getPose()) return;
         status = next; device?.setPose(next.pose, true); render(); loading(); pump();
       } catch { /* the next tick tries again */ } finally { polling = false; }
@@ -316,7 +316,7 @@ export function mountSimulator(root: HTMLElement, host: SimulatorHost) {
       host.notify('Android emulator ready');
       say('');
       await refresh();
-      status = await call('simulator_select', { udid: `android:${avd}` });
+      status = await settle(host.call<SimStatus>('simulator_select', { udid: `android:${avd}` }));
       seq = 0; render(); pump();
     } catch (error) {
       say(error instanceof Error ? error.message : String(error));
